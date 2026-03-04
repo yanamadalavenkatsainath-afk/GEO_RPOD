@@ -1,3 +1,24 @@
 numpy>=1.24.0
 matplotlib>=3.7.0
-pandas>=2.0.0
+pandas>=2.0.0# 3U CubeSat ADCS Simulation
+# Python 3.11+
+# Install with: pip install -r requirements.txt
+
+# ── Core numerics ─────────────────────────────────────────────────────
+numpy>=1.24.0
+
+# ── Orbit propagation ─────────────────────────────────────────────────
+sgp4>=2.22
+
+# ── Geomagnetic field model (IGRF-13) ─────────────────────────────────
+pyIGRF>=0.1.0
+
+# ── Atmospheric density model (NRLMSISE-00) ───────────────────────────
+nrlmsise00>=0.1.0
+
+# ── Plotting ──────────────────────────────────────────────────────────
+matplotlib>=3.7.0
+
+# ── Standard library modules used (no install needed) ─────────────────
+# numpy, time, sys, os, io, contextlib — all stdlib or numpy
+

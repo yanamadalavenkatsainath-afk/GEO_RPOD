@@ -2,7 +2,7 @@ import numpy as np
 
 class ReactionWheel:
 
-    def __init__(self, h_max=0.5):
+    def __init__(self, h_max=0.05):
         self.h = np.zeros(3)
         self.h_max = h_max
 
