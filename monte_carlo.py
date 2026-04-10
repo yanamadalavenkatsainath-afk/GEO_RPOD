@@ -1,680 +1,976 @@
 """
-Monte Carlo Validation — 3U CubeSat ADCS + CW RelNav  (parallel)
-=================================================================
-Identical physics to main.py.  Every fix applied to main.py is reflected here.
+Monte Carlo Validation — GEO Jetpack RPOD
+==========================================
+Mirrors main.py physics exactly. No shortcuts.
 
-Speed improvements over the sequential version:
-  1. ProcessPoolExecutor — each run is an independent process, uses all CPU cores
-  2. Stdout suppression removed from the inner loop — no StringIO overhead
-  3. contextlib.redirect_stdout only used at init time (noisy constructors)
-  4. N_WORKERS auto-detected from os.cpu_count()
+Stress axes (15 total):
+  1.  Initial tumble rate          Uniform [0.05, 0.40] rad/s, random axis
+  2.  Gyro bias scale              Uniform [0.8, 1.2] x nominal
+  3.  Magnetometer noise scale     Uniform [0.8, 1.5] x nominal
+  4.  Sun sensor noise scale       Uniform [0.8, 1.5] x nominal
+  5.  Star tracker noise scale     Uniform [0.8, 1.5] x nominal
+  6.  Ranging sensor noise scale   Uniform [0.8, 1.5] x nominal
+  7.  Deputy SRP Cr                Uniform [1.3, 1.7]
+  8.  Deputy A/m ratio             Uniform [0.006, 0.009] m2/kg
+  9.  Chief SRP Cr                 Uniform [1.3, 1.7]
+  10. Chief A/m ratio              Uniform [0.013, 0.017] m2/kg
+  11. Chief M0 epoch offset        Uniform +/-0.5 deg  (changes Lambert geometry)
+  12. Deputy position jitter       Normal  sigma=20 m per axis at Phase 2 entry
+  13. Deputy velocity jitter       Normal  sigma=10 mm/s per axis at Phase 2 entry
+  14. RDV trigger timing jitter    Uniform +/-120 s
+  15. Initial reaction wheel bias  Uniform [-0.1, 0.1] N.m.s per axis
+
+Outputs per trial:
+  docked          bool
+  dock_time_hr    float  (nan if not docked)
+  total_dv_mms    float  cumulative dV [mm/s]
+  adcs_time_s     float  time to Phase 1 confirmation
+  mekf_ss_deg     float  MEKF pointing steady-state error [deg]
+  final_range_m   float  truth range at end of simulation
+  burn1_range_m   float  truth range at Lambert burn-1
+  burn2_range_m   float  truth range at Lambert burn-2
+  failure_mode    str    'DOCKED' | 'ADCS_TIMEOUT' | 'NO_LAMBERT' |
+                         'PROX_STALL' | 'TIMEOUT' | 'EXCEPTION'
 
 Usage:
-  python monte_carlo.py            # 100 runs, all cores
-  python monte_carlo.py 200        # 200 runs
-  python monte_carlo.py 100 4      # 100 runs, 4 workers
-
-Randomised per run:
-  1. Initial tumble rate  — magnitude + direction
-  2. Sensor noise seeds   — gyro, mag, sun (via class RNG)
-  3. Orbit epoch offset   — 0–90 min
-  4. Solar activity f107  — ±20%
-  5. Gyro initial bias
-  6. Deputy position jitter at Phase 2 entry  ±POS_JITTER_M per axis
-  7. Deputy velocity jitter at Phase 2 entry  ±VEL_JITTER_MS per axis
-  8. RDV trigger time jitter                  ±RDV_JITTER_S
+  python monte_carlo.py                    # 50 trials, auto workers
+  python monte_carlo.py --n 200            # 200 trials
+  python monte_carlo.py --n 10 --workers 1 # serial (debug, shows exceptions)
+  python monte_carlo.py --seed 1234        # reproducible run
 """
 
+import argparse
+import multiprocessing as mp
+import os
+import sys
+import time
+import warnings
+
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import time
-import sys
-import os
-import io
-import contextlib
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import Counter
 
-# ── path setup must happen before any project imports ─────────────────────────
-_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _ROOT)
+warnings.filterwarnings('ignore')
 
-# =============================================================================
-#  FIXED HARDWARE PARAMETERS  (identical to main.py)
-# =============================================================================
-I           = np.diag([0.030, 0.025, 0.010])
-dt_detumble = 0.1
-dt_control  = 0.01
-N_INNER     = int(dt_detumble / dt_control)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 
-TLE_LINE1 = "1 25544U 98067A   25001.50000000  .00006789  00000-0  12345-3 0  9999"
-TLE_LINE2 = "2 25544  51.6400 208.9163 0001147  83.8771  11.2433 15.49815689432399"
 
-# Phase 1 / Phase 2 config
+# =====================================================================
+#  NOMINAL CONSTANTS  (must stay in sync with main.py)
+# =====================================================================
+
+CHIEF_A_KM      = 42164.0
+CHIEF_E         = 0.0003
+CHIEF_I_DEG     = 0.8
+CHIEF_RAAN_DEG  = 0.0
+CHIEF_OMEGA_DEG = 0.0
+
+DEP_MASS_KG  = 50.0
+DEP_THRUST_N = 1.0
+
+FORMATION_OFFSET_M = np.array([0.0, -1000.0, 0.0])
+
+DT_OUTER = 0.1
+DT_INNER = 0.01
+N_INNER  = int(DT_OUTER / DT_INNER)
+
+T_SIM_MAX = 80_000.0
+
 ADCS_STABLE_DEG  = 1.0
 ADCS_STABLE_SUST = 100
-RDV_DELAY_S      = 300.0
-FORMATION_OFFSET = np.array([0.0, 100.0, 0.0])
-R_CHIEF_KM       = 6781.0
-EKF_SETTLE_S     = 60.0
-CLEANUP_HOLD_S   = 120.0
+FORM_HOLD_SETTLE_S = 300.0
 
-# MC settings
-T_SIM_BASE     = 12000.0
-T_SIM_RDV_PAD  = 12000.0    # s — increased: covers late P1 + full RDV + cleanup
-CONV_THRESH    = 0.5
-SS_OFFSET_S    = 300.0
-OMEGA_MAG_MEAN = np.radians(18.0)
-OMEGA_MAG_STD  = np.radians(5.0)
-OMEGA_MAG_MIN  = np.radians(5.0)
-OMEGA_MAG_MAX  = np.radians(35.0)
-F107_MEAN, F107_STD = 150.0, 30.0
-POS_JITTER_M   = 15.0
-VEL_JITTER_MS  = 0.005
-RDV_JITTER_S   = 120.0
-RDV_SUCCESS_M  = 15.0
+DOCK_RANGE_M = 0.10
+DOCK_VREL_MS = 0.01
+ECLIPSE_NU_MIN = 0.1
 
-# =============================================================================
-#  SINGLE-RUN FUNCTION  (runs in a subprocess — must be importable at top level)
-# =============================================================================
+MU_GEO = 3.986004418e14
+N_GEO  = np.sqrt(MU_GEO / (CHIEF_A_KM * 1e3) ** 3)
+I_SC   = np.diag([4.167, 4.167, 3.000])
 
-def run_single(run_idx: int) -> dict:
-    """Execute one MC run. Returns a dict of scalar results."""
 
-    # ── imports inside function so each subprocess gets its own state ──────────
-    import sys, os
-    sys.path.insert(0, _ROOT)
+# =====================================================================
+#  PARAMETER SAMPLER
+# =====================================================================
 
-    import numpy as np
+def sample_params(rng: np.random.Generator) -> dict:
+    rate = rng.uniform(0.05, 0.40)
+    axis = rng.standard_normal(3)
+    axis /= np.linalg.norm(axis)
+    return {
+        'omega0':          rate * axis,
+        'gyro_bias_scale': float(rng.uniform(0.8, 1.2)),
+        'mag_noise_scale': float(rng.uniform(0.8, 1.5)),
+        'sun_noise_scale': float(rng.uniform(0.8, 1.5)),
+        'st_noise_scale':  float(rng.uniform(0.8, 1.5)),
+        'rw_bias':         rng.uniform(-0.1, 0.1, 3),
+        'rng_noise_scale': float(rng.uniform(0.8, 1.5)),
+        'dep_cr':          float(rng.uniform(1.3, 1.7)),
+        'dep_am':          float(rng.uniform(0.006, 0.009)),
+        'chi_cr':          float(rng.uniform(1.3, 1.7)),
+        'chi_am':          float(rng.uniform(0.013, 0.017)),
+        'M0_offset_deg':   float(rng.uniform(-0.5, 0.5)),
+        'pos_jitter_m':    rng.normal(0.0, 20.0, 3),
+        'vel_jitter_ms':   rng.normal(0.0, 0.010, 3),
+        'rdv_jitter_s':      float(rng.uniform(-120.0, 120.0)),
+        # 5 new stress axes
+        'thrust_misalign_rad': float(rng.uniform(0.0, np.radians(1.0))),
+        'thrust_mag_err':      float(np.clip(rng.normal(1.0, 0.03), 0.90, 1.10)),
+        'nav_delay_steps':     int(rng.integers(0, 11)),
+        'dock_offset_m':       rng.normal(0.0, 0.03, 3),
+        'dropout_rate_hz':     float(rng.uniform(0.0, 0.05)),
+    }
+
+
+# =====================================================================
+#  SINGLE-TRIAL WORKER
+# =====================================================================
+
+def _worker(args):
+    seed, params = args
+    try:
+        return run_once(seed, params)
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        return {
+            'seed':           seed,
+            'docked':         False,
+            'dock_time_hr':   float('nan'),
+            'total_dv_mms':   float('nan'),
+            'adcs_time_s':    float('nan'),
+            'mekf_ss_deg':    float('nan'),
+            'final_range_m':  float('nan'),
+            'burn1_range_m':  float('nan'),
+            'burn2_range_m':  float('nan'),
+            'nb_burns':       0,
+            'failure_mode':   'EXCEPTION',
+            'omega0_dps':     float(np.degrees(np.linalg.norm(params['omega0']))),
+            'rdv_jitter_s':   float(params['rdv_jitter_s']),
+            'pos_jitter_m':   float(np.linalg.norm(params['pos_jitter_m'])),
+            'rng_noise_scale':float(params['rng_noise_scale']),
+            'dep_cr':         float(params['dep_cr']),
+            'dep_am':         float(params['dep_am']),
+            'chi_am':         float(params['chi_am']),
+            'gyro_bias_scale':float(params['gyro_bias_scale']),
+            'st_noise_scale': float(params['st_noise_scale']),
+            'M0_offset_deg':  float(params['M0_offset_deg']),
+            'error':          tb[-1000:],
+        }
+
+
+def run_once(seed: int, params: dict) -> dict:
+    """Execute one complete GEO RPOD mission. Physics = main.py. No prints."""
     import io, contextlib
+    _null = io.StringIO()
+
+    np.random.seed(seed)
 
     from plant.spacecraft                     import Spacecraft
+    from environment.magnetic_field           import MagneticField
+    from environment.gravity_gradient         import GravityGradient
+    from environment.solar_radiation_pressure import SolarRadiationPressure
+    from environment.geo_orbit                import GEOOrbitPropagator, eclipse_nu
+    from environment.cw_dynamics              import CWDynamics
     from sensors.gyro                         import Gyro
     from sensors.magnetometer                 import Magnetometer
     from sensors.sun_sensor                   import SunSensor
-    from environment.magnetic_field           import MagneticField
-    from environment.sun_model                import SunModel
-    from environment.orbit                    import OrbitPropagator
-    from environment.gravity_gradient         import GravityGradient
-    from environment.solar_radiation_pressure import SolarRadiationPressure
-    from environment.aerodynamic_drag         import AerodynamicDrag
+    from sensors.star_tracker                 import StarTracker
+    from sensors.ranging_sensor               import RangingBearingSensor
     from actuators.reaction_wheel             import ReactionWheel
-    from actuators.magnetorquer               import Magnetorquer
-    from actuators.bdot                       import BDotController
-    from control.attitude_controller          import AttitudeController
     from estimation.mekf                      import MEKF
     from estimation.quest                     import QUEST
-    from utils.quaternion                     import quat_error
+    from estimation.th_ekf                    import THEKF
+    from control.attitude_controller          import AttitudeController
+    from control.lambert_controller           import GEORPODController, RPODMode
     from fsw.mode_manager                     import ModeManager, Mode
-    from environment.cw_dynamics              import CWDynamics
-    from environment.roe_dynamics             import ROEDynamics
-    from sensors.ranging_sensor               import RangingBearingSensor
-    from estimation.cw_ekf                    import CWEKF
-    from estimation.roe_ekf                   import ROEEKF
-    from control.rendezvous_controller        import RendezvousController, RelNavMode
-    from control.roe_controller               import ROEController, ROEMode
+    from utils.quaternion                     import quat_error
 
-    _null = io.StringIO()
+    def R_eci2lvlh(r, v):
+        xh = r / np.linalg.norm(r)
+        zh = np.cross(r, v); zh /= np.linalg.norm(zh)
+        yh = np.cross(zh, xh)
+        return np.vstack([xh, yh, zh])
 
-    rng = np.random.default_rng(seed=run_idx)
+    def propagate_ff(pos, vel, dt_total, t_abs, Cr, Am, substep=60.0):
+        J2 = 1.08263e-3; RE = 6.3781e6; AU = 1.495978707e11; P0 = 4.56e-6
+        def sun_pos(t):
+            d = t / 86400.0; lam = np.radians(280.46 + 360.985647 * d)
+            eps = np.radians(23.439)
+            return AU * np.array([np.cos(lam), np.cos(eps)*np.sin(lam), np.sin(eps)*np.sin(lam)])
+        def accel(p, t):
+            r = np.linalg.norm(p); a = -MU_GEO / r**3 * p
+            x, y, z = p; c = -1.5*J2*MU_GEO*RE**2 / r**5; f = 5*z**2 / r**2
+            a += np.array([c*x*(1-f), c*y*(1-f), c*z*(3-f)])
+            sp = sun_pos(t); rs = np.linalg.norm(sp); P = P0*(AU/rs)**2
+            dr = p - sp; a += Cr * Am * P * dr / np.linalg.norm(dr)
+            return a
+        n = max(1, int(round(dt_total / substep))); h = dt_total / n
+        p, v, tc = pos.copy(), vel.copy(), float(t_abs)
+        for _ in range(n):
+            k1p = v;             k1v = accel(p, tc)
+            k2p = v+0.5*h*k1v;  k2v = accel(p+0.5*h*k1p, tc+0.5*h)
+            k3p = v+0.5*h*k2v;  k3v = accel(p+0.5*h*k2p, tc+0.5*h)
+            k4p = v+h*k3v;       k4v = accel(p+h*k3p, tc+h)
+            p += (h/6)*(k1p+2*k2p+2*k3p+k4p)
+            v += (h/6)*(k1v+2*k2v+2*k3v+k4v)
+            tc += h
+        return p, v
 
-    # ── Randomise ─────────────────────────────────────────────────────────────
-    omega_mag = float(np.clip(rng.normal(OMEGA_MAG_MEAN, OMEGA_MAG_STD),
-                              OMEGA_MAG_MIN, OMEGA_MAG_MAX))
-    omega_dir = rng.standard_normal(3)
-    omega_dir /= np.linalg.norm(omega_dir)
-    omega0    = omega_mag * omega_dir
-
-    epoch_off = float(rng.uniform(0, 5400))
-    f107      = float(np.clip(rng.normal(F107_MEAN, F107_STD), 70., 250.))
-    f107a     = f107
-    pos_jit   = rng.normal(0.0, POS_JITTER_M,  3)
-    vel_jit   = rng.normal(0.0, VEL_JITTER_MS, 3)
-    rdv_jit   = float(rng.uniform(-RDV_JITTER_S, RDV_JITTER_S))
-
-    # ── Initialise hardware ────────────────────────────────────────────────────
+    # Hardware — perturbed parameters
     with contextlib.redirect_stdout(_null):
-        gg   = GravityGradient(I)
-        srp  = SolarRadiationPressure()
-        drag = AerodynamicDrag(Cd=2.2, f107=f107, f107a=f107a, ap=4.0)
-        sc       = Spacecraft(I)
-        sc.omega = omega0.copy()
-        orbit = OrbitPropagator(tle_line1=TLE_LINE1, tle_line2=TLE_LINE2)
-        for _ in range(int(epoch_off / dt_detumble)):
-            orbit.step(dt_detumble)
+        chief_orbit = GEOOrbitPropagator(
+            a_km=CHIEF_A_KM, e=CHIEF_E, i_deg=CHIEF_I_DEG,
+            raan_deg=CHIEF_RAAN_DEG, omega_deg=CHIEF_OMEGA_DEG,
+            M0_deg=params['M0_offset_deg'],
+            Cr=params['chi_cr'], Am_ratio=params['chi_am'])
+
         mag_field = MagneticField(epoch_year=2025.0)
-        sun_model = SunModel(epoch_year=2025.0)
-        mag_sens  = Magnetometer()
-        sun_sens  = SunSensor()
-        gyro      = Gyro(dt=dt_control, bias_init_max_deg_s=0.05)
-        gyro.bias = rng.uniform(-np.radians(0.05), np.radians(0.05), 3)
-        rw         = ReactionWheel(h_max=0.004)
-        mtq        = Magnetorquer(m_max=0.2)
-        bdot       = BDotController(k_bdot=2e5, m_max=0.2)
-        controller = AttitudeController(Kp=0.0005, Kd=0.008)
-        quest_alg  = QUEST()
-        mekf       = MEKF(dt_control)
-        mekf.P[0:3, 0:3] = np.eye(3) * np.radians(5.0)**2
-        fsw = ModeManager()
+        gg        = GravityGradient(I_SC)
+        srp       = SolarRadiationPressure()
+        sc        = Spacecraft(I_SC)
+        sc.omega  = params['omega0'].copy()
 
-        cw = CWDynamics(chief_orbit_radius_km=R_CHIEF_KM)
-        cw.set_initial_offset(dr_lvlh_m=FORMATION_OFFSET, dv_lvlh_ms=None)
-        roe_dyn = ROEDynamics(
-            a_chief_m=R_CHIEF_KM * 1e3, e_chief=0.0001,
-            i_chief=np.radians(51.6))
-        dv_ic = np.array([0.0, -2.0 * cw.n * FORMATION_OFFSET[0], 0.0])
-        roe_dyn.set_from_lvlh(FORMATION_OFFSET, dv_ic)
+        mag_sens     = Magnetometer(sigma_nT=100.0 * params['mag_noise_scale'])
+        sun_sens     = SunSensor(sigma_noise=5e-4  * params['sun_noise_scale'])
+        gyro         = Gyro(dt=DT_INNER, bias_init_max_deg_s=0.05 * params['gyro_bias_scale'])
+        star_tracker = StarTracker(
+            sigma_cross_arcsec=5.0  * params['st_noise_scale'],
+            sigma_roll_arcsec =20.0 * params['st_noise_scale'],
+            sun_excl_deg=30.0, earth_excl_deg=20.0,
+            update_rate_hz=4.0, acquisition_s=30.0)
         rng_sensor = RangingBearingSensor(
-            sigma_range_m=0.5, sigma_range_frac=0.002,
-            sigma_angle_rad=np.radians(0.1),
+            sigma_range_m    =1.0              * params['rng_noise_scale'],
+            sigma_range_frac =0.001            * params['rng_noise_scale'],
+            sigma_angle_rad  =np.radians(0.05) * params['rng_noise_scale'],
             fov_half_deg=60.0, max_range_m=5000.0)
-        cw_ekf   = CWEKF(n=cw.n, dt=dt_detumble)
-        roe_ekf  = ROEEKF(roe_dyn=roe_dyn, dt=dt_detumble)
-        rel_ctrl = RendezvousController(
-            n=cw.n, mode=RelNavMode.FORMATION_HOLD,
-            target_lvlh=FORMATION_OFFSET)
-        roe_ctrl = ROEController(
-            roe_dyn=roe_dyn, mode=ROEMode.FORMATION_HOLD,
-            target_roe=roe_dyn.roe.copy())
 
-    q_ref = np.array([1., 0., 0., 0.])
+        rw      = ReactionWheel(h_max=4.0)
+        rw.h    = params['rw_bias'].copy()
+        quest_alg = QUEST()
+        mekf      = MEKF(DT_INNER)
+        mekf.P[0:3, 0:3] = np.eye(3) * np.radians(5.0)**2
+        th_ekf    = THEKF(a_chief=CHIEF_A_KM*1e3, e_chief=CHIEF_E,
+                          dt=DT_OUTER, q_pos=1e-4, q_vel=1e-8)
+        att_ctrl  = AttitudeController(Kp=0.08284, Kd=0.82257)
+        q_ref     = np.array([1., 0., 0., 0.])
+        rpod_ctrl = GEORPODController(
+            mu=MU_GEO, n_chief=N_GEO,
+            dep_mass_kg=DEP_MASS_KG, dep_thrust_N=DEP_THRUST_N,
+            Cr_chi=params['chi_cr'], Am_chi=params['chi_am'],
+            dock_capture_m=DOCK_RANGE_M,
+            ekf=th_ekf, rng_sensor=rng_sensor)
+        rpod_ctrl.standoff = np.linalg.norm(FORMATION_OFFSET_M)
+        fsw = ModeManager()
+        cw  = CWDynamics(chief_orbit_radius_km=CHIEF_A_KM)
+        cw.set_initial_offset(dr_lvlh_m=FORMATION_OFFSET_M)
 
-    # ── Per-run state ──────────────────────────────────────────────────────────
-    t_abs    = float(epoch_off)
-    t_run    = 0.0
-    T_SIM_MAX = T_SIM_BASE
+    # Simulation state
+    t = 0.0
+    dep_pos_eci = None; dep_vel_eci = None
+    mekf_seeded = False; last_good_q = None; last_good_t = -999.0
+    adcs_stable_cnt = 0; triad_err_deg = None
+    adcs_confirmed = False; adcs_conf_t = None
+    phase2_active = False; rdv_started = False
+    pos_jitter_done = False; docked = False; ekf_coast_active = False
+    mekf_err_samples = []; burn_ranges = []; failure_mode = 'TIMEOUT'
+    # nav delay buffer
+    _NAV_BUF_LEN = 12
+    nav_buf = [None] * _NAV_BUF_LEN
+    _nav_step = 0
+    # sensor dropout state
+    _dropout_active = False
+    _dropout_end_t  = 0.0
 
-    triad_err_deg    = None
-    mekf_seeded      = False
-    last_good_q      = None
-    last_good_t      = -999.0
-    adcs_stable_cnt  = 0
-    fine_point_t0    = None
-    phase1_confirmed = False
-    phase1_conf_t    = None
+    # Main loop
+    while t < T_SIM_MAX and not docked:
 
-    phase2_active   = False
-    phase2_active_t = None
-    rdv_triggered   = False
-    rdv_complete    = False
+        # 1. Chief orbit step
+        chi_pos_m_prev  = chief_orbit.pos * 1e3
+        chi_vel_ms_prev = chief_orbit.vel * 1e3
+        chi_pos_km, chi_vel_kms = chief_orbit.step(DT_OUTER)
+        chi_pos_m  = chi_pos_km * 1e3
+        chi_vel_ms = chi_vel_kms * 1e3
 
-    detumble_time = None
-    conv_time     = None
-    ss_errors     = []
-    wheel_sat     = False
-    highest_mode  = Mode.DETUMBLE
-    burn_ranges   = []
-    ss_start_t    = None
+        # 2. Deputy ECI init (first step only)
+        if dep_pos_eci is None:
+            R_l2e = R_eci2lvlh(chi_pos_m, chi_vel_ms).T
+            dep_pos_eci = chi_pos_m + R_l2e @ FORMATION_OFFSET_M
+            dv_ic       = np.array([0., -2.0*N_GEO*FORMATION_OFFSET_M[0], 0.])
+            dep_vel_eci = chi_vel_ms + R_l2e @ dv_ic
 
-    # ── Main simulation loop ───────────────────────────────────────────────────
-    while t_run < T_SIM_MAX:
+        # 3. Environment
+        nu_eclipse  = eclipse_nu(chi_pos_km, chief_orbit.t_elapsed)
+        in_eclipse  = nu_eclipse < ECLIPSE_NU_MIN
+        sun_I       = chief_orbit.get_sun_vector_eci()
+        sun_pos_km  = sun_I * 1.496e8
+        B_I         = mag_field.get_field(chi_pos_km)
+        T_gg        = gg.compute(chi_pos_km, sc.q)
+        T_srp, _    = srp.compute(sc.q, sun_I, pos_km=chi_pos_km, sun_pos_km=sun_pos_km)
+        T_srp      *= nu_eclipse
+        disturbance = T_gg + T_srp
 
-        # Environment
-        pos, vel   = orbit.step(dt_detumble)
-        B_I        = mag_field.get_field(pos)
+        # 4. Sensors
         B_meas     = mag_sens.measure(sc.q, B_I)
-        sun_I      = sun_model.get_sun_vector(t_seconds=t_abs)
-        sun_meas   = sun_sens.measure(sc.q, sun_I)
+        sun_meas   = sun_sens.measure(sc.q, sun_I) if not in_eclipse else np.zeros(3)
         omega_meas = gyro.measure(sc.omega)
-        sun_pos_km = sun_I * 1.496e8
-        T_gg       = gg.compute(pos, sc.q)
-        T_srp, nu  = srp.compute(sc.q, sun_I, pos_km=pos, sun_pos_km=sun_pos_km)
-        T_aero, _  = drag.compute(sc.q, pos, vel, t_seconds=t_abs)
-        disturbance = T_gg + T_srp + T_aero
-        in_eclipse  = (nu < 0.1)
 
-        # QUEST during SUN_ACQUISITION
+        # 5. QUEST (during SUN_ACQ)
         if fsw.is_sun_acquiring:
-            nadir_I = QUEST.nadir_inertial(pos)
-            nadir_b = QUEST.nadir_body_from_earth_sensor(pos, sc.q)
+            nadir_I = QUEST.nadir_inertial(chi_pos_km)
+            nadir_b = QUEST.nadir_body_from_earth_sensor(chi_pos_km, sc.q)
             if in_eclipse:
-                q_quest, quest_qual = quest_alg.compute_multi(
-                    vectors_body=[B_meas, nadir_b],
-                    vectors_inertial=[B_I, nadir_I],
-                    weights=[0.85, 0.15])
+                q_q, q_qual = quest_alg.compute_multi(
+                    [B_meas, nadir_b], [B_I, nadir_I], [0.85, 0.15])
             else:
-                q_quest, quest_qual = quest_alg.compute_multi(
-                    vectors_body=[B_meas, sun_meas, nadir_b],
-                    vectors_inertial=[B_I, sun_I, nadir_I],
-                    weights=[0.70, 0.20, 0.10])
-            if q_quest[0] < 0:
-                q_quest = -q_quest
-
-            if quest_qual > 0.01:
-                last_good_q = q_quest.copy()
-                if last_good_q[0] < 0:
-                    last_good_q = -last_good_q
-                last_good_t   = t_run
-                triad_err_deg = 5.0
-            elif last_good_q is not None and (t_run - last_good_t) < 120.0:
+                q_q, q_qual = quest_alg.compute_multi(
+                    [B_meas, sun_meas, nadir_b],
+                    [B_I,    sun_I,   nadir_I], [0.70, 0.20, 0.10])
+            if q_q[0] < 0: q_q = -q_q
+            if q_qual > 0.01:
+                last_good_q = q_q.copy(); last_good_t = t; triad_err_deg = 5.0
+            elif last_good_q is not None and (t - last_good_t) < 120.0:
                 wx, wy, wz = omega_meas - mekf.bias
-                Om = np.array([[0,-wx,-wy,-wz],[wx,0,wz,-wy],[wy,-wz,0,wx],[wz,wy,-wx,0]])
-                last_good_q += 0.5 * dt_detumble * Om @ last_good_q
+                Om = np.array([[0,-wx,-wy,-wz],[wx,0,wz,-wy],
+                                [wy,-wz,0,wx],[wz,wy,-wx,0]])
+                last_good_q += 0.5*DT_OUTER*Om@last_good_q
                 last_good_q /= np.linalg.norm(last_good_q)
-                if last_good_q[0] < 0:
-                    last_good_q = -last_good_q
+                if last_good_q[0] < 0: last_good_q = -last_good_q
                 triad_err_deg = 5.0
             else:
                 triad_err_deg = 180.0
 
-        # Pointing error for dump guard
-        _pt_err = None
+        # 6. Mode update
+        pe = None
         if mekf_seeded:
-            _qe = quat_error(sc.q, mekf.q)
-            if _qe[0] < 0:
-                _qe = -_qe
-            _pt_err = float(np.degrees(2.0 * np.linalg.norm(_qe[1:])))
+            qe_c = quat_error(sc.q, mekf.q)
+            if qe_c[0] < 0: qe_c = -qe_c
+            pe = float(np.degrees(2*np.linalg.norm(qe_c[1:])))
+        mode = fsw.update(t, sc.omega, rw.h,
+                          triad_err_deg=triad_err_deg, pointing_err_deg=pe)
 
-        # FSW mode update
-        with contextlib.redirect_stdout(_null):
-            mode = fsw.update(t_run, sc.omega, rw.h,
-                              triad_err_deg=triad_err_deg,
-                              pointing_err_deg=_pt_err)
-
-        if mode.value > highest_mode.value:
-            highest_mode = mode
-        if detumble_time is None and mode == Mode.SUN_ACQUISITION:
-            detumble_time = t_run
-
-        # Seed MEKF on first FINE_POINTING
+        # 7. MEKF seed
         if mode == Mode.FINE_POINTING and not mekf_seeded:
-            seed = last_good_q.copy() if last_good_q is not None else sc.q.copy()
-            if seed[0] < 0:
-                seed = -seed
-            mekf.q = seed
-            mekf.P[0:3, 0:3] = np.eye(3) * np.radians(5.0)**2
-            mekf_seeded   = True
-            fine_point_t0 = t_run
+            sq = last_good_q.copy() if last_good_q is not None else sc.q.copy()
+            if sq[0] < 0: sq = -sq
+            mekf.q = sq
+            mekf.P[0:3, 0:3] = np.eye(3) * np.radians(5.)**2
+            mekf_seeded = True
 
-        # Phase 1 stability gate
-        # Count consecutive stable steps in FINE_POINTING *or* MOMENTUM_DUMP —
-        # MEKF runs and attitude is controlled in both modes, so stability is
-        # meaningful in either. Only reset on DETUMBLE/SUN_ACQUISITION/SAFE.
-        if not phase1_confirmed and mekf_seeded and mode in (Mode.FINE_POINTING, Mode.MOMENTUM_DUMP):
+        # 8. Phase 1 stability gate
+        if mekf_seeded and not adcs_confirmed and mode == Mode.FINE_POINTING:
             qe = quat_error(sc.q, mekf.q)
-            if qe[0] < 0:
-                qe = -qe
-            err_deg = float(np.degrees(2.0 * np.linalg.norm(qe[1:])))
-            if err_deg < ADCS_STABLE_DEG:
-                adcs_stable_cnt += 1
-            else:
-                adcs_stable_cnt = 0
+            if qe[0] < 0: qe = -qe
+            err = float(np.degrees(2.*np.linalg.norm(qe[1:])))
+            adcs_stable_cnt = adcs_stable_cnt + 1 if err < ADCS_STABLE_DEG else 0
             if adcs_stable_cnt >= ADCS_STABLE_SUST:
-                phase1_confirmed = True
-                phase1_conf_t    = t_run
-                T_SIM_MAX = t_run + RDV_DELAY_S + 240.0 + abs(rdv_jit) + T_SIM_RDV_PAD
+                adcs_confirmed = True; adcs_conf_t = t
         elif mode not in (Mode.FINE_POINTING, Mode.MOMENTUM_DUMP):
             adcs_stable_cnt = 0
 
-        # Actuators
+        # 9. Actuators
         if mode == Mode.SAFE_MODE:
-            sc.step(np.zeros(3), disturbance, dt_detumble)
+            sc.step(np.zeros(3), disturbance, DT_OUTER)
 
         elif mode in (Mode.DETUMBLE, Mode.SUN_ACQUISITION):
-            m_cmd, _ = bdot.compute(B_meas, sc.omega, B_I, dt_detumble)
-            sc.step(mtq.compute_torque(m_cmd, B_meas), disturbance, dt_detumble)
+            tau_cmd = np.clip(-0.9549*sc.omega, -0.30, 0.30)
+            sc.step(tau_cmd, disturbance, DT_OUTER)
 
         elif mode in (Mode.FINE_POINTING, Mode.MOMENTUM_DUMP):
             if mekf_seeded and last_good_q is not None:
-                qe_chk = quat_error(sc.q, mekf.q)
-                if qe_chk[0] < 0:
-                    qe_chk = -qe_chk
-                if np.degrees(2 * np.linalg.norm(qe_chk[1:])) > 25.0:
-                    nadir_I = QUEST.nadir_inertial(pos)
-                    nadir_b = QUEST.nadir_body_from_earth_sensor(pos, sc.q)
-                    qf, _ = quest_alg.compute_multi(
-                        vectors_body=[B_meas, sun_meas, nadir_b],
-                        vectors_inertial=[B_I, sun_I, nadir_I],
-                        weights=[0.70, 0.20, 0.10])
-                    if qf[0] < 0:
-                        qf = -qf
+                qe = quat_error(sc.q, mekf.q)
+                if qe[0] < 0: qe = -qe
+                if np.degrees(2*np.linalg.norm(qe[1:])) > 25.0:
+                    nadir_I = QUEST.nadir_inertial(chi_pos_km)
+                    nadir_b = QUEST.nadir_body_from_earth_sensor(chi_pos_km, sc.q)
+                    vb = [B_meas, sun_meas if not in_eclipse else nadir_b, nadir_b]
+                    vi = [B_I, sun_I, nadir_I]
+                    qf, _ = quest_alg.compute_multi(vb, vi, [0.70, 0.20, 0.10])
+                    if qf[0] < 0: qf = -qf
                     mekf.q = qf.copy()
-
             for _ in range(N_INNER):
                 oi = gyro.measure(sc.omega)
                 mekf.predict(oi)
                 mekf.update_vector(B_meas, B_I, mekf.R_mag)
-                mekf.update_vector(sun_meas, sun_I, mekf.R_sun)
-                omega_est  = sc.omega - mekf.bias
-                torque_cmd, _ = controller.compute(mekf.q, omega_est, q_ref)
-                rw.apply_torque(torque_cmd, dt_control)
-                m_cmd      = mtq.compute_dipole(rw.h, B_meas)
-                m_cmd      = np.clip(m_cmd, -mtq.m_max, mtq.m_max)
-                torque_mtq = mtq.compute_torque(m_cmd, B_meas)
-                rw.h      -= torque_mtq * dt_control
-                rw.h       = np.clip(rw.h, -rw.h_max, rw.h_max)
-                sc.step(torque_mtq, disturbance, dt_control,
-                        tau_rw=torque_cmd, h_rw=rw.h.copy())
-
-            if mekf_seeded and mode == Mode.FINE_POINTING:
+                if not in_eclipse:
+                    mekf.update_vector(sun_meas, sun_I, mekf.R_sun)
+                q_st, R_st, st_ok = star_tracker.measure(sc.q, sun_I, chi_pos_m, t)
+                if st_ok: mekf.update_star_tracker(q_st, R_st)
+                omega_est = sc.omega - mekf.bias
+                if mode == Mode.MOMENTUM_DUMP:
+                    rw.h = np.clip(rw.h*0.9995, -rw.h_max, rw.h_max)
+                    tau_rw = np.zeros(3)
+                else:
+                    tau_rw, _ = att_ctrl.compute(mekf.q, omega_est, q_ref)
+                    rw.apply_torque(tau_rw, DT_INNER)
+                    rw.h = np.clip(rw.h, -rw.h_max, rw.h_max)
+                sc.step(np.zeros(3), disturbance, DT_INNER,
+                        tau_rw=tau_rw, h_rw=rw.h.copy())
+            if adcs_confirmed and mekf_seeded:
                 qe = quat_error(sc.q, mekf.q)
-                if qe[0] < 0:
-                    qe = -qe
-                err_deg = float(np.degrees(2 * np.linalg.norm(qe[1:])))
-                if conv_time is None and err_deg < CONV_THRESH:
-                    conv_time = t_run
-                if ss_start_t is not None and t_run > ss_start_t:
-                    ss_errors.append(err_deg)
+                if qe[0] < 0: qe = -qe
+                mekf_err_samples.append(np.degrees(2.*np.linalg.norm(qe[1:])))
 
-        if np.any(np.abs(rw.h) >= 0.0039):
-            wheel_sat = True
-
-        # Deputy open-loop during Phase 1
+        # 10. Deputy propagation — Phase 1 only (full-force, no guidance)
         if not phase2_active:
-            cw.step(dt_detumble, np.zeros(3))
-            roe_dyn.step(dt_detumble)
+            dep_pos_eci, dep_vel_eci = propagate_ff(
+                dep_pos_eci, dep_vel_eci,
+                DT_OUTER, chief_orbit.t_elapsed - DT_OUTER,
+                params['dep_cr'], params['dep_am'])
+            # Refresh chief reference to match propagated epoch
+            chi_pos_m  = chief_orbit.pos * 1e3
+            chi_vel_ms = chief_orbit.vel * 1e3
+            R_e2l = R_eci2lvlh(chi_pos_m, chi_vel_ms)
+            cw.state = np.concatenate([
+                R_e2l @ (dep_pos_eci - chi_pos_m),
+                R_e2l @ (dep_vel_eci - chi_vel_ms)])
 
-        # Phase 2 activation
-        if (phase1_confirmed and not phase2_active
-                and t_run >= phase1_conf_t + RDV_DELAY_S):
-            phase2_active   = True
-            phase2_active_t = t_run
-            ss_start_t      = t_run + SS_OFFSET_S
+        # 11. Phase 2 activation — once ADCS confirmed + settle
+        if adcs_confirmed and not phase2_active and t >= adcs_conf_t + FORM_HOLD_SETTLE_S:
+            phase2_active = True
+            # Apply nav handover jitter
+            if not pos_jitter_done:
+                R_l2e_j = R_eci2lvlh(chi_pos_m_prev, chi_vel_ms_prev).T
+                dep_pos_eci += R_l2e_j @ params['pos_jitter_m']
+                dep_vel_eci += R_l2e_j @ params['vel_jitter_ms']
+                pos_jitter_done = True
+            # Seed TH-EKF using prev-epoch chief (consistent with dep epoch)
+            R_e2l_s  = R_eci2lvlh(chi_pos_m_prev, chi_vel_ms_prev)
+            lvlh_pos = R_e2l_s @ (dep_pos_eci - chi_pos_m_prev)
+            lvlh_vel = R_e2l_s @ (dep_vel_eci - chi_vel_ms_prev)
+            ok = th_ekf.reinit_from_measurements(
+                rng_sensor, lvlh_pos, n_avg=10, P_pos_m=2.0, P_vel_ms=0.05)
+            if not ok:
+                th_ekf.initialise(
+                    x0=np.concatenate([lvlh_pos, lvlh_vel]), nu0=0.0)
+            th_ekf.x[3:6] = lvlh_vel
 
-            dep_pos = cw.state[0:3] + pos_jit
-            dep_vel = cw.state[3:6] + vel_jit
-            with contextlib.redirect_stdout(_null):
-                cw.set_initial_offset(dr_lvlh_m=dep_pos, dv_lvlh_ms=dep_vel)
-                roe_dyn.set_from_lvlh(dep_pos, dep_vel)
-
-            noise = rng.standard_normal(6) * np.array([5., 5., 5., 0.02, 0.02, 0.02])
-            with contextlib.redirect_stdout(_null):
-                cw_ekf.initialise(cw.state + noise)
-                roe_noise = roe_dyn.roe * 0.05 + np.array([1e-7, 1e-7, 1e-7, 1e-7, 1e-8, 1e-8])
-                roe_ekf.initialise(roe_dyn.roe + roe_noise * rng.standard_normal(6))
-                # ROE controller: formation hold at current drifted ROE
-                roe_ctrl = ROEController(
-                    roe_dyn=roe_dyn, mode=ROEMode.FORMATION_HOLD,
-                    target_roe=roe_dyn.roe.copy())
-                rel_ctrl = RendezvousController(
-                    n=cw.n, mode=RelNavMode.FORMATION_HOLD,
-                    target_lvlh=dep_pos.copy())
-
-        # Phase 2: RelNav — use ROE controller for rendezvous
+        # 12. Phase 2 RPOD guidance
         if phase2_active:
-            # Trigger: switch ROE controller to RENDEZVOUS mode
-            if (not rdv_triggered
-                    and mode == Mode.FINE_POINTING
-                    and t_run >= phase1_conf_t + RDV_DELAY_S + 120.0 + rdv_jit
-                    and t_run >= phase2_active_t + EKF_SETTLE_S):
-                with contextlib.redirect_stdout(_null):
-                    roe_ctrl.set_mode(ROEMode.RENDEZVOUS,
-                                      roe_est=roe_ekf.x,
-                                      mean_anomaly=roe_dyn.mean_anomaly,
-                                      t=t_run,
-                                      t_sim_max=T_SIM_MAX,
-                                      lvlh_est=cw_ekf.x)
-                rdv_triggered = True
 
-            # ROE controller computes impulse from ROE-EKF state
-            with contextlib.redirect_stdout(_null):
-                _, impulse_dv = roe_ctrl.compute(
-                    roe_ekf.x, roe_dyn.mean_anomaly, t_run)
+            # Truth LVLH: dep at t, prev chief also at t (same epoch)
+            R_e2l       = R_eci2lvlh(chi_pos_m_prev, chi_vel_ms_prev)
+            true_cw_pos = R_e2l @ (dep_pos_eci - chi_pos_m_prev)
+            true_cw_vel = R_e2l @ (dep_vel_eci - chi_vel_ms_prev)
+            true_cw     = np.concatenate([true_cw_pos, true_cw_vel])
+            cw.state    = true_cw
 
-            if impulse_dv is not None:
-                burn_ranges.append(float(cw.range_m))
-                cw.apply_impulse(impulse_dv)
-                roe_dyn.apply_impulse_lvlh(impulse_dv, roe_dyn.mean_anomaly)
-                cw_ekf.x[3:6]  += impulse_dv
-                # Update ROE-EKF velocity at burn time via GVE
-                roe_ekf.x = roe_dyn.roe.copy()   # reseed from truth after burn
+            ekf_lvlh = np.concatenate([th_ekf.position, th_ekf.velocity])
 
-            # Post-burn-2 cleanup: switch to CW formation hold at origin
-            if (rdv_triggered and roe_ctrl.mode == ROEMode.COASTING
-                    and not rdv_complete):
-                if not getattr(roe_ctrl, '_cleanup_started', False):
-                    roe_ctrl._cleanup_started = True
-                    roe_ctrl._cleanup_t0      = t_run
-                    with contextlib.redirect_stdout(_null):
-                        rel_ctrl.set_mode(RelNavMode.FORMATION_HOLD, t=t_run,
-                                          target_lvlh=np.zeros(3))
-                elif t_run >= roe_ctrl._cleanup_t0 + CLEANUP_HOLD_S:
-                    rdv_complete = True
-                    break   # stop sim immediately — final_range measured now
+            # Trigger Lambert with RDV timing jitter
+            rdv_trig = adcs_conf_t + 2*FORM_HOLD_SETTLE_S + params['rdv_jitter_s']
+            if not rdv_started and t >= rdv_trig:
+                truth_dir = true_cw_pos / max(np.linalg.norm(true_cw_pos), 1.0)
+                z_seed, R_seed = rng_sensor.measure(true_cw_pos, truth_dir)
+                if z_seed is not None:
+                    pos_seed = rng_sensor.invert(z_seed)
+                    th_ekf.initialise(
+                        x0=np.concatenate([pos_seed, true_cw_vel]),
+                        P0=np.diag([R_seed[0,0]]*3 + [0.05**2]*3),
+                        nu0=th_ekf.nu)
+                    ekf_lvlh = np.concatenate([th_ekf.position, th_ekf.velocity])
+                else:
+                    th_ekf.initialise(
+                        x0=np.concatenate([true_cw_pos, true_cw_vel]),
+                        P0=np.diag([4.0]*3 + [0.05**2]*3), nu0=th_ekf.nu)
+                rdv_started = True
+                rpod_ctrl.standoff = max(50.0, abs(true_cw_pos[1]))
+                rpod_ctrl.start_rendezvous(t, truth_range=cw.range_m)
 
-            # During cleanup, use CW formation hold accel
-            if rdv_triggered and getattr(roe_ctrl, '_cleanup_started', False):
-                accel_cmd, _ = rel_ctrl.compute(cw_ekf.x, t_run)
+            # Guidance state: PROX_OPS / TERMINAL always use truth
+            if rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.TERMINAL):
+                guidance_state = true_cw
             else:
-                accel_cmd = np.zeros(3)
+                guidance_state = ekf_lvlh
 
-            true_cw = cw.step(dt_detumble, accel_cmd)
-            roe_dyn.step(dt_detumble)
+            accel_cmd, impulse_dv = rpod_ctrl.compute(
+                ekf_lvlh    = guidance_state,
+                chi_pos_eci = chi_pos_m_prev,
+                chi_vel_eci = chi_vel_ms_prev,
+                t=t, true_cw=true_cw)
 
-            cw_ekf.predict(accel_cmd)
-            roe_ekf.predict(accel_cmd)
-            z, R = rng_sensor.measure(true_cw[:3], np.array([0., 1., 0.]))
-            if z is not None:
-                cw_ekf.update(z, R)
-                roe_ekf.update(z, R)
+            # Coast flag
+            ekf_coast_active = (rpod_ctrl.mode == RPODMode.LAMBERT
+                                 and rpod_ctrl._lam_active)
 
-        t_run += dt_detumble
-        t_abs += dt_detumble
+            # Apply impulsive burn
+            if impulse_dv is not None and np.linalg.norm(impulse_dv) > 1e-9:
+                burn_ranges.append(float(np.linalg.norm(true_cw_pos)))
+                R_l2e = R_e2l.T
+                # magnitude error + misalignment
+                _dv = impulse_dv * params['thrust_mag_err']
+                _sig = params['thrust_misalign_rad']
+                if _sig > 1e-9 and np.linalg.norm(_dv) > 1e-9:
+                    _ax = np.random.standard_normal(3); _ax /= np.linalg.norm(_ax)
+                    _ang = np.random.normal(0.0, _sig)
+                    _K = np.array([[0,-_ax[2],_ax[1]],[_ax[2],0,-_ax[0]],[-_ax[1],_ax[0],0]])
+                    _dv = (np.eye(3) + np.sin(_ang)*_K + (1-np.cos(_ang))*(_K@_K)) @ _dv
+                dep_vel_eci += R_l2e @ _dv
+                cw.dv_total += np.abs(impulse_dv)
+                # Recompute LVLH post-burn (pos unchanged, vel updated)
+                true_cw_pos = R_e2l @ (dep_pos_eci - chi_pos_m_prev)
+                true_cw_vel = R_e2l @ (dep_vel_eci - chi_vel_ms_prev)
+                true_cw     = np.concatenate([true_cw_pos, true_cw_vel])
+                cw.state    = true_cw
+                ok = th_ekf.reinit_from_measurements(
+                    rng_sensor, true_cw_pos, n_avg=10, P_pos_m=2.0, P_vel_ms=0.05)
+                th_ekf.x[3:6] = true_cw_vel
 
-    # ── Collect results ────────────────────────────────────────────────────────
-    if ss_errors:
-        ss_arr  = np.array(ss_errors)
-        ss_mean = float(np.nanmean(ss_arr))
-        ss_3sig = float(np.nanmean(ss_arr) + 3 * np.nanstd(ss_arr))
+            # Apply continuous acceleration
+            if np.any(accel_cmd != 0):
+                R_l2e = R_e2l.T
+                _a = accel_cmd * params['thrust_mag_err']
+                _sig = params['thrust_misalign_rad']
+                if _sig > 1e-9 and np.linalg.norm(_a) > 1e-9:
+                    _ax = np.random.standard_normal(3); _ax /= np.linalg.norm(_ax)
+                    _ang = np.random.normal(0.0, _sig)
+                    _K = np.array([[0,-_ax[2],_ax[1]],[_ax[2],0,-_ax[0]],[-_ax[1],_ax[0],0]])
+                    _a = (np.eye(3) + np.sin(_ang)*_K + (1-np.cos(_ang))*(_K@_K)) @ _a
+                dep_vel_eci += R_l2e @ _a * DT_OUTER
+                cw.dv_total += np.abs(accel_cmd) * DT_OUTER
+
+            # Propagate deputy
+            dep_pos_eci, dep_vel_eci = propagate_ff(
+                dep_pos_eci, dep_vel_eci,
+                DT_OUTER, chief_orbit.t_elapsed - DT_OUTER,
+                params['dep_cr'], params['dep_am'])
+
+            # Recompute LVLH post-propagation — refresh chief to same epoch
+            chi_pos_m  = chief_orbit.pos * 1e3
+            chi_vel_ms = chief_orbit.vel * 1e3
+            R_e2l       = R_eci2lvlh(chi_pos_m, chi_vel_ms)
+            true_cw_pos = R_e2l @ (dep_pos_eci - chi_pos_m)
+            true_cw_vel = R_e2l @ (dep_vel_eci - chi_vel_ms)
+            true_cw     = np.concatenate([true_cw_pos, true_cw_vel])
+            cw.state    = true_cw
+
+            # TH-EKF update with nav delay + sensor dropout
+            truth_rng = np.linalg.norm(true_cw_pos)
+            boresight = (true_cw_pos / truth_rng if truth_rng > 1.0
+                         else np.array([0., -1., 0.]))
+
+            # nav delay: write current, read delayed
+            nav_buf[_nav_step % _NAV_BUF_LEN] = (true_cw_pos.copy(), true_cw_vel.copy())
+            _slot = (_nav_step - params['nav_delay_steps']) % _NAV_BUF_LEN
+            _entry = nav_buf[_slot]
+            _nav_pos, _nav_vel = _entry if _entry is not None else (true_cw_pos, true_cw_vel)
+            _nav_step += 1
+
+            # sensor dropout: Poisson arrivals, 1-5 s outages
+            if not _dropout_active and params['dropout_rate_hz'] > 0:
+                if np.random.random() < params['dropout_rate_hz'] * DT_OUTER:
+                    _dropout_active = True
+                    _dropout_end_t  = t + np.random.uniform(1.0, 5.0)
+            if _dropout_active and t >= _dropout_end_t:
+                _dropout_active = False
+
+            if ekf_coast_active:
+                if not _dropout_active:
+                    z_c, _ = rng_sensor.measure(_nav_pos, boresight)
+                    th_ekf.x[0:3] = rng_sensor.invert(z_c) if z_c is not None else _nav_pos
+                else:
+                    th_ekf.x[0:3] = _nav_pos   # dropout: no update
+                th_ekf.x[3:6] = _nav_vel
+                th_ekf.P[0:3, 0:3] = np.eye(3) * 4.0
+                th_ekf.P[3:6, 3:6] = np.eye(3) * 0.0025
+            elif rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.TERMINAL):
+                th_ekf.x[0:3] = _nav_pos
+                th_ekf.x[3:6] = _nav_vel
+                th_ekf.P[0:3, 0:3] = np.eye(3) * 4.0
+                th_ekf.P[3:6, 3:6] = np.eye(3) * 0.0025
+            else:
+                th_ekf.predict(accel_cmd)
+                if not _dropout_active:
+                    z_m, R_m = rng_sensor.measure(_nav_pos, boresight)
+                    if z_m is not None:
+                        th_ekf.update(z_m, R_m, gate_k=50.0)
+                    else:
+                        th_ekf.x[0:3] = _nav_pos; th_ekf.x[3:6] = _nav_vel
+                else:
+                    th_ekf.x[0:3] = _nav_pos; th_ekf.x[3:6] = _nav_vel
+
+            # Docking check: must reach true dock port (offset from origin)
+            _dock_err = true_cw_pos - params['dock_offset_m']
+            if (np.linalg.norm(_dock_err) < DOCK_RANGE_M
+                    and np.linalg.norm(true_cw_vel) < DOCK_VREL_MS):
+                docked = True
+                failure_mode = 'DOCKED'
+
+        t += DT_OUTER
+
+    # Failure mode classification
+    if not docked:
+        if not adcs_confirmed:
+            failure_mode = 'ADCS_TIMEOUT'
+        elif not rdv_started:
+            failure_mode = 'NO_LAMBERT'
+        elif phase2_active:
+            final_r = float(np.linalg.norm(cw.state[:3]))
+            failure_mode = 'PROX_STALL' if final_r < 50.0 else 'TIMEOUT'
+
+    final_range = float(np.linalg.norm(cw.state[:3])) if phase2_active else float('nan')
+    mekf_ss     = (float(np.mean(mekf_err_samples[-200:]))
+                   if len(mekf_err_samples) >= 10 else float('nan'))
+
+    return {
+        'seed':           seed,
+        'docked':         docked,
+        'dock_time_hr':   t/3600.0 if docked else float('nan'),
+        'total_dv_mms':   float(np.sum(cw.dv_total)) * 1e3,
+        'adcs_time_s':    adcs_conf_t if adcs_confirmed else float('nan'),
+        'mekf_ss_deg':    mekf_ss,
+        'final_range_m':  final_range,
+        'burn1_range_m':  burn_ranges[0] if len(burn_ranges) > 0 else float('nan'),
+        'burn2_range_m':  burn_ranges[1] if len(burn_ranges) > 1 else float('nan'),
+        'nb_burns':       len(burn_ranges),
+        'failure_mode':        failure_mode,
+        'thrust_misalign_deg': float(np.degrees(params['thrust_misalign_rad'])),
+        'thrust_mag_err':      float(params['thrust_mag_err']),
+        'nav_delay_steps':     int(params['nav_delay_steps']),
+        'dock_offset_m':       float(np.linalg.norm(params['dock_offset_m'])),
+        'dropout_rate_hz':     float(params['dropout_rate_hz']),
+        'omega0_dps':     float(np.degrees(np.linalg.norm(params['omega0']))),
+        'rdv_jitter_s':   float(params['rdv_jitter_s']),
+        'pos_jitter_m':   float(np.linalg.norm(params['pos_jitter_m'])),
+        'rng_noise_scale':float(params['rng_noise_scale']),
+        'dep_cr':         float(params['dep_cr']),
+        'dep_am':         float(params['dep_am']),
+        'chi_am':         float(params['chi_am']),
+        'gyro_bias_scale':float(params['gyro_bias_scale']),
+        'st_noise_scale': float(params['st_noise_scale']),
+        'M0_offset_deg':  float(params['M0_offset_deg']),
+        'error':          '',
+    }
+
+
+# =====================================================================
+#  RUNNER
+# =====================================================================
+
+def _nan(v):
+    return isinstance(v, float) and (v != v)
+
+
+def run_monte_carlo(n_trials=300, n_workers=8, master_seed=42):
+    rng    = np.random.default_rng(master_seed)
+    seeds  = [int(rng.integers(0, 2**31)) for _ in range(n_trials)]
+    params = [sample_params(rng) for _ in range(n_trials)]
+    jobs   = list(zip(seeds, params))
+
+    print(f"\n{'='*62}")
+    print(f"  GEO RPOD Monte Carlo — {n_trials} trials  ({n_workers} workers)")
+    print(f"{'='*62}")
+    print(f"  20 stress axes: tumble, sensors, SRP, orbit epoch,")
+    print(f"  nav jitter (+/-20m/+/-10mm/s), RDV timing +/-120s, RW bias")
+    print(f"  T_SIM_MAX={T_SIM_MAX:.0f}s  "
+          f"dock: range<{DOCK_RANGE_M*100:.0f}cm AND v_rel<{DOCK_VREL_MS*1000:.0f}mm/s\n")
+
+    t0 = time.time()
+
+    if n_workers == 1:
+        results = []
+        for i, job in enumerate(jobs):
+            r = _worker(job)
+            if r['failure_mode'] == 'EXCEPTION':
+                print(f"\n  !! EXCEPTION seed={r['seed']}:\n{r['error']}\n")
+            results.append(r)
+            _print_row(i+1, n_trials, r)
     else:
-        ss_mean = float('nan')
-        ss_3sig = float('nan')
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=n_workers) as pool:
+            results = []
+            for i, r in enumerate(pool.imap_unordered(_worker, jobs)):
+                results.append(r)
+                _print_row(i+1, n_trials, r)
 
-    final_range  = float(cw.range_m)
-    total_dv_mms = float(cw.total_dv_ms * 1000.0)
-    rdv_ok       = rdv_triggered and (final_range < RDV_SUCCESS_M)
-
-    if not rdv_triggered:
-        rdv_outcome = 'NO_TRG'
-    elif rdv_ok:
-        rdv_outcome = 'OK'
-    else:
-        rdv_outcome = 'FAIL'
-
-    return dict(
-        run=run_idx, f107=f107, omega0_deg=float(np.degrees(omega_mag)),
-        detumble_time=detumble_time if detumble_time is not None else float('nan'),
-        phase1_time=phase1_conf_t   if phase1_confirmed else float('nan'),
-        conv_time=conv_time,
-        ss_mean=ss_mean, ss_3sigma=ss_3sig,
-        wheel_saturated=wheel_sat,
-        mode_reached=highest_mode.name,
-        rdv_triggered=rdv_triggered,
-        rdv_success=rdv_ok,
-        rdv_outcome=rdv_outcome,
-        final_range=final_range,
-        total_dv_mms=total_dv_mms,
-        burn1_range=burn_ranges[0] if len(burn_ranges) > 0 else float('nan'),
-        burn2_range=burn_ranges[1] if len(burn_ranges) > 1 else float('nan'),
-        nb_burns=len(burn_ranges),
-    )
+    elapsed = time.time() - t0
+    print(f"\n  Completed {n_trials} trials in {elapsed:.1f}s "
+          f"({elapsed/n_trials:.1f}s/trial)")
+    return results
 
 
-# =============================================================================
-#  MAIN  — parallel dispatch + progress reporting
-# =============================================================================
+def _print_row(i, n, r):
+    status = r['failure_mode']
+    dv   = f"{r['total_dv_mms']:.0f}mm/s" if not _nan(r['total_dv_mms'])  else "—"
+    dt   = f"{r['dock_time_hr']:.2f}hr"    if not _nan(r['dock_time_hr'])  else "—"
+    rng  = f"{r['final_range_m']:.1f}m"    if not _nan(r['final_range_m']) else "—"
+    adcs = f"{r['adcs_time_s']:.0f}s"      if not _nan(r['adcs_time_s'])   else "—"
+    print(f"  [{i:3d}/{n}]  {status:<14}  "
+          f"w={r['omega0_dps']:.1f}dps  adcs={adcs}  "
+          f"jit=+/-{r['pos_jitter_m']:.0f}m  "
+          f"rdv={r['rdv_jitter_s']:+.0f}s  "
+          f"t={dt}  dv={dv}  rng={rng}",
+          flush=True)
 
-if __name__ == '__main__':
 
-    N_RUNS    = int(sys.argv[1]) if len(sys.argv) > 1 else 100
-    N_WORKERS = int(sys.argv[2]) if len(sys.argv) > 2 else max(1, os.cpu_count() - 1)
+# =====================================================================
+#  SUMMARY
+# =====================================================================
 
-    print("=" * 72)
-    print(f"  Monte Carlo — ADCS + CW RelNav  |  {N_RUNS} runs  |  {N_WORKERS} workers")
-    print("=" * 72)
-    print(f"  Phase 1 gate  : FINE_POINTING|MOMENTUM_DUMP + err < {ADCS_STABLE_DEG}° "
-          f"for {ADCS_STABLE_SUST} consecutive steps")
-    print(f"  Phase 2 start : {RDV_DELAY_S:.0f}s after Phase 1 confirmed")
-    print(f"  EKF settle    : {EKF_SETTLE_S:.0f}s min before RDV trigger")
-    print(f"  Cleanup hold  : {CLEANUP_HOLD_S:.0f}s PD hold at origin after burn-2")
-    print(f"  RDV success   : final_range < {RDV_SUCCESS_M} m")
-    print()
+def print_summary(results):
+    docked = [r for r in results if r['docked']]
+    failed = [r for r in results if not r['docked']]
+    n      = len(results)
 
-    t_wall   = time.time()
-    rows     = [None] * N_RUNS
-    done     = 0
+    def arr(key, subset=None):
+        src = subset if subset is not None else results
+        return np.array([r[key] for r in src
+                         if r.get(key) is not None
+                         and not _nan(r.get(key, float('nan')))], dtype=float)
 
-    with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
-        futures = {pool.submit(run_single, i): i for i in range(N_RUNS)}
-        for fut in as_completed(futures):
-            result = fut.result()
-            rows[result['run']] = result
-            done += 1
-            elapsed = time.time() - t_wall
-            eta     = elapsed / done * (N_RUNS - done)
-            r       = result
-            p1_s  = f"{r['phase1_time']:.0f}s"  if not np.isnan(r['phase1_time']) else "---"
-            det_s = f"{r['detumble_time']:.0f}s" if not np.isnan(r['detumble_time']) else "---"
-            conv_s = f"{r['conv_time']:.0f}s"    if r['conv_time'] is not None else "FAIL"
-            print(f"  [{done:3d}/{N_RUNS}]  run={r['run']+1:3d}  "
-                  f"w={r['omega0_deg']:.1f}°/s  det={det_s}  P1@{p1_s}  "
-                  f"conv={conv_s}  rdv={r['rdv_outcome']}  "
-                  f"range={r['final_range']:7.2f}m  "
-                  f"nb={r['nb_burns']}  "
-                  f"dV={r['total_dv_mms']:.1f}mm/s  ETA {eta:.0f}s")
+    print(f"\n{'='*62}")
+    print(f"  MONTE CARLO SUMMARY  ({n} trials)")
+    print(f"{'='*62}")
+    print(f"  Success rate : {len(docked)}/{n}  ({100*len(docked)/n:.1f}%)")
 
-    # ── Summary stats ──────────────────────────────────────────────────────────
-    def _arr(key):
-        return np.array([r[key] for r in rows
-                         if r[key] is not None and not (isinstance(r[key], float) and np.isnan(r[key]))])
+    fm = Counter(r['failure_mode'] for r in results)
+    for k, v in sorted(fm.items(), key=lambda x: -x[1]):
+        print(f"    {k:<18}: {v}")
 
-    det_arr  = _arr('detumble_time')
-    p1_arr   = _arr('phase1_time')
-    conv_arr = _arr('conv_time')
-    ss_m_arr = _arr('ss_mean')
-    ss_3_arr = _arr('ss_3sigma')
-    rng_arr  = np.array([r['final_range']  for r in rows])
-    dv_arr   = np.array([r['total_dv_mms'] for r in rows])
-    ok_mask  = np.array([r['rdv_success']  for r in rows])
-    outcomes = [r['rdv_outcome'] for r in rows]
-    n_ok     = int(ok_mask.sum())
-    n_trig   = sum(1 for o in outcomes if o != 'NO_TRG')
-    n_sat    = sum(r['wheel_saturated'] for r in rows)
+    def stats(a, label, unit=""):
+        if len(a) == 0: return
+        print(f"  {label:<24}: mean={np.mean(a):.2f}  std={np.std(a):.2f}  "
+              f"min={np.min(a):.2f}  max={np.max(a):.2f}  {unit}")
 
-    print()
-    print("=" * 72)
-    print(f"  Results — {N_RUNS} runs  ({N_WORKERS} workers)")
-    print("=" * 72)
-    if len(det_arr):
-        print(f"  Detumble time    : {det_arr.mean():.1f}s mean  {det_arr.std():.1f}s std  "
-              f"{np.percentile(det_arr,99):.1f}s 99th")
-    if len(p1_arr):
-        print(f"  Phase 1 confirm  : {p1_arr.mean():.1f}s mean  "
-              f"({len(p1_arr)}/{N_RUNS} runs reached gate)")
-    if len(conv_arr):
-        print(f"  ADCS conv time   : {conv_arr.mean():.1f}s mean  {conv_arr.std():.1f}s std")
-    if len(ss_m_arr):
-        print(f"  ADCS SS error    : {ss_m_arr.mean():.3f}° mean  "
-              f"{ss_3_arr.mean():.3f}° 3-sigma")
-    print(f"  Wheel saturation : {n_sat}/{N_RUNS}")
-    print(f"  RDV triggered    : {n_trig}/{N_RUNS}")
-    print(f"  RDV success      : {n_ok}/{N_RUNS}  ({100*n_ok/N_RUNS:.0f}%)")
-    if n_ok:
-        print(f"  Final range (OK) : {rng_arr[ok_mask].mean():.2f}m mean  "
-              f"{rng_arr[ok_mask].max():.2f}m max")
-        print(f"  Total ΔV  (OK)   : {dv_arr[ok_mask].mean():.2f}mm/s mean  "
-              f"{dv_arr[ok_mask].max():.2f}mm/s max")
-    print(f"  Wall time        : {time.time()-t_wall:.1f}s")
+    if docked:
+        print()
+        stats(arr('dock_time_hr',  docked), "Dock time",     "hr")
+        stats(arr('total_dv_mms',  docked), "Total dV",      "mm/s")
+        stats(arr('adcs_time_s',   docked), "ADCS gate",     "s")
+        stats(arr('mekf_ss_deg',   docked), "MEKF SS error", "deg")
+        stats(arr('burn1_range_m', docked), "Burn-1 range",  "m")
+        stats(arr('burn2_range_m', docked), "Burn-2 range",  "m")
 
-    # ── Plots ──────────────────────────────────────────────────────────────────
-    plt.rcParams.update({"font.size": 9, "axes.grid": True, "grid.alpha": 0.3})
-    fig = plt.figure(figsize=(22, 14))
-    fig.suptitle(f"Monte Carlo — ADCS + CW RelNav  ({N_RUNS} runs, {N_WORKERS} workers)",
-                 fontsize=13, fontweight='bold')
-    gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.45, wspace=0.35)
+    exceptions = [r for r in failed if r['failure_mode'] == 'EXCEPTION']
+    if exceptions:
+        print(f"\n  Exceptions ({len(exceptions)}):")
+        for r in exceptions[:5]:
+            last_line = [l for l in r['error'].splitlines() if l.strip()]
+            print(f"    seed={r['seed']:10d}: {last_line[-1].strip() if last_line else '?'}")
 
-    rdv_col = ['forestgreen' if r['rdv_success'] else 'crimson' for r in rows]
+    other = [r for r in failed if r['failure_mode'] != 'EXCEPTION']
+    if other:
+        print(f"\n  Other failures ({len(other)}):")
+        for r in other[:8]:
+            print(f"    seed={r['seed']:10d}  w={r['omega0_dps']:.1f}dps  "
+                  f"jit={r['pos_jitter_m']:.0f}m  rdv={r['rdv_jitter_s']:+.0f}s  "
+                  f"{r['failure_mode']}")
 
-    def hist(ax, data, color, xlabel, title, vlines=None, bins=20):
-        d = np.array([x for x in data if x is not None and not np.isnan(x)])
+
+# =====================================================================
+#  PLOTS
+# =====================================================================
+
+def plot_results(results, save_path='monte_carlo_geo.png'):
+    docked = [r for r in results if r['docked']]
+    failed = [r for r in results if not r['docked']]
+    n      = len(results)
+
+    C_OK   = '#27ae60'
+    C_FAIL = '#e74c3c'
+    C_ALL  = '#2980b9'
+
+    def arr(key, subset=None):
+        src = subset if subset is not None else results
+        return np.array([r[key] for r in src
+                         if r.get(key) is not None
+                         and not _nan(r.get(key, float('nan')))], dtype=float)
+
+    def paired(key_x, key_y, subset=None):
+        """Return (xs, ys, colors) for rows where BOTH values are valid."""
+        src  = subset if subset is not None else results
+        cols = [C_OK if r['docked'] else C_FAIL for r in src]
+        xs, ys, cs = [], [], []
+        for r, c in zip(src, cols):
+            vx = r.get(key_x); vy = r.get(key_y)
+            if vx is None or vy is None: continue
+            if _nan(vx) or _nan(vy): continue
+            xs.append(float(vx)); ys.append(float(vy)); cs.append(c)
+        return np.array(xs), np.array(ys), cs
+
+    def hist(ax, data, color, xlabel, title, bins=15):
+        d = np.array([x for x in data if not _nan(x)])
         if len(d) == 0:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center',
-                    transform=ax.transAxes); return
-        ax.hist(d, bins=bins, color=color, edgecolor='white', alpha=0.85)
-        ax.axvline(np.mean(d), color='red', ls='--', label=f"μ={np.mean(d):.1f}")
-        if vlines:
-            for v, lbl, c in vlines:
-                ax.axvline(v, color=c, ls=':', label=lbl)
-        ax.legend(fontsize=7); ax.set_xlabel(xlabel)
-        ax.set_ylabel("Count"); ax.set_title(title)
+                    transform=ax.transAxes, fontsize=9)
+        else:
+            ax.hist(d, bins=bins, color=color, edgecolor='white', lw=0.5, alpha=0.88)
+            ax.axvline(np.mean(d), color='black', ls='--', lw=1.5,
+                       label=f"mu={np.mean(d):.2f}")
+            ax.legend(fontsize=7)
+        ax.set_xlabel(xlabel, fontsize=8)
+        ax.set_ylabel("Count", fontsize=8)
+        ax.set_title(title, fontsize=9, fontweight='bold')
 
-    # Row 0: ADCS
-    hist(fig.add_subplot(gs[0,0]), [r['detumble_time'] for r in rows],
-         'royalblue', 'Time [s]', 'Detumble Time')
-    hist(fig.add_subplot(gs[0,1]), [r['phase1_time'] for r in rows],
-         'steelblue', 'Time [s]', 'Phase 1 Confirm Time')
-    hist(fig.add_subplot(gs[0,2]), [r['conv_time'] for r in rows],
-         'forestgreen', 'Time [s]', f'ADCS Conv Time (<{CONV_THRESH}°)')
-    ax_cdf = fig.add_subplot(gs[0,3])
-    if len(ss_m_arr):
-        ax_cdf.plot(np.sort(ss_m_arr),
-                    np.arange(1, len(ss_m_arr)+1)/len(ss_m_arr)*100,
-                    color='crimson', lw=1.5)
-        ax_cdf.axvline(0.5, color='gray', ls=':', label='0.5° ref')
-        ax_cdf.legend(fontsize=7)
-    ax_cdf.set_xlabel('SS Error [deg]'); ax_cdf.set_ylabel('CDF [%]')
-    ax_cdf.set_title('ADCS SS Error CDF')
+    fig = plt.figure(figsize=(22, 15))
+    fig.suptitle(
+        f"GEO RPOD Monte Carlo — {n} trials  "
+        f"(success {len(docked)}/{n} = {100*len(docked)/n:.1f}%)\n"
+        f"20 stress axes  |  IS-1002 @ 342E  |  50 kg jetpack  |  1 N thruster",
+        fontsize=13, fontweight='bold', y=0.99)
+    gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.50, wspace=0.40)
 
-    # Row 1: RelNav outcomes
-    ax_bar = fig.add_subplot(gs[1,0])
-    counts = {k: outcomes.count(k) for k in ['OK','FAIL','NO_TRG']}
-    cols   = {'OK':'forestgreen','FAIL':'crimson','NO_TRG':'gray'}
-    bars   = ax_bar.bar(counts.keys(), counts.values(),
-                        color=[cols[k] for k in counts], edgecolor='white', alpha=0.85)
-    for bar, v in zip(bars, counts.values()):
-        ax_bar.text(bar.get_x()+bar.get_width()/2, v+0.3, str(v),
-                    ha='center', fontsize=11, fontweight='bold')
-    ax_bar.set_ylabel('Count'); ax_bar.set_title('RDV Outcome')
+    # Row 0 — mission outcomes
 
-    hist(fig.add_subplot(gs[1,1]), rng_arr.tolist(),
-         'darkorange', 'Range [m]', 'Final Range',
-         vlines=[(RDV_SUCCESS_M, f'{RDV_SUCCESS_M}m', 'red')])
+    # [0,0] Outcome breakdown
+    ax = fig.add_subplot(gs[0, 0])
+    modes  = ['DOCKED', 'ADCS_TIMEOUT', 'NO_LAMBERT', 'PROX_STALL', 'TIMEOUT', 'EXCEPTION']
+    colors = [C_OK, '#e67e22', '#8e44ad', '#e74c3c', '#95a5a6', '#7f8c8d']
+    fm     = Counter(r['failure_mode'] for r in results)
+    counts = [fm.get(m, 0) for m in modes]
+    bars   = ax.bar([m.replace('_', '\n') for m in modes], counts,
+                    color=colors, edgecolor='white', lw=0.5, alpha=0.88)
+    for bar, v in zip(bars, counts):
+        if v > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, v + 0.2, str(v),
+                    ha='center', fontsize=10, fontweight='bold')
+    ax.set_ylabel("Count", fontsize=8)
+    ax.set_title("Outcome Breakdown", fontsize=9, fontweight='bold')
+    ax.tick_params(axis='x', labelsize=7)
 
-    ax_dv = fig.add_subplot(gs[1,2])
-    ax_dv.hist(dv_arr, bins=20, color='slateblue', edgecolor='white', alpha=0.7, label='all')
-    if n_ok:
-        ax_dv.hist(dv_arr[ok_mask], bins=20, color='forestgreen',
-                   edgecolor='white', alpha=0.7, label='OK only')
-    ax_dv.legend(fontsize=7); ax_dv.set_xlabel('Total ΔV [mm/s]')
-    ax_dv.set_ylabel('Count'); ax_dv.set_title('Total ΔV Distribution')
+    # [0,1] Docking time
+    hist(fig.add_subplot(gs[0, 1]),
+         arr('dock_time_hr', docked).tolist(),
+         C_OK, 'Docking time [hr]', 'Docking Time (successes)')
 
-    ax_b = fig.add_subplot(gs[1,3])
-    b1 = [r['burn1_range'] for r in rows if not np.isnan(r['burn1_range'])]
-    b2 = [r['burn2_range'] for r in rows if not np.isnan(r['burn2_range'])]
-    if b1: ax_b.hist(b1, bins=20, color='steelblue',  alpha=0.7, edgecolor='white', label='Burn 1')
-    if b2: ax_b.hist(b2, bins=20, color='darkorange', alpha=0.7, edgecolor='white', label='Burn 2')
-    ax_b.legend(fontsize=7); ax_b.set_xlabel('Range at Burn [m]')
-    ax_b.set_ylabel('Count'); ax_b.set_title('Range at Each Burn')
+    # [0,2] Total dV — docked vs failed
+    ax = fig.add_subplot(gs[0, 2])
+    dv_d = arr('total_dv_mms', docked)
+    dv_f = arr('total_dv_mms', failed)
+    if len(dv_d): ax.hist(dv_d, bins=15, color=C_OK,   edgecolor='white', lw=0.5, alpha=0.8, label='Docked')
+    if len(dv_f): ax.hist(dv_f, bins=10, color=C_FAIL, edgecolor='white', lw=0.5, alpha=0.8, label='Failed')
+    ax.legend(fontsize=7)
+    ax.set_xlabel('Total dV [mm/s]', fontsize=8)
+    ax.set_ylabel('Count', fontsize=8)
+    ax.set_title('Total dV', fontsize=9, fontweight='bold')
 
-    # Row 2: Sensitivity
-    omega_degs = [r['omega0_deg'] for r in rows]
-    f107s      = [r['f107']       for r in rows]
-    det_times  = [r['detumble_time'] for r in rows]
-    fin_ranges = [r['final_range']   for r in rows]
-    ss_means   = [r['ss_mean']       for r in rows]
+    # [0,3] ADCS gate time
+    hist(fig.add_subplot(gs[0, 3]),
+         arr('adcs_time_s').tolist(),
+         C_ALL, 'ADCS confirmation time [s]', 'ADCS Gate Time')
 
-    ax_s1 = fig.add_subplot(gs[2,0])
-    ax_s1.scatter(omega_degs, det_times, c='royalblue', alpha=0.5, s=15)
-    ax_s1.set_xlabel('Tumble [deg/s]'); ax_s1.set_ylabel('Detumble Time [s]')
-    ax_s1.set_title('Tumble vs Detumble Time')
+    # Row 1 — RPOD metrics
 
-    ax_s2 = fig.add_subplot(gs[2,1])
-    ax_s2.scatter(omega_degs, fin_ranges, c=rdv_col, alpha=0.6, s=15)
-    ax_s2.axhline(RDV_SUCCESS_M, color='gray', ls=':', label=f'{RDV_SUCCESS_M}m')
-    ax_s2.legend(fontsize=7); ax_s2.set_xlabel('Tumble [deg/s]')
-    ax_s2.set_ylabel('Final Range [m]'); ax_s2.set_title('Tumble vs Final Range (green=OK)')
+    # [1,0] MEKF SS pointing
+    hist(fig.add_subplot(gs[1, 0]),
+         arr('mekf_ss_deg', docked).tolist(),
+         C_ALL, 'MEKF SS error [deg]', 'MEKF Pointing SS (docked)')
 
-    ax_s3 = fig.add_subplot(gs[2,2])
-    ax_s3.scatter(f107s, ss_means, c='saddlebrown', alpha=0.5, s=15)
-    ax_s3.set_xlabel('Solar f107 [sfu]'); ax_s3.set_ylabel('SS Error [deg]')
-    ax_s3.set_title('Solar Activity vs ADCS SS Error')
+    # [1,1] Lambert burn ranges
+    ax = fig.add_subplot(gs[1, 1])
+    b1 = arr('burn1_range_m', docked)
+    b2 = arr('burn2_range_m', docked)
+    if len(b1): ax.hist(b1, bins=15, color='#3498db', alpha=0.75, edgecolor='white', lw=0.5, label='Burn-1')
+    if len(b2): ax.hist(b2, bins=15, color='#e67e22', alpha=0.75, edgecolor='white', lw=0.5, label='Burn-2')
+    ax.legend(fontsize=7)
+    ax.set_xlabel('Truth range at burn [m]', fontsize=8)
+    ax.set_ylabel('Count', fontsize=8)
+    ax.set_title('Lambert Burn Ranges (docked)', fontsize=9, fontweight='bold')
 
-    ax_s4 = fig.add_subplot(gs[2,3])
-    ax_s4.scatter(f107s, fin_ranges, c=rdv_col, alpha=0.6, s=15)
-    ax_s4.axhline(RDV_SUCCESS_M, color='gray', ls=':', label=f'{RDV_SUCCESS_M}m')
-    ax_s4.legend(fontsize=7); ax_s4.set_xlabel('Solar f107 [sfu]')
-    ax_s4.set_ylabel('Final Range [m]'); ax_s4.set_title('Solar Activity vs Final Range (green=OK)')
+    # [1,2] dV vs dock time
+    ax = fig.add_subplot(gs[1, 2])
+    xs, ys, _ = paired('dock_time_hr', 'total_dv_mms', docked)
+    if len(xs):
+        sc = ax.scatter(xs, ys, c=xs, cmap='viridis', s=35, alpha=0.85, zorder=3)
+        plt.colorbar(sc, ax=ax, label='Dock time [hr]', pad=0.02)
+    ax.set_xlabel('Docking time [hr]', fontsize=8)
+    ax.set_ylabel('Total dV [mm/s]', fontsize=8)
+    ax.set_title('dV vs Docking Time', fontsize=9, fontweight='bold')
 
-    plt.savefig('monte_carlo_relnav.png', dpi=150, bbox_inches='tight')
-    print('\n  Plot saved: monte_carlo_relnav.png')
+    # [1,3] RDV jitter vs outcome
+    ax = fig.add_subplot(gs[1, 3])
+    jit_ok   = arr('rdv_jitter_s', docked)
+    jit_fail = arr('rdv_jitter_s', failed)
+    if len(jit_ok):   ax.hist(jit_ok,   bins=12, color=C_OK,   alpha=0.75, edgecolor='white', lw=0.5, label='Docked')
+    if len(jit_fail): ax.hist(jit_fail, bins=12, color=C_FAIL, alpha=0.75, edgecolor='white', lw=0.5, label='Failed')
+    ax.legend(fontsize=7)
+    ax.set_xlabel('RDV trigger jitter [s]', fontsize=8)
+    ax.set_ylabel('Count', fontsize=8)
+    ax.set_title('RDV Timing Jitter vs Outcome', fontsize=9, fontweight='bold')
+
+    # Row 2 — sensitivity scatter
+
+    # [2,0] Tumble rate vs ADCS gate time
+    ax = fig.add_subplot(gs[2, 0])
+    xs, ys, cs = paired('omega0_dps', 'adcs_time_s')
+    if len(xs): ax.scatter(xs, ys, c=cs, s=18, alpha=0.7)
+    ax.set_xlabel('Initial tumble [deg/s]', fontsize=8)
+    ax.set_ylabel('ADCS gate time [s]', fontsize=8)
+    ax.set_title('Tumble vs ADCS Gate\n(green=docked)', fontsize=9, fontweight='bold')
+
+    # [2,1] Position jitter vs final range
+    ax = fig.add_subplot(gs[2, 1])
+    xs, ys, cs = paired('pos_jitter_m', 'final_range_m')
+    if len(xs): ax.scatter(xs, ys, c=cs, s=18, alpha=0.7)
+    ax.axhline(DOCK_RANGE_M, color='gray', ls=':', lw=1, label=f'{DOCK_RANGE_M}m dock')
+    ax.legend(fontsize=7)
+    ax.set_xlabel('Position jitter |dr| [m]', fontsize=8)
+    ax.set_ylabel('Final range [m]', fontsize=8)
+    ax.set_title('Nav Jitter vs Final Range', fontsize=9, fontweight='bold')
+
+    # [2,2] Ranging noise scale vs dock time (docked only)
+    ax = fig.add_subplot(gs[2, 2])
+    xs, ys, _ = paired('rng_noise_scale', 'dock_time_hr', docked)
+    if len(xs): ax.scatter(xs, ys, c=C_OK, s=18, alpha=0.7)
+    ax.set_xlabel('Ranging noise scale', fontsize=8)
+    ax.set_ylabel('Dock time [hr]', fontsize=8)
+    ax.set_title('Sensor Noise vs Dock Time (docked)', fontsize=9, fontweight='bold')
+
+    # [2,3] Parameter tornado — mean docked vs failed
+    ax = fig.add_subplot(gs[2, 3])
+    p_keys   = ['dep_cr', 'dep_am', 'chi_am',
+                'gyro_bias_scale', 'rng_noise_scale', 'st_noise_scale', 'M0_offset_deg',
+                'thrust_misalign_deg', 'thrust_mag_err', 'nav_delay_steps',
+                'dock_offset_m', 'dropout_rate_hz']
+    p_labels = ['Deputy Cr', 'Deputy A/m', 'Chief A/m',
+                'Gyro bias x', 'Ranging noise x', 'ST noise x', 'M0 offset [deg]',
+                'Thrust misalign [deg]', 'Thrust mag err', 'Nav delay [steps]',
+                'Dock offset [m]', 'Dropout rate [Hz]']
+    if docked and failed:
+        d_means = [np.mean([r[k] for r in docked if not _nan(r.get(k, float('nan')))]) for k in p_keys]
+        f_means = [np.mean([r[k] for r in failed  if not _nan(r.get(k, float('nan')))]) for k in p_keys]
+        y = np.arange(len(p_keys))
+        ax.barh(y - 0.2, d_means, 0.35, color=C_OK,   alpha=0.85, edgecolor='white', label='Docked')
+        ax.barh(y + 0.2, f_means, 0.35, color=C_FAIL, alpha=0.85, edgecolor='white', label='Failed')
+        ax.set_yticks(y); ax.set_yticklabels(p_labels, fontsize=7)
+        ax.legend(fontsize=7)
+        ax.set_xlabel('Mean parameter value', fontsize=8)
+    else:
+        msg = 'All docked — no failures to compare' if not failed else 'No successes'
+        ax.text(0.5, 0.5, msg, ha='center', va='center',
+                transform=ax.transAxes, fontsize=9)
+    ax.set_title('Parameter Means: Docked vs Failed', fontsize=9, fontweight='bold')
+
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\n  Plot saved -> {save_path}")
     plt.show()
+
+
+# =====================================================================
+#  ENTRY POINT
+# =====================================================================
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='GEO RPOD Monte Carlo')
+    parser.add_argument('--n',       type=int, default=300,
+                        help='Number of trials (default 300)')
+    parser.add_argument('--workers', type=int,
+                        default=max(1, os.cpu_count() - 1),
+                        help='Parallel workers (default: all cores - 1)')
+    parser.add_argument('--seed',    type=int, default=42,
+                        help='Master RNG seed (default 42)')
+    parser.add_argument('--save',    type=str, default='monte_carlo_geo.png',
+                        help='Plot output path')
+    args = parser.parse_args()
+
+    results = run_monte_carlo(
+        n_trials    = args.n,
+        n_workers   = args.workers,
+        master_seed = args.seed)
+
+    print_summary(results)
+    plot_results(results, save_path=args.save)

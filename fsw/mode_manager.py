@@ -44,12 +44,10 @@ class ModeManager:
     TRIAD_ERR_THRESHOLD   = 15.0               # deg — TRIAD accepted below this
     SUN_ACQ_TIMEOUT       = 600.0              # s — give up sun acq after this long
 
-    # Momentum dump thresholds — set at 75% / 20% of h_max (0.004 N·m·s).
-    # Wide hysteresis prevents rapid FINE_POINTING <-> MOMENTUM_DUMP cycling:
-    # at small pointing errors the controller commands ~1-10 uNm, which fills
-    # the old 0.7 mNms band in seconds.  A 2.2 mNms band takes ~200 s to refill.
-    DUMP_TRIGGER          = 0.003              # N·m·s — start dump above this |h|  (75% h_max)
-    DUMP_COMPLETE         = 0.0008             # N·m·s — end dump below this |h|    (20% h_max)
+    # Momentum dump thresholds — scaled to 75% / 20% of h_max (4.0 N·m·s).
+    # 50 kg jetpack, Bradford WSAT wheels (4.0 N·m·s).
+    DUMP_TRIGGER          = 3.000              # N·m·s — start dump above this |h|  (75% of 4.0 N·m·s)
+    DUMP_COMPLETE         = 0.800              # N·m·s — end dump below this |h|    (20% of 4.0 N·m·s)
 
     # Only enter MOMENTUM_DUMP when pointing is already good (deg).
     # Prevents thrashing: large pointing errors cause large wheel torques -> instant re-trigger.
