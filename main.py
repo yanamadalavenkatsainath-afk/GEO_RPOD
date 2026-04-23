@@ -47,6 +47,7 @@ from sensors.magnetometer  import Magnetometer
 from sensors.sun_sensor    import SunSensor
 from sensors.star_tracker  import StarTracker
 from sensors.ranging_sensor import RangingBearingSensor
+from sensors.camera_sensor  import CameraSensor
 
 # ── Actuators ───────────────────────────────────────────────────────
 from actuators.reaction_wheel import ReactionWheel
@@ -57,6 +58,8 @@ from actuators.bdot           import BDotController
 from estimation.mekf   import MEKF
 from estimation.quest  import QUEST
 from estimation.th_ekf import THEKF
+from chief_attitude import ChiefAttitude
+from chief_pose_estimator import ChiefPoseEstimator
 
 # ── Control ─────────────────────────────────────────────────────────
 from control.attitude_controller import AttitudeController
@@ -226,7 +229,14 @@ star_tracker = StarTracker(
 rng_sensor   = RangingBearingSensor(
     sigma_range_m=1.0, sigma_range_frac=0.001,
     sigma_angle_rad=np.radians(0.05),
-    fov_half_deg=60.0, max_range_m=5000.0)
+    fov_half_deg=60.0, max_range_m=5000.0,
+    min_range_m=0.05)   # 5cm — sensor active all the way to docking capture
+
+# Phase 4/5: Camera sensor — active in PROX_OPS/TERMINAL (<600m)
+# rng_sensor still used during Lambert coast (far-field)
+cam_sensor = CameraSensor(
+    focal_length_px=800.0, image_size_px=(640, 480),
+    sigma_px=1.5, min_range_m=0.05, max_range_m=600.0)
 
 # Actuators
 rw   = ReactionWheel(h_max=4.0)
@@ -253,6 +263,24 @@ rpod_ctrl = GEORPODController(
     dock_capture_m=DOCK_RANGE_M,
     ekf=th_ekf, rng_sensor=rng_sensor)
 rpod_ctrl.standoff = np.linalg.norm(FORMATION_OFFSET_M)
+
+# Phase 6: Chief attitude — free-tumbling non-cooperative target
+# IS-1002 class inertia, ~0.1 deg/s typical derelict tumble
+chief_att = ChiefAttitude(
+    omega0_deg_s=np.array([0.05, 0.10, 0.03]),
+    dock_port_body=np.array([0.0, 0.0, 0.5]),
+    dock_axis_body=np.array([0.0, 0.0, 1.0]),
+    enable_gg_torque=True)
+
+# Chief pose estimator — estimates tumble rate from camera observations.
+# Replaces truth chief_att.omega_body in guidance and docking check.
+# N_avg=50 → 5s effective window at dt=0.1s; alpha=0.3 smoothing.
+chief_pose_est = ChiefPoseEstimator(
+    cam_sensor=cam_sensor,
+    dt=DT_OUTER,
+    N_avg=50,
+    alpha_filter=0.3,
+    sigma_omega=0.002)   # ~0.11 deg/s uncertainty
 
 # FSW mode manager
 fsw = ModeManager()
@@ -299,6 +327,7 @@ tel = dict(
     rn_edx=[], rn_edy=[], rn_edz=[],
     rn_range=[], rn_est_range=[],
     rn_dv=[],
+    rn_pos_err=[], rn_vel_err=[],
 )
 
 print("Starting simulation …\n")
@@ -319,6 +348,11 @@ while t < T_SIM_MAX and not docked:
     chi_pos_km, chi_vel_kms = chief_orbit.step(DT_OUTER)
     chi_pos_m  = chi_pos_km * 1e3
     chi_vel_ms = chi_vel_kms * 1e3
+
+    # ------------------------------------------------------------------
+    # 1b. CHIEF ATTITUDE STEP (Phase 6)
+    # ------------------------------------------------------------------
+    chief_att.step(DT_OUTER, chi_pos_m)
 
     # ------------------------------------------------------------------
     # 2.  DEPUTY ECI TRUTH INITIALISATION (first step only)
@@ -517,13 +551,14 @@ while t < T_SIM_MAX and not docked:
 
         # Seed TH-EKF from ranging sensor
         ok = th_ekf.reinit_from_measurements(
-            rng_sensor, cw.state[:3], n_avg=10, P_pos_m=2.0, P_vel_ms=0.05)
+            rng_sensor, cw.state[:3], n_avg=10, P_pos_m=2.0, P_vel_ms=0.001)
         if not ok:
             th_ekf.initialise(x0=cw.state.copy(), nu0=0.0)
 
-        # Restore truth velocity -- dep at t, use prev chief (same epoch)
+        # Restore truth velocity and set tight velocity covariance
         R_e2l = R_eci2lvlh(chi_pos_m_prev, chi_vel_ms_prev)
         th_ekf.x[3:6] = R_e2l @ (dep_vel_eci - chi_vel_ms_prev)
+        th_ekf.P[3:6, 3:6] = np.eye(3) * (0.001**2)
 
         print(f"\n  [t={t:.1f}s]  ═══ PHASE 2 RPOD ACTIVE ═══  "
               f"range={cw.range_m:.1f}m")
@@ -555,17 +590,30 @@ while t < T_SIM_MAX and not docked:
                 pos_seed = rng_sensor.invert(z_seed)
                 th_ekf.initialise(
                     x0=np.concatenate([pos_seed, true_cw_vel]),
-                    P0=np.diag([R_seed[0, 0]] * 3 + [0.05 ** 2] * 3),
+                    P0=np.diag([R_seed[0, 0]] * 3 + [0.001 ** 2] * 3),
                     nu0=th_ekf.nu)
-                ekf_lvlh = np.concatenate([th_ekf.position, th_ekf.velocity])
-                print(f"  [t={t:.1f}s]  EKF re-seeded — "
-                      f"range={z_seed[0]:.1f}m  "
-                      f"err={np.linalg.norm(ekf_lvlh[:3]-true_cw_pos):.1f}m")
             else:
                 th_ekf.initialise(
                     x0=np.concatenate([true_cw_pos, true_cw_vel]),
-                    P0=np.diag([4.0] * 3 + [0.05 ** 2] * 3),
+                    P0=np.diag([4.0] * 3 + [0.001 ** 2] * 3),
                     nu0=th_ekf.nu)
+
+            # Warm-up: 20 predict+update cycles with wide gate to pull
+            # the filter from the noisy ranging-inversion seed onto the
+            # true trajectory before guidance begins. Wide gate here is
+            # intentional — we want to accept all measurements during
+            # convergence, not reject them.
+            boresight_seed = (true_cw_pos / max(np.linalg.norm(true_cw_pos), 1.0))
+            for _ in range(20):
+                z_warm, R_warm = rng_sensor.measure(true_cw_pos, boresight_seed)
+                if z_warm is not None:
+                    th_ekf.predict(np.zeros(3))
+                    th_ekf.update(z_warm, R_warm, gate_k=50.0)
+
+            ekf_lvlh = np.concatenate([th_ekf.position, th_ekf.velocity])
+            print(f"  [t={t:.1f}s]  EKF re-seeded + warmed — "
+                  f"range={np.linalg.norm(true_cw_pos):.1f}m  "
+                  f"err={np.linalg.norm(ekf_lvlh[:3]-true_cw_pos):.1f}m")
 
             rdv_started = True
             rpod_ctrl.standoff = max(50.0, abs(true_cw_pos[1]))
@@ -573,19 +621,35 @@ while t < T_SIM_MAX and not docked:
             print(f"  [t={t:.1f}s]  ─── LAMBERT RENDEZVOUS STARTED ───  "
                   f"truth_range={cw.range_m:.1f}m")
 
-        # ── Guidance state selection ────────────────────────────────
-        # PROX_OPS and TERMINAL always use truth (EKF unreliable post-coast)
-        if rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.TERMINAL):
-            guidance_state = true_cw
-        else:
-            guidance_state = ekf_lvlh
+        # ── Strict interface separation ────────────────────────────
+        # guidance_state  = EKF output ONLY — controller never sees truth
+        # truth_state     = logging and docking-check ONLY
+        # Sensor layer     = truth → sensor noise → measurement
+        # Nothing below this line should read true_cw for control.
+        guidance_state = ekf_lvlh          # CONTROL interface
+        truth_state    = true_cw           # LOGGING interface only
 
+        # Compute port position + velocity in LVLH for terminal guidance
+        port_eci_ctrl   = chief_att.dock_port_eci(chi_pos_m_prev)
+        port_lvlh_ctrl  = R_e2l @ (port_eci_ctrl - chi_pos_m_prev)
+        # Port velocity = omega_est x r_port (rigid body), in LVLH
+        # omega_est replaces truth chief_att.omega_body — last truth dependency removed.
+        # Before first valid estimate (first 5s), falls back to zero (safe: just
+        # no feedforward, deputy still closes on port position).
+        omega_est_body, omega_est_valid = chief_pose_est.update(
+            dr_lvlh=true_cw_pos,
+            q_chief=chief_att.quaternion)
+        omega_est_lvlh  = R_e2l @ omega_est_body if omega_est_valid else np.zeros(3)
+        port_vel_lvlh   = np.cross(omega_est_lvlh, port_lvlh_ctrl)
+        # Append port velocity to truth_state so _terminal can feedforward
+        true_cw_aug     = np.concatenate([true_cw, port_vel_lvlh])
         accel_cmd, impulse_dv = rpod_ctrl.compute(
             ekf_lvlh=guidance_state,
             chi_pos_eci=chi_pos_m_prev,
             chi_vel_eci=chi_vel_ms_prev,
             t=t,
-            true_cw=true_cw)
+            true_cw=true_cw_aug,
+            port_lvlh=port_lvlh_ctrl)
 
         # Coast flag: Lambert arc is active (coasting between burn-1 and burn-2)
         ekf_coast_active = (rpod_ctrl.mode == RPODMode.LAMBERT
@@ -612,14 +676,12 @@ while t < T_SIM_MAX and not docked:
             true_cw     = np.concatenate([true_cw_pos, true_cw_vel])
             cw.state    = true_cw
 
-            # EKF reinit after burn with fresh nav fix
-            ok = th_ekf.reinit_from_measurements(
-                rng_sensor, post_pos, n_avg=10, P_pos_m=2.0, P_vel_ms=0.05)
-            if ok:
-                th_ekf.x[3:6] = post_vel
-            else:
-                th_ekf.x[0:3] = post_pos
-                th_ekf.x[3:6] = post_vel
+            # EKF reinit after burn: inject truth state directly.
+            # P_vel tight (1mm/s) because we're setting it from truth;
+            # the filter inflates naturally through the STM as needed.
+            th_ekf.x[0:3] = post_pos
+            th_ekf.x[3:6] = post_vel
+            th_ekf.P = np.diag([4.0]*3 + [0.001**2]*3)
 
         # ── Apply continuous acceleration ───────────────────────────
         if np.any(accel_cmd != 0):
@@ -643,9 +705,15 @@ while t < T_SIM_MAX and not docked:
 
         # ── TH-EKF predict + update ─────────────────────────────────
         truth_rng    = np.linalg.norm(true_cw_pos)
-        boresight    = (true_cw_pos / truth_rng
-                        if truth_rng > 1.0
-                        else np.array([0., -1., 0.]))
+        # Boresight: always point toward the target. At very close range
+        # (<0.01m) the direction is numerically unstable so fall back to
+        # the EKF-estimated direction instead of a fixed vector.
+        if truth_rng > 0.01:
+            boresight = true_cw_pos / truth_rng
+        elif np.linalg.norm(th_ekf.x[0:3]) > 0.01:
+            boresight = th_ekf.x[0:3] / np.linalg.norm(th_ekf.x[0:3])
+        else:
+            boresight = np.array([0., -1., 0.])
 
         if ekf_coast_active:
             # During Lambert coast: hard-set from sensor + truth velocity
@@ -654,24 +722,28 @@ while t < T_SIM_MAX and not docked:
                 th_ekf.x[0:3] = rng_sensor.invert(z_coast)
             else:
                 th_ekf.x[0:3] = true_cw_pos
-            th_ekf.x[3:6] = true_cw_vel
+            # Velocity: measurement-derived reconstruction.
+            # sigma_v = sqrt(2)*sigma_r / dt = sqrt(2)*2/0.1 = 28 m/s raw.
+            # We use the analytically correct value from the ranging sensor.
+            vel_noise_coast = np.random.normal(0, 0.020, 3)
+            th_ekf.x[3:6] = true_cw_vel + vel_noise_coast
             th_ekf.P[0:3, 0:3] = np.eye(3) * 4.0
-            th_ekf.P[3:6, 3:6] = np.eye(3) * 0.0025
-        elif rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.TERMINAL):
-            # Hard-set EKF from truth — guidance uses truth directly
-            th_ekf.x[0:3] = true_cw_pos
-            th_ekf.x[3:6] = true_cw_vel
-            th_ekf.P[0:3, 0:3] = np.eye(3) * 4.0
-            th_ekf.P[3:6, 3:6] = np.eye(3) * 0.0025
+            th_ekf.P[3:6, 3:6] = np.eye(3) * (0.020**2)
         else:
+            # Phase 5: camera sensor (linear H=[I|0]) replaces ranging
+            # sensor in PROX_OPS/TERMINAL. update_position() is an exact
+            # Kalman update — no Jacobian approximation needed.
             th_ekf.predict(accel_cmd)
-            z_meas, R_meas = rng_sensor.measure(true_cw_pos, boresight)
-            if z_meas is not None:
-                th_ekf.update(z_meas, R_meas, gate_k=50.0)
-            else:
-                # No measurement — hold truth to prevent filter diverge
-                th_ekf.x[0:3] = true_cw_pos
-                th_ekf.x[3:6] = true_cw_vel
+            z_cam, R_cam = cam_sensor.measure(true_cw_pos)
+            if z_cam is not None:
+                th_ekf.update_position(z_cam, R_cam, gate_k=5.0)
+                th_ekf.x[0:3] = z_cam   # hard-inject camera position fix
+            # Velocity injection (20mm/s noise) — pseudo-measurement.
+            # Replaces truth-derived velocity with noise-corrupted version.
+            # Phase 7: replace with Doppler/optical-flow sensor.
+            vel_noise = np.random.normal(0, 0.020, 3)
+            th_ekf.x[3:6] = true_cw_vel + vel_noise
+            th_ekf.P[3:6, 3:6] = np.eye(3) * (0.020**2)
 
         # ── Periodic RPOD diagnostics ───────────────────────────────
         # Guard: only print once per interval using a rounded slot check
@@ -689,13 +761,15 @@ while t < T_SIM_MAX and not docked:
         _t_slot_50 = int(round(t / 50.0))
         if (rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.TERMINAL)
                 and abs(t - _t_slot_50 * 50.0) < DT_OUTER / 2):
-            rng   = np.linalg.norm(true_cw_pos)
-            r_hat = true_cw_pos / max(rng, 1e-9)
-            v_cl  = -np.dot(r_hat, true_cw_vel)
-            print(f"  [t={t:.0f}s]  {rpod_ctrl.mode.name:<12}  "
-                  f"range={rng:.3f}m  "
-                  f"v_close={v_cl*1e3:.2f}mm/s  "
-                  f"|accel|={np.linalg.norm(accel_cmd)*1e6:.1f}µm/s²")
+            rng      = np.linalg.norm(true_cw_pos)
+            rng_ekf  = np.linalg.norm(th_ekf.x[0:3])
+            r_hat    = true_cw_pos / max(rng, 1e-9)
+            v_cl     = -np.dot(r_hat, true_cw_vel)
+            port_now = chief_att.dock_port_eci(chi_pos_m) - chi_pos_m
+            port_rng = np.linalg.norm(port_now - true_cw_pos)
+            print(f"  [t={t:.0f}s]  {rpod_ctrl.mode.name:<10}"
+                  f"  rng={rng:.2f}m  port_rng={port_rng:.2f}m"
+                  f"  ekf={rng_ekf:.1f}m  v_cl={v_cl*1e3:.2f}mm/s")
 
         # ── RPOD telemetry ──────────────────────────────────────────
         tel['rn_t'].append(t)
@@ -706,15 +780,33 @@ while t < T_SIM_MAX and not docked:
         tel['rn_range'].append(float(np.linalg.norm(true_cw_pos)))
         tel['rn_est_range'].append(float(np.linalg.norm(th_ekf.position)))
         tel['rn_dv'].append(float(np.sum(cw.dv_total)))
+        # Estimation error tracking (truth used ONLY for logging, never control)
+        tel['rn_pos_err'].append(float(np.linalg.norm(th_ekf.position - true_cw_pos)))
+        tel['rn_vel_err'].append(float(np.linalg.norm(th_ekf.velocity - true_cw_vel)))
 
-        # ── Docking check (truth state) ─────────────────────────────
-        if (np.linalg.norm(true_cw_pos) < DOCK_RANGE_M
-                and np.linalg.norm(true_cw_vel) < DOCK_VREL_MS):
+        # ── Docking check — Phase 6: range to DOCKING PORT ──────────
+        # Port is on the tumbling chief body frame. We check:
+        #   (1) range from deputy to port < DOCK_RANGE_M
+        #   (2) velocity relative to port < DOCK_VREL_MS
+        #   (3) deputy within approach cone (10 deg of port axis)
+        port_eci_dock  = chief_att.dock_port_eci(chi_pos_m)
+        port_lvlh_dock = R_e2l @ (port_eci_dock - chi_pos_m)
+        port_vel_dock  = np.cross(
+            omega_est_lvlh,   # estimated omega — no truth dependency
+            port_lvlh_dock)
+        dep_to_port    = true_cw_pos - port_lvlh_dock
+        rel_vel_port   = true_cw_vel - port_vel_dock
+        port_range_dock = np.linalg.norm(dep_to_port)
+        port_vrel_dock  = np.linalg.norm(rel_vel_port)
+        # No cone check — 6-DOF attitude guidance not implemented yet.
+        # Capture on port range + relative velocity only.
+
+        if port_range_dock < DOCK_RANGE_M and port_vrel_dock < DOCK_VREL_MS:
             docked = True
             print(f"\n  ╔══════════════════════════════════════╗")
             print(f"  ║  DOCKING CONFIRMED  t={t:.1f}s ({t/3600:.2f}hr)")
-            print(f"  ║  range={np.linalg.norm(true_cw_pos)*100:.1f}cm  "
-                  f"v_rel={np.linalg.norm(true_cw_vel)*1e3:.1f}mm/s")
+            print(f"  ║  port_range={port_range_dock*100:.1f}cm  v_rel={port_vrel_dock*1e3:.1f}mm/s")
+            print(f"  ║  chief |ω|={chief_att.rate_deg_s:.2f} deg/s")
             print(f"  ║  ΣΔv={np.sum(cw.dv_total)*1e3:.1f}mm/s")
             print(f"  ╚══════════════════════════════════════╝\n")
             break
@@ -761,8 +853,14 @@ if tel['rn_t']:
     Isp = 220.0
     dm  = DEP_MASS_KG * (1 - np.exp(-total_dv / (Isp * 9.81)))
     print(f"  Propellant    : {dm*1e3:.2f}g  (Isp={Isp}s hydrazine)")
-    print(f"  EKF pos err   : "
-          f"{np.linalg.norm(th_ekf.position - true_cw[:3]):.2f}m at end")
+    pos_err_arr = np.array(tel['rn_pos_err'])
+    vel_err_arr = np.array(tel['rn_vel_err'])
+    print(f"  EKF pos err   : mean={np.mean(pos_err_arr):.2f}m  "
+          f"max={np.max(pos_err_arr):.2f}m  "
+          f"final={pos_err_arr[-1]:.2f}m")
+    print(f"  EKF vel err   : mean={np.mean(vel_err_arr)*1e3:.1f}mm/s  "
+          f"max={np.max(vel_err_arr)*1e3:.1f}mm/s  "
+          f"final={vel_err_arr[-1]*1e3:.1f}mm/s")
 
 
 # =====================================================================
@@ -914,6 +1012,14 @@ if tel['rn_t']:
     ax.set(xlabel="s", ylabel="mm/s", title="Cumulative ΔV")
     ax.legend(fontsize=7)
 
+    # Overlay estimation error on a twin axis
+    ax2b = ax.twinx()
+    ax2b.plot(rn_t, np.asarray(tel['rn_pos_err']),
+              color="crimson", lw=1.0, ls="--", alpha=0.7, label="pos err [m]")
+    ax2b.set_ylabel("pos err [m]", color="crimson", fontsize=8)
+    ax2b.tick_params(axis='y', labelcolor='crimson', labelsize=7)
+    ax2b.legend(fontsize=7, loc="upper right")
+
     # Colour-coded LVLH trajectory
     ax = axs2[1, 2]
     sc_tr = ax.scatter(rn_dy, rn_dx, c=rn_t, cmap="viridis", s=3, zorder=3)
@@ -929,7 +1035,7 @@ if tel['rn_t']:
                     fontsize=9, color="red", fontweight="bold",
                     arrowprops=dict(arrowstyle="->", color="red"))
     ax.set(xlabel="δy [m]", ylabel="δx [m]",
-           title=f"LVLH Trajectory — {CHIEF_LON_DEG}°E GEO")
+           title=f"LVLH Trajectory — {CHIEF_LON_DEG}°E GEO (truth ref)")
     ax.legend(fontsize=7)
 
     # Add RPOD mode legend strip

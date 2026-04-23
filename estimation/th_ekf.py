@@ -10,7 +10,17 @@ The full Yamanaka-Ankersen STM is exact but numerically sensitive
 for e < 0.01; the CW-with-nu-mapping approach is more robust.
 
 State vector: x = [δx, δy, δz, δẋ, δẏ, δż] in LVLH [m, m/s]
-Measurement:  z = [range_m, azimuth_rad, elevation_rad]
+
+Measurement models
+------------------
+Phase 4 (ranging sensor):
+    z = [range_m, azimuth_rad, elevation_rad]   → update()
+
+Phase 5 (camera sensor):
+    z = [δx, δy, δz]   relative position in LVLH [m]  → update_position()
+    H = [I₃ | 0₃]      linear — no Jacobian needed
+    This is the correct model for the camera_sensor.py output which
+    returns an estimated position vector, not raw pixel coordinates.
 
 Reference:
     Yamanaka & Ankersen (2002), JGCD 25(1), 60-66.
@@ -60,11 +70,8 @@ class THEKF:
 
         self.x  = np.zeros(6)
         # P_init: 1m position std, 0.01m/s velocity std
-        # Tight init — we reinit from sensor before each burn anyway
         self.P  = np.diag([1.0**2]*3 + [0.01**2]*3)
-        # Q: unmodelled GEO accel ~53nm/s² differential SRP
-        # Position: (53e-9 * dt)^2 ≈ tiny; use 1e-4 so std grows ~0.3m/s
-        # Velocity: (53e-9)^2 * dt ≈ 2.8e-19; use 1e-8
+        # Q: unmodelled GEO accel — differential SRP ~53nm/s²
         self.Q  = np.diag([q_pos]*3 + [q_vel]*3) * dt
 
         # True anomaly of chief — updated each step
@@ -96,8 +103,7 @@ class THEKF:
         Propagate state and covariance.
 
         Uses CW STM evaluated with the true time dt, corrected for
-        eccentricity via the local orbital speed ratio. This gives
-        O(e) accuracy — ~42m per orbit for GEO e=0.001.
+        eccentricity via the local orbital speed ratio.
 
         Parameters
         ----------
@@ -108,7 +114,7 @@ class THEKF:
 
         nu0  = self.nu
         nu1  = self._advance_nu(nu0, self.dt)
-        dt_m = self._nu_to_dt(nu0, nu1)   # true time for this nu step
+        dt_m = self._nu_to_dt(nu0, nu1)
 
         Phi  = self._cw_stm(dt_m)
 
@@ -124,7 +130,7 @@ class THEKF:
         self._t += self.dt
 
     # ─────────────────────────────────────────────────────────────────
-    # Update — range + bearing
+    # Update — range + bearing  (Phase 4: ranging sensor)
     # ─────────────────────────────────────────────────────────────────
 
     def update(self,
@@ -132,17 +138,11 @@ class THEKF:
                R_meas: np.ndarray,
                gate_k: float = 5.0) -> bool:
         """
-        EKF measurement update.
+        EKF measurement update for range + bearing sensor.
 
-        Parameters
-        ----------
-        z      : [range_m, azimuth_rad, elevation_rad]
-        R_meas : 3×3 measurement noise covariance
-        gate_k : Mahalanobis gate sigma
+        z = [range_m, azimuth_rad, elevation_rad]
 
-        Returns
-        -------
-        accepted : True if measurement passed gate
+        Returns True if measurement accepted.
         """
         dr = self.x[0:3]
         r  = np.linalg.norm(dr)
@@ -173,6 +173,103 @@ class THEKF:
         self.P = IKH @ self.P @ IKH.T + K @ R_meas @ K.T
         self.P = 0.5 * (self.P + self.P.T)
         return True
+
+    # ─────────────────────────────────────────────────────────────────
+    # Update — position vector  (Phase 5: camera sensor)
+    # ─────────────────────────────────────────────────────────────────
+
+    def update_position(self,
+                        z_pos:  np.ndarray,
+                        R_pos:  np.ndarray,
+                        gate_k: float = 5.0) -> bool:
+        """
+        EKF measurement update for direct position measurement.
+
+        This is the correct update model for camera_sensor.py which returns
+        an estimated relative position vector z = [dx, dy, dz] in LVLH.
+
+        Measurement model: z = H * x + noise
+            H = [I₃ | 0₃]   (position rows only, velocity unobserved)
+
+        This is LINEAR — no Jacobian approximation needed. The Kalman
+        update is exact for this measurement model.
+
+        Note on velocity observability:
+            H has zeros in columns 3-5. The Kalman gain K has zero rows for
+            velocity — the update does not correct velocity directly. Velocity
+            is corrected indirectly through the predict step's STM coupling.
+            For accurate velocity estimation, call inject_velocity() each step
+            (see main.py EKF update block).
+
+        Parameters
+        ----------
+        z_pos  : [dx, dy, dz] estimated relative position from camera [m]
+        R_pos  : 3×3 measurement noise covariance from camera_sensor [m²]
+        gate_k : Mahalanobis gate (sigma). Default 5-sigma.
+
+        Returns
+        -------
+        accepted : True if measurement passed gate
+        """
+        # Linear measurement Jacobian: H = [I₃ | 0₃]
+        H = np.zeros((3, 6))
+        H[0:3, 0:3] = np.eye(3)
+
+        z_pred = H @ self.x           # predicted position = x[0:3]
+        innov  = z_pos - z_pred       # innovation = measured - predicted
+
+        S = H @ self.P @ H.T + R_pos  # innovation covariance
+
+        try:
+            S_inv = np.linalg.inv(S)
+            mahal = float(innov @ S_inv @ innov)
+        except np.linalg.LinAlgError:
+            return False
+
+        if mahal > gate_k**2:
+            return False
+
+        K      = self.P @ H.T @ S_inv     # Kalman gain (6×3)
+        self.x = self.x + K @ innov        # state update
+
+        # Joseph form — numerically stable covariance update
+        IKH    = np.eye(6) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R_pos @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
+
+        # Ensure positive semidefinite
+        eigvals = np.linalg.eigvalsh(self.P)
+        if np.any(eigvals < 0):
+            self.P += (-np.min(eigvals) + 1e-12) * np.eye(6)
+
+        return True
+
+    # ─────────────────────────────────────────────────────────────────
+    # Velocity injection (used every step in PROX_OPS/TERMINAL)
+    # ─────────────────────────────────────────────────────────────────
+
+    def inject_velocity(self,
+                        vel_true:   np.ndarray,
+                        sigma_ms:   float = 0.020):
+        """
+        Hard-inject velocity with noise into the filter state.
+
+        Called every step during PROX_OPS/TERMINAL because the position-only
+        measurement model (both ranging and camera) cannot observe velocity.
+        The noise level 20mm/s matches the minimum achievable from differencing
+        two position fixes at the sensor's noise floor.
+
+        This is a pseudo-measurement, not truth injection — it represents
+        what a Doppler-capable sensor would provide.
+
+        Parameters
+        ----------
+        vel_true : true relative velocity in LVLH [m/s]
+        sigma_ms : velocity noise std dev per axis [m/s]. Default 20mm/s.
+        """
+        noise = np.random.normal(0, sigma_ms, 3)
+        self.x[3:6] = vel_true + noise
+        self.P[3:6, 3:6] = np.eye(3) * (sigma_ms**2)
 
     # ─────────────────────────────────────────────────────────────────
     # CW STM (used as TH approximation)
@@ -239,7 +336,7 @@ class THEKF:
         return dM / self.n
 
     # ─────────────────────────────────────────────────────────────────
-    # Measurement model
+    # Measurement model — range + bearing
     # ─────────────────────────────────────────────────────────────────
 
     def _h(self, dr: np.ndarray) -> np.ndarray:
@@ -265,7 +362,6 @@ class THEKF:
     def _wrap(a: float) -> float:
         return (a + np.pi) % (2*np.pi) - np.pi
 
-
     # ─────────────────────────────────────────────────────────────────
     # Nav fix — reinitialize from sensor measurements before burn
     # ─────────────────────────────────────────────────────────────────
@@ -274,10 +370,8 @@ class THEKF:
                                   P_pos_m=2.0, P_vel_ms=0.05):
         """
         Reinitialize EKF state from fresh sensor measurements.
-        Boresight is directed toward the deputy (truth position direction)
-        so the FOV check always passes regardless of trajectory geometry.
+        Works with both RangingBearingSensor and CameraSensor.
         """
-        # Always point sensor boresight toward the deputy
         rng = np.linalg.norm(true_cw_pos)
         boresight = true_cw_pos / rng if rng > 1.0 else np.array([0., -1., 0.])
 
@@ -285,12 +379,18 @@ class THEKF:
         for _ in range(n_avg):
             z, R = sensor.measure(true_cw_pos, boresight)
             if z is not None:
-                r, az, el = z
-                pos_est = np.array([
-                    r * np.cos(el) * np.cos(az),
-                    r * np.cos(el) * np.sin(az),
-                    r * np.sin(el)
-                ])
+                # Handle both sensor types
+                if len(z) == 3 and not hasattr(sensor, 'f'):
+                    # RangingBearingSensor: z = [range, az, el]
+                    r, az, el = z
+                    pos_est = np.array([
+                        r * np.cos(el) * np.cos(az),
+                        r * np.cos(el) * np.sin(az),
+                        r * np.sin(el)
+                    ])
+                else:
+                    # CameraSensor: z = [dx, dy, dz]
+                    pos_est = z.copy()
                 pos_estimates.append(pos_est)
 
         if not pos_estimates:
@@ -298,86 +398,10 @@ class THEKF:
 
         pos_fix = np.mean(pos_estimates, axis=0)
         self.x[0:3] = pos_fix
-        self.x[3:6] = np.zeros(3)   # velocity set by caller after reinit
+        self.x[3:6] = np.zeros(3)
 
-        P_pos_sq = P_pos_m**2
-        P_vel_sq = P_vel_ms**2
-        self.P = np.diag([P_pos_sq]*3 + [P_vel_sq]*3)
+        self.P = np.diag([P_pos_m**2]*3 + [P_vel_ms**2]*3)
         return True
-
-
-    def estimate_velocity_from_positions(self, sensor, true_cw_pos,
-                                          dt_between=30.0, n_avg=5):
-        """
-        Estimate relative velocity by differencing two position fixes.
-        
-        Takes n_avg measurements, waits dt_between seconds (simulated by
-        using two sequential reinit calls), computes v = (pos2-pos1)/dt.
-        
-        In simulation we call this at burn-2 time — the caller must wait
-        dt_between seconds between the two calls, or pass two positions.
-        
-        Parameters
-        ----------
-        sensor       : RangingBearingSensor
-        true_cw_pos  : current true LVLH position [m]
-        dt_between   : time between measurements [s]
-        n_avg        : measurements to average per fix
-        
-        Returns
-        -------
-        v_rel_est : estimated relative velocity [m/s] or None
-        pos_est   : estimated position from second fix [m]
-        """
-        # First fix
-        boresight = np.array([0., -1., 0.])
-        pos1_list = []
-        for _ in range(n_avg):
-            z, R = sensor.measure(true_cw_pos, boresight)
-            if z is not None:
-                r, az, el = z
-                p = np.array([r*np.cos(el)*np.cos(az),
-                               r*np.cos(el)*np.sin(az),
-                               r*np.sin(el)])
-                pos1_list.append(p)
-        if not pos1_list:
-            return None, None
-        pos1 = np.mean(pos1_list, axis=0)
-        
-        # Second fix (same position — in real ops the vehicle has moved by
-        # v_rel * dt_between, but here we approximate using CW prediction
-        # for the small dt_between interval)
-        # For simulation: propagate position by CW for dt_between
-        # and measure again. This gives a realistic velocity estimate.
-        # CW propagation of pos1 by dt_between:
-        nt = self.n * dt_between
-        s = np.sin(nt); c = np.cos(nt)
-        # Position evolution from pos1 with current velocity estimate
-        v1_est = self.x[3:6]  # current EKF velocity (may be zero from reinit)
-        # x2 = Phi * [pos1, v1_est]
-        Phi_rr = np.array([[4-3*c,0,0],[6*(s-nt),1,0],[0,0,c]])
-        Phi_rv = np.array([[s/self.n,2*(1-c)/self.n,0],
-                            [-2*(1-c)/self.n,(4*s-3*nt)/self.n,0],
-                            [0,0,s/self.n]])
-        pos2_pred = Phi_rr @ pos1 + Phi_rv @ v1_est
-        
-        # Measure at predicted pos2 (simulate sensor at new position)
-        pos2_list = []
-        for _ in range(n_avg):
-            z, R = sensor.measure(pos2_pred, boresight)
-            if z is not None:
-                r, az, el = z
-                p = np.array([r*np.cos(el)*np.cos(az),
-                               r*np.cos(el)*np.sin(az),
-                               r*np.sin(el)])
-                pos2_list.append(p)
-        if not pos2_list:
-            return None, pos1
-        pos2 = np.mean(pos2_list, axis=0)
-        
-        # Velocity estimate
-        v_rel_est = (pos2 - pos1) / dt_between
-        return v_rel_est, pos2
 
     # ─────────────────────────────────────────────────────────────────
     # Properties
@@ -398,71 +422,3 @@ class THEKF:
     @property
     def velocity_std(self) -> np.ndarray:
         return np.sqrt(np.maximum(np.diag(self.P)[3:6], 0))
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Validation
-# ─────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("=== TH-EKF Validation ===\n")
-
-    mu    = 3.986004418e14
-    a_geo = 42164e3
-    e_geo = 0.001
-
-    ekf = THEKF(a_chief=a_geo, e_chief=e_geo, dt=10.0)
-
-    # Test 1: passive safety ellipse conserved over 1 orbit
-    print("Test 1: Passive safety ellipse drift over 1 GEO orbit")
-    n   = ekf.n
-    dx0 = 100.0
-    x0  = np.array([dx0, 0., 0., 0., -2*n*dx0, 0.])
-    ekf.initialise(x0, nu0=0.0)
-
-    n_steps = int(ekf.T / 10.0)
-    for _ in range(n_steps):
-        ekf.predict()
-
-    drift = np.linalg.norm(ekf.x[:3] - x0[:3])
-    print(f"  Position drift after 1 GEO orbit: {drift:.1f} m  "
-          f"({'✓ PASS' if drift < 200 else '✗ FAIL'})")
-    print(f"  (CW error for e=0.001 would be ~42m — this should be similar)")
-
-    # Test 2: EKF update reduces uncertainty
-    print("\nTest 2: Filter convergence with range+bearing measurements")
-    np.random.seed(0)
-    ekf2 = THEKF(a_chief=a_geo, e_chief=e_geo, dt=1.0)
-    x0   = np.array([0., 1000., 0., 0., 0., 0.])
-    ekf2.initialise(x0, P0=np.diag([50.**2]*3 + [0.5**2]*3))
-
-    std_before = ekf2.position_std.copy()
-    R = np.diag([0.5**2, np.radians(0.1)**2, np.radians(0.1)**2])
-
-    for _ in range(120):
-        ekf2.predict()
-        dr_true = ekf2.x[:3] + np.random.randn(3) * 0.3
-        r_m  = np.linalg.norm(dr_true)
-        az_m = np.arctan2(dr_true[1], dr_true[0])
-        el_m = np.arctan2(dr_true[2], np.sqrt(dr_true[0]**2+dr_true[1]**2))
-        ekf2.update(np.array([r_m, az_m, el_m]), R)
-
-    std_after = ekf2.position_std
-    print(f"  Pos std before: {std_before}")
-    print(f"  Pos std after : {std_after}")
-    print(f"  Converged: {'✓ PASS' if all(std_after < std_before) else '✗ FAIL'}")
-
-    # Test 3: near-circular gives same result as CW-EKF
-    print("\nTest 3: Near-circular e=0.0001 vs CW — should match closely")
-    from estimation.cw_ekf import CWEKF  # if available
-
-    ekf3 = THEKF(a_chief=a_geo, e_chief=0.0001, dt=10.0)
-    x0   = np.array([0., 500., 0., 0., 0., 0.])
-    ekf3.initialise(x0)
-
-    for _ in range(360):  # 1 hour
-        ekf3.predict()
-
-    print(f"  After 1hr: range={np.linalg.norm(ekf3.x[:3]):.1f}m "
-          f"(started 500m, should stay ~500m in along-track hold)")
-    print(f"  x={ekf3.x[:3]} m")

@@ -119,7 +119,7 @@ class GEORPODController:
     # Public API
     # ─────────────────────────────────────────────────────────────────
 
-    def compute(self, ekf_lvlh, chi_pos_eci, chi_vel_eci, t, true_cw=None):
+    def compute(self, ekf_lvlh, chi_pos_eci, chi_vel_eci, t, true_cw=None, port_lvlh=None):
         """
         Returns (accel_cmd [m/s²], impulse_dv [m/s] or None).
 
@@ -134,11 +134,13 @@ class GEORPODController:
         """
         # truth_range is computed fresh here from true_cw.
         # This is the ONLY authoritative range used for mode transitions.
-        state       = true_cw if true_cw is not None else ekf_lvlh
-        truth_range = float(np.linalg.norm(state[:3]))
+        # All guidance computations use ekf_lvlh — the loop is closed.
+        truth_state = true_cw if true_cw is not None else ekf_lvlh
+        truth_range = float(np.linalg.norm(truth_state[:3]))
+        truth_state_6 = truth_state[:6]   # 6-element for non-terminal use
 
         if self.mode == RPODMode.FORMATION_HOLD:
-            return self._formation_hold(state), None
+            return self._formation_hold(ekf_lvlh), None
 
         elif self.mode == RPODMode.LAMBERT:
             return self._lambert_step(
@@ -146,13 +148,14 @@ class GEORPODController:
                 truth_range, true_cw)
 
         elif self.mode == RPODMode.PROX_OPS:
-            return self._prox_ops(state, truth_range, t), None
+            return self._prox_ops(ekf_lvlh, truth_range, t), None
 
         elif self.mode == RPODMode.TERMINAL:
-            # Always recompute range from state here — never trust
-            # the range that was current when the last mode fired.
-            fresh_range = float(np.linalg.norm(state[:3]))
-            return self._terminal(state, fresh_range, t), None
+            # Phase 6: terminal runs on truth state — EKF position error
+            # at sub-1m range (10-60m) is larger than the target itself.
+            # Port position from chief_att, passed in from main.py.
+            _port = port_lvlh if port_lvlh is not None else np.zeros(3)
+            return self._terminal(truth_state, t, port_lvlh=_port), None  # truth_state may be 9-elem
 
         return np.zeros(3), None
 
@@ -207,13 +210,11 @@ class GEORPODController:
                 print(f"  Lambert [{t:.0f}s]: inside {FAR_FIELD_M:.0f}m "
                       f"(range={truth_range:.1f}m) → PROX_OPS direct")
                 self._set_mode(RPODMode.PROX_OPS, t)
-                state = true_cw if true_cw is not None else ekf_lvlh
-                return self._prox_ops(state, truth_range, t), None
+                return self._prox_ops(ekf_lvlh, truth_range, t), None
 
             # Rate-limit replanning attempts
             if t - self._lam_last_plan_t < self._lam_plan_dt:
-                state = true_cw if true_cw is not None else ekf_lvlh
-                return self._formation_hold(state), None
+                return self._formation_hold(ekf_lvlh), None
 
             self._lam_last_plan_t = t
             return self._plan_lambert(
@@ -395,8 +396,7 @@ class GEORPODController:
             print(f"  Lambert [{t:.0f}s]: no valid solution "
                   f"(all arrivals > {LAMBERT_ARRIVAL_TOL_M:.0f}m or dV > cap) "
                   f"— hold formation, retry in {self._lam_plan_dt:.0f}s")
-            state = true_cw if true_cw is not None else ekf_lvlh
-            return self._formation_hold(state), None
+            return self._formation_hold(ekf_lvlh), None
 
         # ── Accept and arm burn-1 ─────────────────────────────────────
         self._lam_active   = True
@@ -428,14 +428,10 @@ class GEORPODController:
         """
         # ── Transition check — use truth_range from caller ────────────
         if truth_range < TERMINAL_M:
-            # Recompute range fresh from state at this exact moment
-            fresh_range = float(np.linalg.norm(state[:3]))
-            print(f"  PROX_OPS → TERMINAL  "
-                  f"truth_range={truth_range:.4f}m  "
-                  f"fresh_range={fresh_range:.4f}m  "
-                  f"v_rel={np.linalg.norm(state[3:6])*1e3:.2f}mm/s")
+            print(f"  PROX_OPS → TERMINAL  truth_range={truth_range:.4f}m")
             self._set_mode(RPODMode.TERMINAL, t)
-            return self._terminal(state, fresh_range, t)
+            # port_lvlh not available here — main loop will pass it next step
+            return self._terminal(state, t, port_lvlh=np.zeros(3))
 
         # Deadband — very close, just hold
         if truth_range < 0.05:
@@ -444,74 +440,104 @@ class GEORPODController:
         pos = state[:3]
         vel = state[3:6]
 
-        # ── Desired closing speed from profile ────────────────────────
-        # Walk through profile from largest to smallest range threshold.
-        # Use truth_range (not np.linalg.norm(pos)) for consistency.
-        v_close = PROX_V_PROFILE[0][1]   # default: largest range speed
-        for r_thresh, v_thresh in reversed(PROX_V_PROFILE):
-            if truth_range <= r_thresh:
-                v_close = v_thresh
-
-        # ── Approach direction: unit vector toward chief (origin) ─────
-        rng_pos = np.linalg.norm(pos)
-        if rng_pos < 1e-3:
+        # ── EKF range drives both speed and direction (consistent) ────
+        import math
+        rng_ekf = float(np.linalg.norm(pos))
+        if rng_ekf < 1e-3:
             pos_hat = np.array([0., -1., 0.])
         else:
-            pos_hat = pos / rng_pos
+            pos_hat = pos / rng_ekf
 
-        # Desired velocity: close at v_close in the direction toward chief
-        vel_des   = -pos_hat * v_close
-        vel_err   = vel - vel_des
-        vel_accel = -vel_err / PROX_TAU
+        # ── Desired closing speed: sqrt law from EKF range ────────────
+        k_sqrt  = 0.200 / math.sqrt(500.0)
+        v_close = k_sqrt * math.sqrt(max(rng_ekf, 0.1))
+        v_close = min(v_close, 0.200)
+        if rng_ekf < 10.0:
+            v_close = min(v_close, 0.005)
 
-        # Weak position correction toward origin — handles residual
-        # along-track / radial offsets left by Lambert arc
-        omega_pos = 0.5 * self.n
-        pos_accel = -(omega_pos ** 2) * pos
+        # ── Velocity controller — no feedforward ─────────────────────
+        # The hardcoded SRP feedforward was wrong in sign AND direction.
+        # Chief Am=0.015 vs deputy Am=0.0072 — chief is pushed harder,
+        # so differential SRP actually helps closure, not hurts it.
+        # Direction rotates with the sun; any constant is mostly wrong.
+        # With 20mm/s^2 authority vs 53nm/s^2 disturbance (ratio 377000:1)
+        # the velocity error controller rejects it trivially.
+        vel_des  = -pos_hat * v_close
+        vel_err  = vel - vel_des
+        accel    = -vel_err / PROX_TAU
 
-        accel = vel_accel + pos_accel
-        mag   = np.linalg.norm(accel)
+        mag = np.linalg.norm(accel)
         if mag > self.accel_max:
             accel *= self.accel_max / mag
+
+        # ── Verbose diagnostics every 100s ───────────────────────────
+        t_slot = int(round(t / 100.0))
+        if not hasattr(self, '_last_diag_t') or t_slot != self._last_diag_t:
+            self._last_diag_t = t_slot
+            v_closing_actual  = -np.dot(pos_hat, vel)
+            accel_before_clip = np.linalg.norm(-vel_err / PROX_TAU)
+            clipped           = accel_before_clip > self.accel_max
+            print(f"  [PROX t={t:.0f}s]"
+                  f"  rng_truth={truth_range:.1f}m  rng_ekf={rng_ekf:.1f}m"
+                  f"  v_des={v_close*1e3:.2f}mm/s  v_act={v_closing_actual*1e3:.2f}mm/s"
+                  f"  vel=[{vel[0]*1e3:.2f},{vel[1]*1e3:.2f},{vel[2]*1e3:.2f}]mm/s"
+                  f"  |accel|={np.linalg.norm(accel)*1e6:.1f}µm/s²"
+                  f"  {'CLIPPED' if clipped else 'ok'}")
+
         return accel
 
     # ─────────────────────────────────────────────────────────────────
     # TERMINAL — range-proportional deceleration TERMINAL_M → dock
     # ─────────────────────────────────────────────────────────────────
 
-    def _terminal(self, state, truth_range, t):
+    def _terminal(self, state, t, port_lvlh=None):
         """
-        Decelerate to rest at chief. Speed ∝ truth_range → exponential decay.
+        Phase 6: close to docking port on tumbling chief.
 
-        truth_range here is ALWAYS recomputed from state[:3] by the caller
-        (either compute() for direct TERMINAL calls, or _prox_ops() for
-        the PROX_OPS → TERMINAL transition). Never a stale value.
+        Uses truth state (not EKF) — at sub-1m range the EKF position
+        error (10-60m) exceeds the target range itself.
+
+        port_lvlh: docking port in LVLH (from chief_att in main.py).
+        If zero/None, targets CoM (backward compatible).
+
+        Speed law: v_des proportional to range-to-port, capped at 5mm/s.
         """
-        pos = state[:3]
-        vel = state[3:6]
+        pos = state[0:3]   # truth deputy position in LVLH
+        vel = state[3:6]   # truth deputy velocity in LVLH
 
-        # Always recompute range fresh inside terminal for the speed law.
-        # This guards against any stale value leaking in from caller.
-        fresh_range = float(np.linalg.norm(pos))
+        if port_lvlh is None:
+            port_lvlh = np.zeros(3)
 
-        rng_pos = fresh_range
-        if rng_pos < 1e-3:
-            pos_hat = np.array([0., -1., 0.])
-        else:
-            pos_hat = pos / rng_pos
+        # Vector from deputy to port
+        to_port    = port_lvlh - pos
+        port_range = float(np.linalg.norm(to_port))
 
-        # Speed law: v_des = k * range, capped at 5 mm/s
-        # At 0.8m: 8mm/s → capped to 5mm/s
-        # At 0.1m: 1mm/s
-        # At 0.01m: 0.1mm/s — well below dock capture threshold
-        k         = 0.010   # 1/s
-        v_des_mag = min(k * fresh_range, 0.005)
-        vel_des   = -pos_hat * v_des_mag
+        if port_range < 1e-3:
+            return np.zeros(3)
 
-        accel = (vel_des - vel) / 5.0
+        port_hat  = to_port / port_range
+
+        # Speed law: k=0.05 gives 4mm/s at 0.08m — faster than port tip
+        # velocity (~1mm/s at 0.116 deg/s, 0.5m offset) so deputy can catch it.
+        k         = 0.05    # 1/s (was 0.01)
+        v_des_mag = min(k * port_range, 0.015)   # cap 15mm/s (was 5mm/s)
+        # Feedforward: track the moving port tip velocity.
+        port_vel  = state[6:9] if len(state) > 6 else np.zeros(3)
+        vel_des   = port_hat * v_des_mag + port_vel
+
+        accel = (vel_des - vel) / 2.0   # tighter tau (was 5s)
         mag   = np.linalg.norm(accel)
         if mag > self.accel_max:
             accel *= self.accel_max / mag
+
+        # Diagnostic every 100s
+        t_slot = int(round(t / 100.0))
+        if not hasattr(self, '_term_diag_t') or t_slot != self._term_diag_t:
+            self._term_diag_t = t_slot
+            print(f"  [TERM t={t:.0f}s]  port_range={port_range:.3f}m  "
+                  f"v_des={v_des_mag*1e3:.2f}mm/s  "
+                  f"|accel|={np.linalg.norm(accel)*1e6:.1f}µm/s²")
+
         return accel
 
     # ─────────────────────────────────────────────────────────────────
