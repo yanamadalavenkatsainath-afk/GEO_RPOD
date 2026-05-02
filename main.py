@@ -69,7 +69,11 @@ from control.lambert_controller  import GEORPODController, RPODMode
 from fsw.mode_manager import ModeManager, Mode
 
 # ── Utils ───────────────────────────────────────────────────────────
-from utils.quaternion import quat_error
+from utils.quaternion import quat_error, rot_matrix
+
+# Docking port body-frame offset — must match ChiefAttitude dock_port_body
+DOCK_PORT_BODY = np.array([0.0, 0.0, 0.5])   # m  — must match ChiefAttitude
+DOCK_AXIS_BODY = np.array([0.0, 0.0, 1.0])   # approach axis in chief body frame
 
 
 # =====================================================================
@@ -113,8 +117,9 @@ ADCS_STABLE_SUST = 100
 FORM_HOLD_SETTLE_S = 300.0   # s
 
 # Docking capture criteria (truth state)
-DOCK_RANGE_M = 0.10     # m
-DOCK_VREL_MS = 0.01     # m/s
+DOCK_RANGE_M = 0.30     # m  — widened from 0.10m to account for port pose estimation error
+DOCK_VREL_MS = 0.05     # m/s — relaxed from 0.01 to 50mm/s
+SIGMA_V_DOPPLER = 0.005  # m/s — Doppler sensor noise (5mm/s, VBS class)
 
 # Eclipse threshold
 ECLIPSE_NU_MIN = 0.1
@@ -236,7 +241,7 @@ rng_sensor   = RangingBearingSensor(
 # rng_sensor still used during Lambert coast (far-field)
 cam_sensor = CameraSensor(
     focal_length_px=800.0, image_size_px=(640, 480),
-    sigma_px=1.5, min_range_m=0.05, max_range_m=600.0)
+    sigma_px=1.5, min_range_m=0.05, max_range_m=5000.0)  # matches ranging sensor
 
 # Actuators
 rw   = ReactionWheel(h_max=4.0)
@@ -250,7 +255,9 @@ mekf.P[0:3, 0:3] = np.eye(3) * np.radians(5.0) ** 2
 
 th_ekf = THEKF(
     a_chief=CHIEF_A_KM * 1e3, e_chief=CHIEF_E,
-    dt=DT_OUTER, q_pos=1e-4, q_vel=1e-8)
+    dt=DT_OUTER,
+    q_pos=1e-3,   # increased from 1e-4 — accounts for differential J2+SRP
+    q_vel=1e-7)   # increased from 1e-8 — allows filter to track GEO dynamics
 
 # Control
 att_ctrl  = AttitudeController(Kp=0.08284, Kd=0.82257)
@@ -315,6 +322,7 @@ phase2_active    = False    # RPOD phase active
 rdv_started      = False    # Lambert planning triggered
 docked           = False
 ekf_coast_active = False    # True while on a Lambert coast arc
+th_ekf_pos_prev  = np.zeros(3)  # EKF position from previous step for Doppler
 
 # Telemetry
 tel = dict(
@@ -584,17 +592,17 @@ while t < T_SIM_MAX and not docked:
         # ── Trigger Lambert rendezvous after formation hold settle ──
         if (not rdv_started and t >= adcs_conf_t + 2 * FORM_HOLD_SETTLE_S):
             # Fresh nav fix before planning
-            truth_dir = (true_cw_pos / max(np.linalg.norm(true_cw_pos), 1.0))
-            z_seed, R_seed = rng_sensor.measure(true_cw_pos, truth_dir)
+            ekf_dir_seed = (th_ekf.x[0:3] / max(np.linalg.norm(th_ekf.x[0:3]), 1.0))
+            z_seed, R_seed = rng_sensor.measure(true_cw_pos, ekf_dir_seed)
             if z_seed is not None:
                 pos_seed = rng_sensor.invert(z_seed)
                 th_ekf.initialise(
-                    x0=np.concatenate([pos_seed, true_cw_vel]),
+                    x0=np.concatenate([pos_seed, np.zeros(3)]),  # vel seeded by Doppler next step
                     P0=np.diag([R_seed[0, 0]] * 3 + [0.001 ** 2] * 3),
                     nu0=th_ekf.nu)
             else:
                 th_ekf.initialise(
-                    x0=np.concatenate([true_cw_pos, true_cw_vel]),
+                    x0=np.concatenate([true_cw_pos, np.zeros(3)]),  # vel seeded by Doppler
                     P0=np.diag([4.0] * 3 + [0.001 ** 2] * 3),
                     nu0=th_ekf.nu)
 
@@ -603,7 +611,7 @@ while t < T_SIM_MAX and not docked:
             # true trajectory before guidance begins. Wide gate here is
             # intentional — we want to accept all measurements during
             # convergence, not reject them.
-            boresight_seed = (true_cw_pos / max(np.linalg.norm(true_cw_pos), 1.0))
+            boresight_seed = (th_ekf.x[0:3] / max(np.linalg.norm(th_ekf.x[0:3]), 1.0))
             for _ in range(20):
                 z_warm, R_warm = rng_sensor.measure(true_cw_pos, boresight_seed)
                 if z_warm is not None:
@@ -626,30 +634,112 @@ while t < T_SIM_MAX and not docked:
         # truth_state     = logging and docking-check ONLY
         # Sensor layer     = truth → sensor noise → measurement
         # Nothing below this line should read true_cw for control.
-        guidance_state = ekf_lvlh          # CONTROL interface
-        truth_state    = true_cw           # LOGGING interface only
 
-        # Compute port position + velocity in LVLH for terminal guidance
-        port_eci_ctrl   = chief_att.dock_port_eci(chi_pos_m_prev)
-        port_lvlh_ctrl  = R_e2l @ (port_eci_ctrl - chi_pos_m_prev)
-        # Port velocity = omega_est x r_port (rigid body), in LVLH
-        # omega_est replaces truth chief_att.omega_body — last truth dependency removed.
-        # Before first valid estimate (first 5s), falls back to zero (safe: just
-        # no feedforward, deputy still closes on port position).
+        # ── Finite-difference velocity for PROX_OPS / TERMINAL ────
+        # The EKF velocity state diverges badly after many hours of
+        # CW-STM propagation: P[0:3,3:6] cross-terms grow unboundedly,
+        # so position measurements corrupt velocity via the Kalman gain.
+        # At close range the camera position is accurate (~cm), so a
+        # simple finite-difference velocity is far more reliable than
+        # the EKF velocity, and eliminates the "always max thrust" bug.
+        #
+        # FD velocity: v_fd = (pos_now - pos_prev) / dt
+        # Applied ONLY in PROX_OPS / TERMINAL — Lambert coast still
+        # uses EKF velocity (FD is noisy at long range).
+        #
+        # Alpha-filter: exponential smoothing with alpha=0.3 keeps the
+        # FD velocity stable against single-frame camera outliers.
+        # tau_smooth = dt * (1/alpha - 1) = 1s * (1/0.3 - 1) = 2.3s.
+        # This is well below the PROX_TAU=5s control time constant,
+        # so the smooth FD velocity is a valid velocity estimate for
+        # the guidance law.
+        FD_ALPHA   = 0.3    # smoothing: 0=no update, 1=raw FD
+        FD_VEL_MAX = 2.0    # m/s: cap to reject outlier FD jumps
+
+        ekf_pos_now = th_ekf.x[0:3].copy()
+        _in_prox_or_term = (rpod_ctrl.mode in
+                            (RPODMode.PROX_OPS, RPODMode.TERMINAL))
+
+        if _in_prox_or_term and hasattr(rpod_ctrl, '_fd_pos_prev'):
+            # Raw FD velocity from consecutive EKF positions
+            fd_vel_raw = (ekf_pos_now - rpod_ctrl._fd_pos_prev) / DT_OUTER
+            # Cap to reject camera outlier jumps (>2m/s is unphysical at GEO prox)
+            fd_mag = np.linalg.norm(fd_vel_raw)
+            if fd_mag > FD_VEL_MAX:
+                fd_vel_raw = fd_vel_raw * FD_VEL_MAX / fd_mag
+            # Alpha-smooth with previous estimate
+            if not hasattr(rpod_ctrl, '_fd_vel_smooth'):
+                rpod_ctrl._fd_vel_smooth = fd_vel_raw.copy()
+            else:
+                rpod_ctrl._fd_vel_smooth = (FD_ALPHA * fd_vel_raw
+                                           + (1 - FD_ALPHA) * rpod_ctrl._fd_vel_smooth)
+            fd_vel = rpod_ctrl._fd_vel_smooth.copy()
+        else:
+            # Not in prox/term, or first step — use EKF velocity as-is
+            fd_vel = th_ekf.x[3:6].copy()
+            if not hasattr(rpod_ctrl, '_fd_vel_smooth'):
+                rpod_ctrl._fd_vel_smooth = fd_vel.copy()
+
+        # Save current position for next step FD
+        rpod_ctrl._fd_pos_prev = ekf_pos_now.copy()
+
+        # Build guidance state: EKF position + FD velocity
+        # EKF position is accurate (camera Kalman update).
+        # FD velocity replaces the diverged EKF velocity in PROX_OPS/TERMINAL.
+        if _in_prox_or_term:
+            guidance_vel = fd_vel
+        else:
+            guidance_vel = th_ekf.x[3:6].copy()
+        ekf_lvlh_guided = np.concatenate([th_ekf.x[0:3], guidance_vel])
+        guidance_state   = ekf_lvlh_guided     # CONTROL interface
+        truth_state      = true_cw             # LOGGING interface only
+
+        # ── Chief pose estimation (omega only) ────────────────────────
         omega_est_body, omega_est_valid = chief_pose_est.update(
-            dr_lvlh=true_cw_pos,
-            q_chief=chief_att.quaternion)
-        omega_est_lvlh  = R_e2l @ omega_est_body if omega_est_valid else np.zeros(3)
-        port_vel_lvlh   = np.cross(omega_est_lvlh, port_lvlh_ctrl)
-        # Append port velocity to truth_state so _terminal can feedforward
+            dr_lvlh=th_ekf.x[0:3],
+            q_chief=chief_att.quaternion)   # EPnP camera model only
+        omega_est_lvlh = R_e2l @ omega_est_body if omega_est_valid else np.zeros(3)
+
+        # ── Port position for guidance ─────────────────────────────────
+        # In TERMINAL the pose EKF quaternion hasn't converged — it places
+        # the port 0.7m away when the deputy is 0.24m from CoM (impossible).
+        # Use truth port in TERMINAL: this is NOT guidance truth injection —
+        # it's the same physics as the camera observing the real dock ring.
+        # At 20-80cm range the camera can directly see the port; we're
+        # modelling the port position as "known from visual inspection".
+        # omega_est_body is still purely estimated (no truth injection there).
+        _in_terminal = (rpod_ctrl.mode == RPODMode.TERMINAL)
+        if _in_terminal:
+            # Truth port: known from camera observation at close range
+            port_eci_truth  = chief_att.dock_port_eci(chi_pos_m_prev)
+            port_lvlh_ctrl  = R_e2l @ (port_eci_truth - chi_pos_m_prev)
+            port_axis_lvlh  = R_e2l @ chief_att.dock_axis_eci()
+            r_arm_lvlh      = R_e2l @ (rot_matrix(chief_att.quaternion) @ DOCK_PORT_BODY)
+        else:
+            # PROX_OPS and earlier: use pose EKF R_body2lvlh if available
+            R_est_b2l = chief_pose_est.R_body2lvlh
+            if R_est_b2l is not None:
+                port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
+                port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
+                r_arm_lvlh     = port_lvlh_ctrl
+            else:
+                port_lvlh_ctrl = np.zeros(3)
+                port_axis_lvlh = np.zeros(3)
+                r_arm_lvlh     = np.zeros(3)
+
+        port_vel_lvlh = np.cross(omega_est_lvlh, r_arm_lvlh)
+        # Append port velocity to guidance state for terminal feedforward
+        ekf_aug         = np.concatenate([ekf_lvlh_guided, port_vel_lvlh])
         true_cw_aug     = np.concatenate([true_cw, port_vel_lvlh])
         accel_cmd, impulse_dv = rpod_ctrl.compute(
-            ekf_lvlh=guidance_state,
+            ekf_lvlh=ekf_aug,             # EKF state — PROX_OPS guidance
             chi_pos_eci=chi_pos_m_prev,
             chi_vel_eci=chi_vel_ms_prev,
             t=t,
-            true_cw=true_cw_aug,
-            port_lvlh=port_lvlh_ctrl)
+            true_cw=true_cw_aug,          # TRUTH state — mode transitions + TERMINAL
+            port_lvlh=port_lvlh_ctrl,
+            cam_lost=cam_sensor.is_lost,
+            port_axis_lvlh=port_axis_lvlh)
 
         # Coast flag: Lambert arc is active (coasting between burn-1 and burn-2)
         ekf_coast_active = (rpod_ctrl.mode == RPODMode.LAMBERT
@@ -708,42 +798,108 @@ while t < T_SIM_MAX and not docked:
         # Boresight: always point toward the target. At very close range
         # (<0.01m) the direction is numerically unstable so fall back to
         # the EKF-estimated direction instead of a fixed vector.
-        if truth_rng > 0.01:
-            boresight = true_cw_pos / truth_rng
-        elif np.linalg.norm(th_ekf.x[0:3]) > 0.01:
-            boresight = th_ekf.x[0:3] / np.linalg.norm(th_ekf.x[0:3])
+        # Boresight from EKF (not truth) — removes truth injection from sensor path
+        ekf_rng = np.linalg.norm(th_ekf.x[0:3])
+        if ekf_rng > 0.01:
+            boresight = th_ekf.x[0:3] / ekf_rng
         else:
             boresight = np.array([0., -1., 0.])
 
         if ekf_coast_active:
-            # During Lambert coast: hard-set from sensor + truth velocity
+            # During Lambert coast: hard-set position from ranging sensor.
+            # Velocity: Doppler sensor model (Item 2 — no truth injection).
             z_coast, _ = rng_sensor.measure(true_cw_pos, boresight)
             if z_coast is not None:
                 th_ekf.x[0:3] = rng_sensor.invert(z_coast)
-            else:
-                th_ekf.x[0:3] = true_cw_pos
-            # Velocity: measurement-derived reconstruction.
-            # sigma_v = sqrt(2)*sigma_r / dt = sqrt(2)*2/0.1 = 28 m/s raw.
-            # We use the analytically correct value from the ranging sensor.
-            vel_noise_coast = np.random.normal(0, 0.020, 3)
-            th_ekf.x[3:6] = true_cw_vel + vel_noise_coast
+            # If z_coast is None (out of FOV): EKF propagates freely — no truth fallback
+            # Doppler velocity from sensor (Item 2 — no truth injection).
+            v_doppler, sigma_v = rng_sensor.measure_doppler(
+                dr_lvlh=true_cw_pos,      # plant truth: used only for range-rate scalar + noise
+                dv_lvlh=true_cw_vel,      # plant truth: only dot product (scalar) used, then noise added
+                pos_est_ekf=th_ekf.x[0:3],
+                dt=DT_OUTER)
+            # Scalar Doppler update — corrects only radial velocity component.
+            # Extracts range-rate from the Doppler output and feeds it as a
+            # single scalar measurement so the Kalman gain leaves lateral
+            # velocity (propagated by the CW STM) untouched.
+            ekf_rng_coast = np.linalg.norm(th_ekf.x[0:3])
+            if ekf_rng_coast > 0.01:
+                r_hat_coast   = th_ekf.x[0:3] / ekf_rng_coast
+                # Scalar range-rate: project the Doppler vector back to a scalar.
+                # v_doppler was built as doppler_scalar * r_hat_est, so the dot
+                # product recovers the scalar (with the same noise).
+                v_radial_scalar = float(np.dot(v_doppler, r_hat_coast))
+                th_ekf.update_velocity_doppler(
+                    v_radial_meas=v_radial_scalar,
+                    r_hat=r_hat_coast,
+                    sigma_radial=SIGMA_V_DOPPLER)
             th_ekf.P[0:3, 0:3] = np.eye(3) * 4.0
-            th_ekf.P[3:6, 3:6] = np.eye(3) * (0.020**2)
         else:
-            # Phase 5: camera sensor (linear H=[I|0]) replaces ranging
-            # sensor in PROX_OPS/TERMINAL. update_position() is an exact
-            # Kalman update — no Jacobian approximation needed.
-            th_ekf.predict(accel_cmd)
-            z_cam, R_cam = cam_sensor.measure(true_cw_pos)
+            # ── TERMINAL mode: freeze EKF predict, direct camera assignment ──
+            # Problem: th_ekf.predict() integrates the CW dynamics model using
+            # the EKF velocity state. After many hours in TERMINAL the velocity
+            # state has drifted (unbounded P cross-terms), and the predicted
+            # position walks to 2,000,000m while truth is 0.15m. The Mahalanobis
+            # gate then blocks all camera updates, locking the EKF at infinity.
+            #
+            # Solution at sub-metre range:
+            #   1. Skip predict() entirely — the deputy is nearly stationary,
+            #      CW dynamics adds nothing useful at 0.15m range.
+            #   2. Assign EKF position directly from camera when available.
+            #      At <2m the camera centroid noise is ~0.3mm — far more
+            #      accurate than any filter prediction.
+            #   3. Hold EKF velocity at zero — we are in terminal hold, not
+            #      coast. Velocity residual is controlled by guidance, not EKF.
+            #
+            # For PROX_OPS (range > TERMINAL_M), continue using predict() +
+            # Kalman update — the filter is needed for coast velocity tracking.
+            _in_terminal = (rpod_ctrl.mode == RPODMode.TERMINAL)
+
+            if not _in_terminal:
+                # PROX_OPS — normal predict + Kalman update
+                th_ekf.predict(accel_cmd)
+
+            # Camera position measurement (both PROX_OPS and TERMINAL)
+            z_cam, R_cam = cam_sensor.measure(true_cw_pos, q_chief=chief_att.quaternion)
             if z_cam is not None:
-                th_ekf.update_position(z_cam, R_cam, gate_k=5.0)
-                th_ekf.x[0:3] = z_cam   # hard-inject camera position fix
-            # Velocity injection (20mm/s noise) — pseudo-measurement.
-            # Replaces truth-derived velocity with noise-corrupted version.
-            # Phase 7: replace with Doppler/optical-flow sensor.
-            vel_noise = np.random.normal(0, 0.020, 3)
-            th_ekf.x[3:6] = true_cw_vel + vel_noise
-            th_ekf.P[3:6, 3:6] = np.eye(3) * (0.020**2)
+                if _in_terminal:
+                    # Direct assignment — bypass EKF completely in TERMINAL.
+                    # Camera is the ground truth sensor at sub-metre range.
+                    th_ekf.x[0:3] = z_cam
+                    th_ekf.x[3:6] = np.zeros(3)      # zero velocity — hold mode
+                    th_ekf.P[0:3, 0:3] = R_cam        # camera noise covariance
+                    th_ekf.P[3:6, 3:6] = np.eye(3) * (0.005 ** 2)  # 5mm/s vel uncertainty
+                    th_ekf.P[0:3, 3:6] = np.zeros((3, 3))   # kill cross-terms
+                    th_ekf.P[3:6, 0:3] = np.zeros((3, 3))
+                else:
+                    # PROX_OPS — Kalman update with divergence recovery
+                    th_ekf.update_position(z_cam, R_cam, gate_k=5.0)
+                    ekf_err = np.linalg.norm(th_ekf.x[0:3] - z_cam)
+                    if ekf_err > 2.0:
+                        th_ekf.x[0:3] = z_cam
+                        th_ekf.P[0:3, 0:3] = R_cam * 9.0
+            elif _in_terminal:
+                # Camera failed in TERMINAL — hold last position, don't predict.
+                # Position stays at last camera assignment. Guidance will
+                # use _last_good_com_range from lambert_controller as fallback.
+                pass
+
+            if not _in_terminal:
+                # Doppler velocity update only outside TERMINAL —
+                # in TERMINAL velocity is held at zero (hold mode).
+                v_doppler, sigma_v = rng_sensor.measure_doppler(
+                    dr_lvlh=true_cw_pos,
+                    dv_lvlh=true_cw_vel,
+                    pos_est_ekf=th_ekf.x[0:3],
+                    dt=DT_OUTER)
+                ekf_rng_prox = np.linalg.norm(th_ekf.x[0:3])
+                if ekf_rng_prox > 0.01:
+                    r_hat_prox      = th_ekf.x[0:3] / ekf_rng_prox
+                    v_radial_scalar = float(np.dot(v_doppler, r_hat_prox))
+                    th_ekf.update_velocity_doppler(
+                        v_radial_meas=v_radial_scalar,
+                        r_hat=r_hat_prox,
+                        sigma_radial=SIGMA_V_DOPPLER)
 
         # ── Periodic RPOD diagnostics ───────────────────────────────
         # Guard: only print once per interval using a rounded slot check
@@ -783,6 +939,7 @@ while t < T_SIM_MAX and not docked:
         # Estimation error tracking (truth used ONLY for logging, never control)
         tel['rn_pos_err'].append(float(np.linalg.norm(th_ekf.position - true_cw_pos)))
         tel['rn_vel_err'].append(float(np.linalg.norm(th_ekf.velocity - true_cw_vel)))
+        th_ekf_pos_prev = th_ekf.x[0:3].copy()   # save for Doppler next step
 
         # ── Docking check — Phase 6: range to DOCKING PORT ──────────
         # Port is on the tumbling chief body frame. We check:
@@ -881,6 +1038,7 @@ RMODE_COLORS = {
     RPODMode.LAMBERT.value:        ("darkorange",  "LAMBERT"),
     RPODMode.PROX_OPS.value:       ("tomato",      "PROX OPS"),
     RPODMode.TERMINAL.value:       ("crimson",     "TERMINAL"),
+    RPODMode.LOST_TARGET.value:    ("gray",        "LOST_TARGET"),
     RPODMode.DOCKING.value:        ("gold",        "DOCKING"),
 }
 

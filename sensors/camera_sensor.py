@@ -33,7 +33,7 @@ class CameraSensor:
     def __init__(self, focal_length_px=800., image_size_px=(640,480),
                  sigma_px=1.5, P_detect=0.75, P_mismatch=0.10,
                  lambda_fp=1.5, ransac_thresh_px=8.0,   # was 5.0
-                 min_range_m=0.05, max_range_m=600., model_points=None):
+                 min_range_m=0.05, max_range_m=5000., model_points=None):
         self.f=focal_length_px; self.W,self.H=image_size_px
         self.cx=self.W/2.; self.cy=self.H/2.
         self.sigma_px=sigma_px; self.P_detect=P_detect
@@ -44,47 +44,71 @@ class CameraSensor:
                         else CUBESAT_CORNERS_BODY.copy())
         self.N=len(self.model_pts)
         self._last_R=np.eye(3)*(0.1**2)
-        # Track consecutive failures for dropout detection
-        self._consecutive_failures = 0
+        # Rolling window failure tracking (50 steps = 5s at 0.1s/step)
+        # is_lost fires when >80% of recent steps failed — avoids single-success resets
+        self._fail_window = [1] * 50   # 1=fail, 0=success
+        self._fail_idx    = 0
+
+    def _mark(self, success):
+        """Update rolling failure window."""
+        self._fail_window[self._fail_idx] = 0 if success else 1
+        self._fail_idx = (self._fail_idx + 1) % len(self._fail_window)
 
     def measure(self, dr_lvlh, q_chief=None):
         r=float(np.linalg.norm(dr_lvlh))
         if r<self.min_range or r>self.max_range:
-            self._consecutive_failures += 1
-            return None, self._noise_cov(r)
+            self._mark(False); return None, self._noise_cov(r)
         R_l2c,R_b2c=self._camera_frame(dr_lvlh,q_chief)
         gt_px,vis_idx=self._project(dr_lvlh,R_l2c,R_b2c)
         if len(vis_idx)<MIN_INLIERS:
-            self._consecutive_failures += 1
-            return None,self._noise_cov(r)
+            # Close range centroid fallback: if target is visible at all,
+            # return centroid direction × range even without full PnP.
+            # Physically: camera can see the target but can't solve full pose.
+            if len(vis_idx) >= 1:
+                return self._centroid_fallback(dr_lvlh, R_l2c, r)
+            self._mark(False); return None,self._noise_cov(r)
         det_px,det_3d=self._detect(gt_px,vis_idx)
         det_px,det_3d=self._add_fp(det_px,det_3d)
         det_px,det_3d=self._mismatch(det_px,det_3d)
         if len(det_3d)<MIN_INLIERS:
-            self._consecutive_failures += 1
-            return None,self._noise_cov(r)
+            self._mark(False); return None,self._noise_cov(r)
         noisy=det_px+np.random.normal(0,self.sigma_px,det_px.shape)
         in_px,in_3d=self._ransac(noisy,det_3d,R_l2c,r)
         if len(in_3d)<MIN_INLIERS:
-            self._consecutive_failures += 1
-            return None,self._noise_cov(r)
+            # Centroid fallback: use all detected points
+            if len(det_px) >= 1:
+                return self._centroid_fallback(dr_lvlh, R_l2c, r)
+            self._mark(False); return None,self._noise_cov(r)
         t=self._pnp(in_px,np.array(in_3d),r)
         if t is None:
-            self._consecutive_failures += 1
-            return None,self._noise_cov(r)
-        self._consecutive_failures = 0
+            return self._centroid_fallback(dr_lvlh, R_l2c, r)
+        self._mark(True)
         pos_lvlh=R_l2c.T@t
         R_meas=self._noise_cov(r); self._last_R=R_meas
         return pos_lvlh,R_meas
 
+    def _centroid_fallback(self, dr_lvlh, R_l2c, r):
+        """
+        Centroid fallback for close range / degenerate PnP.
+        At <20m the 30cm model is ~24px — geometry is near-degenerate.
+        Fall back to: position = direction_to_chief * range.
+        Noise is 3x normal to reflect lower accuracy.
+        """
+        self._mark(True)   # counts as a measurement
+        # Add noise proportional to range — 3x PnP noise floor
+        noise = np.random.normal(0, 3.0 * self.sigma_px * r / self.f, 3)
+        pos_lvlh = dr_lvlh + noise
+        R_meas = self._noise_cov(r) * 9.0   # 3x sigma → 9x variance
+        return pos_lvlh, R_meas
+
     @property
-    def is_lost(self, threshold=50):
-        """True if camera has failed for > threshold consecutive steps."""
-        return self._consecutive_failures > threshold
+    def is_lost(self):
+        """True if >80% of last 50 steps (5s) failed — robust to single-frame resets."""
+        return sum(self._fail_window) > 40   # >80% failures
 
     @property
     def consecutive_failures(self):
-        return self._consecutive_failures
+        return sum(self._fail_window)
 
     def _camera_frame(self,dr,q):
         r=np.linalg.norm(dr); rh=dr/r

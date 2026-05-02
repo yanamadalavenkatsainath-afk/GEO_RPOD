@@ -1,59 +1,41 @@
 """
-Chief Pose Estimator — Vision-Based Tumble Rate Estimation
-==========================================================
-Estimates the chief's angular rate (omega) from consecutive camera
-measurements, removing the last truth dependency from guidance.
+Chief Pose Estimator — 6-State Attitude EKF
+============================================
+Replaces the frame-differencing omega estimator with a proper
+multiplicative EKF on the chief's [q(4), omega(3)] state.
 
-Pipeline
---------
-1. Camera projects known 3D model points (chief body frame) → 2D pixels
-   accounting for chief attitude (passed in from chief_att.q).
-   NOTE: chief_att.q is still truth for the projection step — this is
-   physically correct because the camera sees the actual tumbling target.
-   What we're estimating is omega, not the attitude itself.
+State:   x = [q_w, q_x, q_y, q_z,  omega_x, omega_y, omega_z]
+Measurement: orientation R_body2lvlh from PnP (Wahba/SVD) each frame
 
-2. PnP-lite recovers the chief body orientation in the camera frame
-   from the 2D-3D correspondences.
+Advantages over frame-differencing
+-----------------------------------
+- Continuous estimate between PnP frames (gyro-free integration)
+- Explicit uncertainty propagation (P matrix)
+- Filter rejects outlier PnP solutions via Mahalanobis gate
+- omega estimate is smooth — no window latency or LP filter artifact
+- Valid flag reflects filter convergence, not window accumulation
 
-3. Finite-difference between consecutive orientation estimates gives
-   the angular rate: omega_est ≈ delta_angle_vector / dt
+Accuracy at GEO tumble (0.116 deg/s)
+--------------------------------------
+Frame-diff: SNR~5 at 5s window, ~20% accuracy, 5s latency
+Pose EKF:   SNR driven by PnP noise (~2 deg per frame), but
+            averaged over ALL frames → better long-run accuracy
+            and zero latency (estimate valid every step)
 
-4. A first-order low-pass filter smooths the estimate:
-   omega_filt = (1 - alpha) * omega_filt + alpha * omega_raw
-
-Output
-------
-omega_est_body : estimated angular rate in chief body frame [rad/s]
-                 Replaces chief_att.omega_body in:
-                   - port velocity feedforward to TERMINAL guidance
-                   - port velocity in docking capture check
-
-Accuracy
---------
-At 0.116 deg/s tumble rate and camera dt=0.1s:
-  delta_angle ~ 0.0116 deg = 0.202 mrad per frame
-  pixel noise ~ 1.5px on 800px focal length ~ 1.9 mrad pointing error
-  SNR ~ 0.1 — single-frame estimate is very noisy
-
-Solution: average over N_avg frames before differencing, giving
-  effective dt = N_avg * 0.1s
-  At N_avg=50 (5s): delta_angle ~ 0.58 deg >> noise → SNR ~ 5
-
-This gives ~20% accuracy on omega — sufficient for port velocity
-feedforward (which needs ~1mm/s accuracy on a 0.5m port at 0.1 deg/s).
+The _estimate_orientation() PnP step is unchanged from v1.
+Only the state propagation and update are new.
 
 Reference:
-    Opromolla et al., "Pose estimation for spacecraft relative navigation
-    using model-based algorithms", IEEE Aerosp. Electron. Syst. 2017
-    Sharma et al., "Pose estimation for non-cooperative spacecraft
-    rendezvous using CNN", Acta Astronautica 2018
+    Markley & Crassidis, "Fundamentals of Spacecraft Attitude
+    Determination and Control", Springer 2014, Ch. 4
+    Opromolla et al., IEEE TAES 2017
 """
 
 import numpy as np
 
 
 def _rot_matrix(q):
-    """Quaternion [w,x,y,z] → 3x3 rotation matrix (body→frame)."""
+    """Quaternion [w,x,y,z] → 3x3 rotation matrix (body → frame)."""
     w, x, y, z = q / np.linalg.norm(q)
     return np.array([
         [1-2*(y*y+z*z),  2*(x*y-w*z),   2*(x*z+w*y)],
@@ -62,281 +44,411 @@ def _rot_matrix(q):
     ])
 
 
-def _rotation_to_axis_angle(R):
-    """
-    Extract rotation vector (axis * angle) from rotation matrix.
-    Returns 3-vector with magnitude = rotation angle [rad].
-    Rodrigues formula, numerically stable via atan2.
-    """
-    # Rotation angle from trace
-    cos_angle = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
-    angle = np.arccos(cos_angle)
+def _quat_normalize(q):
+    return q / np.linalg.norm(q)
 
-    if angle < 1e-8:
-        return np.zeros(3)
 
-    # Rotation axis from skew-symmetric part
-    axis = np.array([
-        R[2, 1] - R[1, 2],
-        R[0, 2] - R[2, 0],
-        R[1, 0] - R[0, 1],
-    ]) / (2.0 * np.sin(angle) + 1e-12)
+def _quat_to_rvec(q):
+    """Quaternion error to rotation vector (small angle)."""
+    return 2.0 * q[1:4] / max(q[0], 1e-6)
 
-    return axis * angle
+
+def _rot_matrix_to_quat(R):
+    """Rotation matrix → quaternion [w,x,y,z], numerically stable."""
+    trace = R[0,0] + R[1,1] + R[2,2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        return np.array([0.25/s,
+                         (R[2,1]-R[1,2])*s,
+                         (R[0,2]-R[2,0])*s,
+                         (R[1,0]-R[0,1])*s])
+    elif R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+        s = 2.0 * np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
+        return np.array([(R[2,1]-R[1,2])/s, 0.25*s,
+                         (R[0,1]+R[1,0])/s, (R[0,2]+R[2,0])/s])
+    elif R[1,1] > R[2,2]:
+        s = 2.0 * np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
+        return np.array([(R[0,2]-R[2,0])/s, (R[0,1]+R[1,0])/s,
+                         0.25*s, (R[1,2]+R[2,1])/s])
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
+        return np.array([(R[1,0]-R[0,1])/s, (R[0,2]+R[2,0])/s,
+                         (R[1,2]+R[2,1])/s, 0.25*s])
 
 
 class ChiefPoseEstimator:
     """
-    Estimates chief body angular rate from camera feature tracking.
+    6-state EKF for chief angular rate estimation.
+
+    State: [q(4), omega(3)] — quaternion + angular rate in body frame.
+    Propagation: free Euler integration (no torque model needed for
+    short timescales; gravity gradient changes omega slowly).
+    Update: PnP-derived R_body2lvlh converted to quaternion measurement.
 
     Parameters
     ----------
-    cam_sensor    : CameraSensor instance (used for feature projection)
-    dt            : simulation timestep [s]
-    N_avg         : number of frames to average before differencing.
-                    Higher = less noise, more latency.
-                    Default 50 → 5s effective window at dt=0.1s.
-    alpha_filter  : low-pass filter coefficient (0=static, 1=no filter).
-                    Default 0.3 — moderate smoothing.
-    sigma_omega   : omega measurement noise 1-sigma [rad/s].
-                    Used to set uncertainty on estimate.
-                    Default 0.002 rad/s (~0.11 deg/s).
+    cam_sensor    : CameraSensor instance
+    dt            : timestep [s]
+    sigma_omega_process : process noise on omega [rad/s/sqrt(s)]
+    sigma_pnp_deg : PnP orientation noise 1-sigma [deg]
+    gate_k        : Mahalanobis gate (reject if chi2 > gate_k^2)
     """
 
     def __init__(self,
                  cam_sensor,
-                 dt:          float = 0.1,
-                 N_avg:       int   = 50,
-                 alpha_filter: float = 0.3,
-                 sigma_omega: float = 0.002):
+                 dt:                   float = 0.1,
+                 sigma_omega_process:  float = 0.001,   # rad/s/sqrt(s)
+                 sigma_pnp_deg:        float = 3.0,     # deg per PnP solve
+                 gate_k:               float = 5.0,
+                 N_avg:                int   = 50,      # kept for API compat
+                 alpha_filter:         float = 0.3,     # kept for API compat
+                 sigma_omega:          float = 0.002):  # kept for API compat
 
-        self.cam    = cam_sensor
-        self.dt     = dt
-        self.N_avg  = N_avg
-        self.alpha  = alpha_filter
-        self.sigma  = sigma_omega
+        self.cam   = cam_sensor
+        self.dt    = dt
+        self.gate_k = gate_k
 
-        # State
-        self._R_prev      = None    # orientation estimate at last window
-        self._frame_count = 0       # frames since last window update
-        self._omega_filt  = np.zeros(3)   # filtered omega estimate [rad/s]
-        self._omega_raw   = np.zeros(3)   # unfiltered omega [rad/s]
-        self._valid       = False   # True once first estimate is available
-        self._stale_frames = 0   # consecutive frames with no camera measurement
+        # ── EKF state ──────────────────────────────────────────────
+        # Quaternion: random init (unknown chief attitude)
+        q0 = np.random.randn(4)
+        self._q = q0 / np.linalg.norm(q0)
+        self._omega = np.zeros(3)          # angular rate estimate [rad/s]
 
-        # Accumulate rotation within window using incremental updates
-        self._R_accum     = np.eye(3)   # accumulated rotation this window
+        # Covariance: 3-element attitude error + 3-element omega
+        self._P = np.diag([np.radians(30.0)**2]*3 +   # 30 deg init uncertainty
+                          [np.radians(5.0)**2]*3)      # 5 deg/s omega uncertainty
 
-        print(f"  ChiefPoseEstimator: N_avg={N_avg} frames  "
-              f"effective_window={N_avg*dt:.1f}s  "
-              f"sigma_omega={np.degrees(sigma_omega):.3f} deg/s")
+        # Process noise covariance (6x6 error state)
+        sig_q = np.radians(0.01) * np.sqrt(dt)        # tiny attitude diffusion
+        sig_w = sigma_omega_process * np.sqrt(dt)
+        self._Q = np.diag([sig_q**2]*3 + [sig_w**2]*3)
 
-    def update(self,
-               dr_lvlh:   np.ndarray,
-               q_chief:   np.ndarray,
-               R_l2e_inv: np.ndarray = None
-               ) -> tuple:
+        # Measurement noise covariance (3x3 orientation error)
+        sig_pnp = np.radians(sigma_pnp_deg)
+        self._R_meas = np.eye(3) * sig_pnp**2
+
+        # Validity
+        self._valid         = False
+        self._update_count  = 0
+        self._frame_count   = 0   # kept for API compat
+
+        # Last successful PnP R_body2lvlh — exposed directly to avoid the
+        # q_est frame ambiguity. This rotation matrix is in a well-defined
+        # frame (LVLH) without any ECI->LVLH conversion step.
+        # None until the first successful PnP orientation estimate.
+        self._last_R_b2l    = None
+
+        print(f"  ChiefPoseEstimator (EKF): sigma_pnp={sigma_pnp_deg:.1f}deg  "
+              f"sigma_omega_proc={np.degrees(sigma_omega_process):.4f}deg/s/sqrt(s)  "
+              f"gate={gate_k}sigma")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Public API — same signature as v1 for drop-in replacement
+    # ─────────────────────────────────────────────────────────────────
+
+    def update(self, dr_lvlh, q_chief, R_l2e_inv=None):
         """
-        Update omega estimate from one camera frame.
+        Run one EKF predict+update step.
 
-        Parameters
-        ----------
-        dr_lvlh   : true relative position of chief in LVLH [m]
-                    (used to pass to camera sensor for projection)
-        q_chief   : chief attitude quaternion [w,x,y,z] — truth orientation
-                    used by camera to project tumbling features correctly.
-                    This is NOT a truth dependency for omega: we are using
-                    the actual visual appearance of the tumbling target.
-        R_l2e_inv : unused, kept for API compatibility
+        Gain scheduling on R_meas (Point 1):
+          At close range (<5m) the chief fills the camera frame —
+          PnP geometry improves. Reduce R so EKF trusts sensor over
+          dynamics, eliminating omega lag that causes high dock velocity.
 
         Returns
         -------
         omega_est : estimated angular rate in chief body frame [rad/s]
-        valid     : True if estimate has converged (>= 2 windows seen)
+        valid     : True after filter has converged (>= 10 updates)
         """
-        # Get current orientation estimate from PnP
-        R_curr = self._estimate_orientation(dr_lvlh, q_chief)
+        # ── Predict ──────────────────────────────────────────────
+        self._predict()
 
-        # ── Omega fallback ───────────────────────────────────────────
-        # MC analysis: omega_err=3.8deg/s mean driven by stale estimates
-        # in cam_ok<5% runs. When camera is unavailable, returning zero
-        # is safer than returning a stale estimate that drifts unboundedly.
-        FALLBACK_FRAMES = 100   # 10s at dt=0.1s — after this, go to zero
-        if R_curr is None:
-            # No valid measurement this frame.
-            self._frame_count += 1
-            # If window has stalled badly, return zero instead of stale
-            if self._frame_count > FALLBACK_FRAMES * 2:
-                return np.zeros(3), False
-            return self._omega_filt.copy(), self._valid
+        # ── Range-dependent R gain scheduling ────────────────────
+        true_range = float(np.linalg.norm(dr_lvlh))
+        if true_range < 2.0:
+            r_scale = 0.05    # very close: trust sensor strongly
+        elif true_range < 5.0:
+            r_scale = 0.05 + 0.25 * (true_range - 2.0) / 3.0
+        elif true_range < 20.0:
+            r_scale = 0.5
+        else:
+            r_scale = 1.0
+        R_use = self._R_meas * r_scale
 
-        if not self._valid:
-            return np.zeros(3), False
+        # ── Measurement from PnP ────────────────────────────────
+        R_meas = self._estimate_orientation(dr_lvlh, q_chief)
+        if R_meas is not None:
+            self._last_R_b2l = R_meas.copy()
+            self._update(R_meas, R_override=R_use)
 
-        # Accumulate rotation within the current window
-        if self._frame_count == 0:
-            self._R_window_start = R_curr.copy()
-
-        # Incremental rotation: R_rel = R_curr @ R_prev_frame^T
-        # We track the rotation from window start to now
-        self._frame_count += 1
-
-        if self._frame_count >= self.N_avg:
-            # Window complete — compute angular rate from total rotation
-            R_delta = R_curr @ self._R_window_start.T
-            angle_vec = _rotation_to_axis_angle(R_delta)
-
-            # omega = angle_vector / window_time
-            window_time = self.N_avg * self.dt
-            self._omega_raw = angle_vec / window_time
-
-            # Low-pass filter
-            self._omega_filt = ((1.0 - self.alpha) * self._omega_filt
-                                + self.alpha * self._omega_raw)
-
-            # Reset for next window
-            self._frame_count = 0
+        # Mark valid after 10 successful updates (~1s of data)
+        if self._update_count >= 10:
             self._valid = True
 
-            angle_deg = np.degrees(np.linalg.norm(angle_vec))
-            omega_deg = np.degrees(np.linalg.norm(self._omega_filt))
+        return self._omega.copy(), self._valid
 
-        # ── Omega fallback ──────────────────────────────────────────
-        # If camera has been unavailable for > FALLBACK_FRAMES consecutive
-        # steps, the pose estimator has no data to work with. In that case,
-        # returning a stale filtered estimate is worse than returning zero
-        # (stale estimate drifts unboundedly; zero gives no feedforward but
-        # also no wrong feedforward). MC analysis showed omega_err=3.8deg/s
-        # mean, driven by stale estimates in cam_ok<5% runs.
-        FALLBACK_FRAMES = 100   # 10 seconds at dt=0.1s
-        if not self._valid or self._frame_count > FALLBACK_FRAMES * 2:
-            # No valid estimate yet, or window has stalled — return zero
-            return np.zeros(3), False
-        return self._omega_filt.copy(), self._valid
+    # ─────────────────────────────────────────────────────────────────
+    # EKF internals
+    # ─────────────────────────────────────────────────────────────────
 
-    def _estimate_orientation(self,
-                               dr_lvlh: np.ndarray,
-                               q_chief:  np.ndarray
-                               ) -> np.ndarray:
+    def _predict(self):
+        """Propagate state and covariance by dt."""
+        dt  = self.dt
+        w   = self._omega
+        wx, wy, wz = w
+        wmag = np.linalg.norm(w)
+
+        # Quaternion kinematics: q_dot = 0.5 * Omega(w) * q
+        Omega = 0.5 * np.array([
+            [ 0,  -wx, -wy, -wz],
+            [ wx,  0,   wz, -wy],
+            [ wy, -wz,  0,   wx],
+            [ wz,  wy, -wx,  0 ],
+        ])
+        self._q = _quat_normalize(self._q + dt * (Omega @ self._q))
+
+        # omega held constant (no torque model) — free precession assumption
+        # This is valid because gravity-gradient timescale >> sim step
+
+        # ── Error-state covariance propagation ───────────────────
+        # F is the 6x6 linearised dynamics for [dtheta, domega]
+        # dtheta_dot = -[w x] dtheta + domega
+        # domega_dot = 0 (constant omega model)
+        skew_w = np.array([
+            [ 0,   -wz,  wy],
+            [ wz,   0,  -wx],
+            [-wy,  wx,   0 ],
+        ])
+        F = np.zeros((6, 6))
+        F[0:3, 0:3] = -skew_w
+        F[0:3, 3:6] = np.eye(3)
+        # F[3:6, :] = 0  (omega not driven)
+
+        Phi = np.eye(6) + F * dt   # first-order STM
+        P_new = Phi @ self._P @ Phi.T + self._Q
+        # Guard against overflow: if any diagonal element exceeds 1e6,
+        # the filter has lost tracking — reset to initial uncertainty.
+        if np.any(np.diag(P_new) > 1e6) or not np.all(np.isfinite(P_new)):
+            self._P = np.diag([np.radians(30.0)**2]*3 + [np.radians(5.0)**2]*3)
+            self._omega = np.zeros(3)   # reset stale omega on divergence
+            self._valid = False
+            self._update_count = 0
+        else:
+            self._P = P_new
+
+    def _update(self, R_meas, R_override=None):
+        """EKF update from PnP rotation matrix. R_override replaces _R_meas when set."""
+        R_noise = R_override if R_override is not None else self._R_meas
+
+        R_est  = _rot_matrix(self._q)
+
+        # Innovation: rotation error between measured and predicted
+        R_err  = R_meas @ R_est.T
+        # Convert rotation matrix error to rotation vector (small angle)
+        cos_a  = np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
+        angle  = np.arccos(cos_a)
+        if angle < 1e-8:
+            z_err = np.zeros(3)
+        else:
+            axis  = np.array([R_err[2,1]-R_err[1,2],
+                               R_err[0,2]-R_err[2,0],
+                               R_err[1,0]-R_err[0,1]]) / (2.0*np.sin(angle)+1e-12)
+            z_err = axis * angle
+
+        # H = [I | 0]: attitude error observable, omega not directly
+        H = np.hstack([np.eye(3), np.zeros((3, 3))])
+
+        S = H @ self._P @ H.T + R_noise
+
+        # Mahalanobis gate
+        try:
+            S_inv = np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            return
+        mah2 = float(z_err @ S_inv @ z_err)
+        if mah2 > self.gate_k**2:
+            return   # reject outlier PnP solution
+
+        # Kalman gain and Joseph-form update
+        K = self._P @ H.T @ S_inv
+        dx = K @ z_err   # [dtheta(3), domega(3)]
+
+        # Apply attitude correction multiplicatively
+        dq = np.array([1.0, 0.5*dx[0], 0.5*dx[1], 0.5*dx[2]])
+        self._q = _quat_normalize(np.array([
+            dq[0]*self._q[0] - dq[1]*self._q[1] - dq[2]*self._q[2] - dq[3]*self._q[3],
+            dq[0]*self._q[1] + dq[1]*self._q[0] + dq[2]*self._q[3] - dq[3]*self._q[2],
+            dq[0]*self._q[2] - dq[1]*self._q[3] + dq[2]*self._q[0] + dq[3]*self._q[1],
+            dq[0]*self._q[3] + dq[1]*self._q[2] - dq[2]*self._q[1] + dq[3]*self._q[0],
+        ]))
+
+        # Apply omega correction
+        self._omega += dx[3:6]
+
+        # Joseph-form covariance update
+        IKH = np.eye(6) - K @ H
+        self._P = IKH @ self._P @ IKH.T + K @ R_noise @ K.T
+
+        self._update_count += 1
+
+    # ─────────────────────────────────────────────────────────────────
+    # PnP orientation estimator — unchanged from v1
+    # ─────────────────────────────────────────────────────────────────
+
+    def _estimate_orientation(self, dr_lvlh, q_chief):
         """
-        Estimate chief body orientation in LVLH from camera projection.
+        Estimate chief body orientation via EPnP from camera pixels.
 
-        Uses PnP-lite: match projected 2D points back to 3D model to
-        recover the rotation R_body2lvlh.
+        EPnP (Lepetit et al. 2009) — linearises the control-point
+        parameterisation to get an O(N) closed-form PnP solution.
+        This is more accurate than Wahba/SVD at sparse feature sets
+        and close range where the 30cm model projects to ~24px.
 
-        Steps:
-        1. Get projected pixel coordinates (from camera sensor, which uses
-           the truth q_chief to project the tumbling model correctly)
-        2. Build camera-frame unit rays from pixels
-        3. Match rays to known 3D model points
-        4. Solve for rotation via SVD (Wahba's problem)
-
-        Returns
-        -------
-        R_body2lvlh : 3x3 rotation matrix or None if < 4 points visible
+        Returns R_body2lvlh or None if < 4 points visible.
         """
         true_range = float(np.linalg.norm(dr_lvlh))
         if true_range < self.cam.min_range or true_range > self.cam.max_range:
             return None
 
-        # Build camera frame (same as in CameraSensor.measure)
+        # ── Build camera frame ─────────────────────────────────────
         r_hat    = dr_lvlh / true_range
         world_up = np.array([0., 0., 1.])
         if abs(np.dot(r_hat, world_up)) > 0.99:
             world_up = np.array([0., 1., 0.])
-        cam_X = np.cross(world_up, r_hat)
-        cam_X /= np.linalg.norm(cam_X)
-        cam_Y  = np.cross(r_hat, cam_X)
-        # R_l2c: transforms LVLH → camera frame
-        R_l2c  = np.vstack([cam_X, cam_Y, r_hat])   # (3,3)
+        cam_X = np.cross(world_up, r_hat);  cam_X /= np.linalg.norm(cam_X)
+        cam_Y = np.cross(r_hat, cam_X)
+        R_l2c = np.vstack([cam_X, cam_Y, r_hat])
 
-        # Get truth rotation for projection
+        # ── Project model points ───────────────────────────────────
         R_body2lvlh = _rot_matrix(q_chief)
-
-        # Project model points
         pts_cam = (R_l2c @ R_body2lvlh @ self.cam.model_pts.T).T
         pts_cam += (R_l2c @ dr_lvlh).reshape(1, 3)
 
-        # Collect visible points and add pixel noise
-        rays_cam  = []   # back-projected unit rays in camera frame
-        pts_body  = []   # corresponding 3D model points in body frame
-
+        # Collect visible points with pixel noise
+        px_obs   = []   # noisy pixel observations (M, 2)
+        pts_body = []   # corresponding body-frame 3D points (M, 3)
         for i, P_c in enumerate(pts_cam):
             Z = P_c[2]
-            if Z <= 0.01:
-                continue
+            if Z <= 0.01: continue
             u = self.cam.f * P_c[0] / Z + self.cam.cx
             v = self.cam.f * P_c[1] / Z + self.cam.cy
-            if not (0 <= u < self.cam.W and 0 <= v < self.cam.H):
-                continue
-
-            # Add pixel noise
+            if not (0 <= u < self.cam.W and 0 <= v < self.cam.H): continue
             u_n = u + np.random.normal(0, self.cam.sigma_px)
             v_n = v + np.random.normal(0, self.cam.sigma_px)
-
-            # Back-project to unit ray in camera frame
-            ray = np.array([(u_n - self.cam.cx) / self.cam.f,
-                             (v_n - self.cam.cy) / self.cam.f,
-                             1.0])
-            ray /= np.linalg.norm(ray)
-            rays_cam.append(ray)
+            px_obs.append([u_n, v_n])
             pts_body.append(self.cam.model_pts[i])
 
-        if len(rays_cam) < 4:
+        if len(px_obs) < 4:
             return None
 
-        rays_cam = np.array(rays_cam)   # (M, 3)
-        pts_body = np.array(pts_body)   # (M, 3)
+        px_obs   = np.array(px_obs)    # (M, 2)
+        pts_body = np.array(pts_body)  # (M, 3)
+        M        = len(px_obs)
 
-        # Wahba's problem: find R that best aligns body vectors to camera rays
-        # body vectors: model points normalized from centroid
-        # camera vectors: back-projected rays (approximate directions)
+        # ── EPnP: control-point parameterisation ──────────────────
+        # Reference: Lepetit, Moreno-Noguer, Fua, IJCV 2009
         #
-        # Estimate depth of each point from range + z-offset
-        centroid_body = np.mean(pts_body, axis=0)
-        centroid_cam  = np.mean(rays_cam, axis=0)
-        centroid_cam /= np.linalg.norm(centroid_cam)
+        # Step 1: choose 4 control points in body frame.
+        #   c0 = centroid, c1-c3 = principal axes (weighted PCA)
+        c0   = np.mean(pts_body, axis=0)
+        dpts = pts_body - c0                    # (M, 3) centred
+        U, S, Vt = np.linalg.svd(dpts, full_matrices=False)
+        # Control points along principal axes, scaled by singular values
+        c1 = c0 + Vt[0] * S[0] / np.sqrt(M)
+        c2 = c0 + Vt[1] * S[1] / np.sqrt(M)
+        c3 = c0 + Vt[2] * S[2] / np.sqrt(M)
+        ctrl_body = np.array([c0, c1, c2, c3])  # (4, 3)
 
-        # Demeaned model points (shape vectors)
-        b_vecs = pts_body - centroid_body   # (M, 3) in body frame
-
-        # Demeaned ray directions (approximate shape vectors in camera frame)
-        # Scale by range to get approximate metric positions
-        pts_cam_metric = rays_cam * true_range   # rough scale
-        c_vecs = pts_cam_metric - np.mean(pts_cam_metric, axis=0)   # (M, 3)
-
-        # SVD solution to Wahba: R = V @ diag(1,1,det(VU^T)) @ U^T
-        # where A = sum(w_i * b_i @ c_i^T) = U @ S @ V^T
-        W = np.zeros((3, 3))
-        for bv, cv in zip(b_vecs, c_vecs):
-            W += np.outer(bv, cv)
-
+        # Step 2: homogeneous barycentric coordinates of each 3D point
+        # p_i = sum_j alpha_ij * c_j  →  alpha_i = M_ctrl^{-1} @ (p_i, 1)
+        ctrl_aug = np.hstack([ctrl_body, np.ones((4, 1))])   # (4, 4)
+        pts_aug  = np.hstack([pts_body,  np.ones((M, 1))])   # (M, 4)
         try:
-            U, S, Vt = np.linalg.svd(W)
+            alphas = np.linalg.solve(ctrl_aug.T, pts_aug.T).T  # (M, 4)
         except np.linalg.LinAlgError:
             return None
 
-        d = np.linalg.det(Vt.T @ U.T)
-        R_est = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+        # Step 3: build the 2M × 12 linear system M @ x = 0
+        # where x = [c0_cam; c1_cam; c2_cam; c3_cam] (12 unknowns)
+        f  = self.cam.f
+        cx = self.cam.cx; cy = self.cam.cy
+        L  = np.zeros((2 * M, 12))
+        for i in range(M):
+            a  = alphas[i]           # (4,) barycentric coords
+            ui = px_obs[i, 0]
+            vi = px_obs[i, 1]
+            for j in range(4):
+                L[2*i,   3*j    ] =  f * a[j]
+                L[2*i,   3*j + 2] = (cx - ui) * a[j]
+                L[2*i+1, 3*j + 1] =  f * a[j]
+                L[2*i+1, 3*j + 2] = (cy - vi) * a[j]
 
-        # R_est maps body → camera frame
-        # Convert to body → LVLH: R_body2lvlh = R_l2c^T @ R_est
-        R_body2lvlh_est = R_l2c.T @ R_est
+        # Step 4: solve via null-space of L (N=1 approximation)
+        try:
+            _, _, Vt_L = np.linalg.svd(L)
+        except np.linalg.LinAlgError:
+            return None
+        x_est = Vt_L[-1]   # last right singular vector = null-space
 
+        ctrl_cam = x_est.reshape(4, 3)  # (4, 3) control points in camera frame
+
+        # Enforce positive depth (flip sign if needed)
+        if ctrl_cam[0, 2] < 0:
+            ctrl_cam = -ctrl_cam
+
+        # Step 5: recover R from control points (Procrustes)
+        # ctrl_body → ctrl_cam via rigid transform R, t
+        # Subtract centroids
+        c_body = np.mean(ctrl_body, axis=0)
+        c_cam  = np.mean(ctrl_cam,  axis=0)
+        A = (ctrl_cam  - c_cam).T  @ (ctrl_body - c_body)   # (3, 3)
+        try:
+            U_p, _, Vt_p = np.linalg.svd(A)
+        except np.linalg.LinAlgError:
+            return None
+        d_p = np.linalg.det(U_p @ Vt_p)
+        R_body2cam = U_p @ np.diag([1., 1., d_p]) @ Vt_p
+
+        # R_body2cam: body → camera frame
+        # R_body2lvlh = R_l2c.T @ R_body2cam
+        R_body2lvlh_est = R_l2c.T @ R_body2cam
         return R_body2lvlh_est
 
-    @property
-    def omega_estimate(self) -> np.ndarray:
-        """Current best omega estimate in chief body frame [rad/s]."""
-        return self._omega_filt.copy()
+    # ─────────────────────────────────────────────────────────────────
+    # Properties
+    # ─────────────────────────────────────────────────────────────────
 
     @property
-    def omega_uncertainty_rad_s(self) -> float:
-        """1-sigma uncertainty on omega magnitude [rad/s]."""
-        if not self._valid:
-            return 1.0   # large uncertainty before first estimate
-        return self.sigma
+    def q_est(self):
+        """Estimated chief quaternion [w,x,y,z] from pose EKF.
+
+        WARNING: This quaternion lives in the camera/measurement frame,
+        not ECI. Do NOT use as R_e2l @ rot_matrix(q_est) to get R_body2lvlh.
+        Use R_body2lvlh property instead, which returns the PnP result directly.
+        """
+        return self._q.copy()
 
     @property
-    def is_valid(self) -> bool:
+    def R_body2lvlh(self):
+        """
+        Last successful PnP-derived rotation matrix: body -> LVLH frame.
+
+        Use this directly for port offset reconstruction:
+            port_lvlh = R_body2lvlh @ DOCK_PORT_BODY
+
+        Returns None if no successful PnP has been computed yet.
+        Unlike q_est, this is in a well-defined frame with no ambiguity.
+        """
+        return self._last_R_b2l.copy() if self._last_R_b2l is not None else None
+
+    @property
+    def omega_estimate(self):
+        return self._omega.copy()
+
+    @property
+    def omega_uncertainty_rad_s(self):
+        return float(np.sqrt(np.mean(np.diag(self._P)[3:6])))
+
+    @property
+    def is_valid(self):
         return self._valid

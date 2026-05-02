@@ -126,8 +126,36 @@ class THEKF:
         self.P = Phi @ self.P @ Phi.T + self.Q
         self.P = 0.5 * (self.P + self.P.T)
 
+        # ── P ceiling — prevents Mahalanobis gate becoming meaningless ──
+        # After hours of CW-STM propagation P[0:3,0:3] grows O(1000) m².
+        # A 25m camera spike then has chi2 ≈ 25²/1000 = 0.6 → passes 5-sigma gate.
+        # Cap diagonal: sigma_pos <= 50m, sigma_vel <= 1 m/s.
+        P_diag = np.diag(self.P)
+        P_diag_clamped = np.minimum(P_diag, np.array([50.**2]*3 + [1.**2]*3))
+        for i in range(6):
+            if P_diag[i] > P_diag_clamped[i]:
+                scale = P_diag_clamped[i] / P_diag[i]
+                self.P[i, :] *= np.sqrt(scale)
+                self.P[:, i] *= np.sqrt(scale)
+                self.P[i, i]  = P_diag_clamped[i]
+
         self.nu  = nu1
         self._t += self.dt
+
+    def inflate_process_noise(self, scale: float = 10.0):
+        """
+        Temporarily inflate process noise covariance.
+
+        Called during TERMINAL phase when EKF is near singularity
+        (sub-metre range, degenerate camera geometry). Inflation allows
+        the filter to accept noisy measurements without diverging.
+
+        scale : multiplicative factor on Q diagonal. Default 10x.
+                At 0.8m range, camera sigma ~ 1.5px * 0.8m / 800px = 1.5mm.
+                The EKF needs Q large enough to accept this vs a state
+                that may have several-mm accumulated error.
+        """
+        self.P[0:3, 0:3] += np.eye(3) * (self.Q[0, 0] * scale)
 
     # ─────────────────────────────────────────────────────────────────
     # Update — range + bearing  (Phase 4: ranging sensor)
@@ -229,7 +257,14 @@ class THEKF:
         if mahal > gate_k**2:
             return False
 
-        K      = self.P @ H.T @ S_inv     # Kalman gain (6×3)
+        # Absolute innovation sanity gate — rejects spikes regardless of P size.
+        # Without this a 25m camera spike passes when sigma_pos has grown large.
+        # 10m is ~20x the camera sigma at 1m range — any larger is a bad measurement.
+        innov_m = float(np.linalg.norm(innov))
+        if innov_m > 10.0:
+            return False
+
+        K      = self.P @ H.T @ S_inv     # Kalman gain (6x3)
         self.x = self.x + K @ innov        # state update
 
         # Joseph form — numerically stable covariance update
@@ -270,6 +305,92 @@ class THEKF:
         noise = np.random.normal(0, sigma_ms, 3)
         self.x[3:6] = vel_true + noise
         self.P[3:6, 3:6] = np.eye(3) * (sigma_ms**2)
+
+    def update_velocity_doppler(self,
+                                v_radial_meas: float,
+                                r_hat:         np.ndarray,
+                                sigma_radial:  float = 0.005):
+        """
+        EKF update using only the scalar radial (Doppler) velocity measurement.
+
+        Why a scalar update instead of hard-injection
+        ---------------------------------------------
+        Hard-injection (`x[3:6] = v_doppler_vec`) overwrites the lateral
+        velocity components with zeros every step.  At close range the CW
+        dynamics couple radial and along-track velocity, so setting lateral
+        velocity to zero each step cancels the commanded acceleration and
+        freezes the deputy in place (the "stuck at 32m" bug).
+
+        A scalar Kalman update avoids this:
+          * Only the radial projection of the velocity state is corrected.
+          * Lateral velocity is updated only through the Kalman gain, which
+            weights the Doppler measurement against the current covariance.
+            When lateral uncertainty is already low (P[4,4], P[5,5] small),
+            the gain on lateral states is near-zero and the CW-STM estimate
+            is left intact.
+          * The covariance update naturally propagates radial information to
+            correlated lateral states via the off-diagonal P terms built up
+            by the CW STM, consistent with orbital mechanics.
+
+        Measurement model
+        -----------------
+            z_scalar = r_hat · v_body  =  H_v · x[3:6]
+            H = [0, 0, 0, r_hat[0], r_hat[1], r_hat[2]]   (1 × 6)
+
+        Parameters
+        ----------
+        v_radial_meas : scalar Doppler range-rate measurement [m/s]
+                        = dot(true_dv, r_hat_true) + noise(sigma_radial)
+        r_hat         : unit vector toward target in LVLH, from EKF position.
+                        Must NOT be the truth direction (no truth in guidance path).
+        sigma_radial  : 1-sigma Doppler noise [m/s].  Default 5 mm/s (VBS class).
+        """
+        # Build scalar measurement row H (1 × 6)
+        H = np.zeros((1, 6))
+        H[0, 3:6] = r_hat
+
+        # Predicted measurement — H@x is shape (1,), index to scalar
+        z_pred       = float((H @ self.x)[0])
+        innov_scalar = v_radial_meas - z_pred
+
+        # Innovation covariance (scalar)
+        R_dop = np.array([[sigma_radial ** 2]])
+        S     = H @ self.P @ H.T + R_dop   # (1×1)
+
+        # Mahalanobis gate — 5-sigma on the scalar innovation
+        mahal = float(innov_scalar ** 2 / S[0, 0])
+        if mahal > 25.0:
+            return   # outlier — do not update
+
+        # Kalman gain (6 × 1) — velocity rows only.
+        #
+        # WHY: After ~3000s of CW-STM propagation the P[0:3, 3:6] cross-terms
+        # (position-velocity coupling) grow to O(1000) m^2. If the full K is
+        # applied, a 150 mm/s Doppler innovation times the large position-row
+        # K[0:3] produces a 100+ m jump in x[0:3]. This is the explosion at
+        # t=4000s (rng 26m → 56m → km in one step).
+        #
+        # Doppler measures velocity, not position. Position is already updated
+        # by the range sensor (hard override) and camera (Kalman update).
+        # Zeroing K[0:3] makes this a velocity-only measurement — physically
+        # correct and prevents the cross-term explosion.
+        K = self.P @ H.T / S[0, 0]
+        K_vel = K.copy()
+        K_vel[0:3] = 0.0   # Doppler corrects velocity only, not position
+
+        # State update — use velocity-only gain
+        self.x += K_vel.flatten() * innov_scalar
+
+        # Covariance update with full K for consistency (Joseph-form)
+        # Use K_vel so P[0:3,0:3] isn't corrupted by the velocity measurement
+        IKH    = np.eye(6) - K_vel @ H
+        self.P = IKH @ self.P @ IKH.T + K_vel * R_dop[0, 0] * K_vel.T
+        self.P = 0.5 * (self.P + self.P.T)
+
+        # Ensure positive semi-definite
+        eigvals = np.linalg.eigvalsh(self.P)
+        if np.any(eigvals < 0):
+            self.P += (-np.min(eigvals) + 1e-12) * np.eye(6)
 
     # ─────────────────────────────────────────────────────────────────
     # CW STM (used as TH approximation)
