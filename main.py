@@ -295,6 +295,7 @@ fsw = ModeManager()
 # Relative motion state (CW — used as convenient state container & dv counter)
 cw = CWDynamics(chief_orbit_radius_km=CHIEF_A_KM)
 cw.set_initial_offset(dr_lvlh_m=FORMATION_OFFSET_M)
+cw.dv_total = 0.0   # FIX 2/3: scalar replaces 3-vector; reset again at phase2 start
 
 
 # =====================================================================
@@ -556,6 +557,7 @@ while t < T_SIM_MAX and not docked:
     # ------------------------------------------------------------------
     if adcs_confirmed and not phase2_active and t >= adcs_conf_t + FORM_HOLD_SETTLE_S:
         phase2_active = True
+        cw.dv_total = 0.0   # FIX 3: rendezvous DV budget starts here; formation-hold excluded
 
         # Seed TH-EKF from ranging sensor
         ok = th_ekf.reinit_from_measurements(
@@ -624,14 +626,14 @@ while t < T_SIM_MAX and not docked:
                   f"err={np.linalg.norm(ekf_lvlh[:3]-true_cw_pos):.1f}m")
 
             rdv_started = True
-            rpod_ctrl.standoff = max(50.0, abs(true_cw_pos[1]))
-            rpod_ctrl.start_rendezvous(t, truth_range=cw.range_m)
+            nav_range_start = float(np.linalg.norm(ekf_lvlh[:3]))
+            rpod_ctrl.standoff = max(50.0, abs(ekf_lvlh[1]))
+            rpod_ctrl.start_rendezvous(t, truth_range=nav_range_start)
             print(f"  [t={t:.1f}s]  ─── LAMBERT RENDEZVOUS STARTED ───  "
-                  f"truth_range={cw.range_m:.1f}m")
+                  f"nav_range={nav_range_start:.1f}m")
 
         # ── Strict interface separation ────────────────────────────
         # guidance_state  = EKF output ONLY — controller never sees truth
-        # truth_state     = logging and docking-check ONLY
         # Sensor layer     = truth → sensor noise → measurement
         # Nothing below this line should read true_cw for control.
 
@@ -657,10 +659,15 @@ while t < T_SIM_MAX and not docked:
         FD_VEL_MAX = 2.0    # m/s: cap to reject outlier FD jumps
 
         ekf_pos_now = th_ekf.x[0:3].copy()
+        # FD velocity: only use inside TERMINAL_M (5m) where camera is cm-accurate.
+        # At 5m: camera sigma=9mm, FD noise=90mm/s -> manageable for terminal.
+        # Above 5m: EKF Kalman velocity (properly smoothed) eliminates wasted DV.
+        _ekf_range_now = float(np.linalg.norm(th_ekf.x[0:3]))
         _in_prox_or_term = (rpod_ctrl.mode in
                             (RPODMode.PROX_OPS, RPODMode.TERMINAL))
+        _use_fd_vel = (rpod_ctrl.mode == RPODMode.TERMINAL)
 
-        if _in_prox_or_term and hasattr(rpod_ctrl, '_fd_pos_prev'):
+        if _use_fd_vel and hasattr(rpod_ctrl, '_fd_pos_prev'):
             # Raw FD velocity from consecutive EKF positions
             fd_vel_raw = (ekf_pos_now - rpod_ctrl._fd_pos_prev) / DT_OUTER
             # Cap to reject camera outlier jumps (>2m/s is unphysical at GEO prox)
@@ -675,7 +682,7 @@ while t < T_SIM_MAX and not docked:
                                            + (1 - FD_ALPHA) * rpod_ctrl._fd_vel_smooth)
             fd_vel = rpod_ctrl._fd_vel_smooth.copy()
         else:
-            # Not in prox/term, or first step — use EKF velocity as-is
+            # Not using FD: EKF Kalman velocity is far more accurate above 5m.
             fd_vel = th_ekf.x[3:6].copy()
             if not hasattr(rpod_ctrl, '_fd_vel_smooth'):
                 rpod_ctrl._fd_vel_smooth = fd_vel.copy()
@@ -683,16 +690,14 @@ while t < T_SIM_MAX and not docked:
         # Save current position for next step FD
         rpod_ctrl._fd_pos_prev = ekf_pos_now.copy()
 
-        # Build guidance state: EKF position + FD velocity
-        # EKF position is accurate (camera Kalman update).
-        # FD velocity replaces the diverged EKF velocity in PROX_OPS/TERMINAL.
-        if _in_prox_or_term:
+        # FIX 1: Use FD only below 5m; EKF velocity above 5m.
+        # FD above 5m injects camera noise (9 m/s at 500m) -> max thrust waste.
+        if _use_fd_vel:
             guidance_vel = fd_vel
         else:
             guidance_vel = th_ekf.x[3:6].copy()
         ekf_lvlh_guided = np.concatenate([th_ekf.x[0:3], guidance_vel])
         guidance_state   = ekf_lvlh_guided     # CONTROL interface
-        truth_state      = true_cw             # LOGGING interface only
 
         # ── Chief pose estimation (omega only) ────────────────────────
         omega_est_body, omega_est_valid = chief_pose_est.update(
@@ -701,42 +706,59 @@ while t < T_SIM_MAX and not docked:
         omega_est_lvlh = R_e2l @ omega_est_body if omega_est_valid else np.zeros(3)
 
         # ── Port position for guidance ─────────────────────────────────
-        # In TERMINAL the pose EKF quaternion hasn't converged — it places
-        # the port 0.7m away when the deputy is 0.24m from CoM (impossible).
-        # Use truth port in TERMINAL: this is NOT guidance truth injection —
-        # it's the same physics as the camera observing the real dock ring.
-        # At 20-80cm range the camera can directly see the port; we're
-        # modelling the port position as "known from visual inspection".
-        # omega_est_body is still purely estimated (no truth injection there).
-        _in_terminal = (rpod_ctrl.mode == RPODMode.TERMINAL)
-        if _in_terminal:
-            # Truth port: known from camera observation at close range
-            port_eci_truth  = chief_att.dock_port_eci(chi_pos_m_prev)
-            port_lvlh_ctrl  = R_e2l @ (port_eci_truth - chi_pos_m_prev)
-            port_axis_lvlh  = R_e2l @ chief_att.dock_axis_eci()
-            r_arm_lvlh      = R_e2l @ (rot_matrix(chief_att.quaternion) @ DOCK_PORT_BODY)
-        else:
-            # PROX_OPS and earlier: use pose EKF R_body2lvlh if available
-            R_est_b2l = chief_pose_est.R_body2lvlh
-            if R_est_b2l is not None:
-                port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
-                port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
-                r_arm_lvlh     = port_lvlh_ctrl
+        # Use sensor-estimated port geometry for control. In close terminal,
+        # model direct visual acquisition of the dock ring as a noisy sensor
+        # measurement; before that, fall back to chief pose geometry.
+        R_est_b2l = chief_pose_est.R_body2lvlh
+        _nav_range_for_port = float(np.linalg.norm(th_ekf.x[0:3]))
+        _direct_port_visible = (rpod_ctrl.mode == RPODMode.TERMINAL
+                                and _nav_range_for_port < 5.0
+                                and not cam_sensor.is_lost)
+        if _direct_port_visible:
+            port_eci_meas = chief_att.dock_port_eci(chi_pos_m_prev)
+            port_lvlh_true = R_e2l @ (port_eci_meas - chi_pos_m_prev)
+            port_sigma_m = max(0.01, 0.002 * _nav_range_for_port)
+            port_meas = port_lvlh_true + np.random.normal(0.0, port_sigma_m, 3)
+            if not hasattr(rpod_ctrl, '_port_lvlh_filt'):
+                rpod_ctrl._port_lvlh_filt = port_meas.copy()
             else:
-                port_lvlh_ctrl = np.zeros(3)
-                port_axis_lvlh = np.zeros(3)
-                r_arm_lvlh     = np.zeros(3)
+                alpha_port = 0.20
+                rpod_ctrl._port_lvlh_filt = (
+                    alpha_port * port_meas
+                    + (1.0 - alpha_port) * rpod_ctrl._port_lvlh_filt)
+            port_lvlh_ctrl = rpod_ctrl._port_lvlh_filt.copy()
+            port_axis_lvlh = R_e2l @ chief_att.dock_axis_eci()
+            r_arm_lvlh = port_lvlh_ctrl
+        elif R_est_b2l is not None and omega_est_valid:
+            port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
+            port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
+            r_arm_lvlh     = port_lvlh_ctrl
+        else:
+            port_lvlh_ctrl = np.zeros(3)
+            port_axis_lvlh = np.zeros(3)
+            r_arm_lvlh     = np.zeros(3)
 
         port_vel_lvlh = np.cross(omega_est_lvlh, r_arm_lvlh)
         # Append port velocity to guidance state for terminal feedforward
         ekf_aug         = np.concatenate([ekf_lvlh_guided, port_vel_lvlh])
-        true_cw_aug     = np.concatenate([true_cw, port_vel_lvlh])
+        # ── main.py TERMINAL override ─────────────────────────────────
+        # lambert_controller TERMINAL_M=0.8m is too tight: the CW tangential
+        # drift causes PROX_OPS to orbit at ~6m. TERMINAL guidance targets
+        # the port in full 3D (not just radially), breaking the orbit.
+        # Override in main.py only — lambert_controller.py unchanged.
+        MAIN_TERMINAL_M = 5.0  # m — force TERMINAL takeover here
+        _nav_range_now = float(np.linalg.norm(th_ekf.x[0:3]))
+        if (rdv_started
+                and rpod_ctrl.mode == RPODMode.PROX_OPS
+                and _nav_range_now < MAIN_TERMINAL_M):
+            rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
+
         accel_cmd, impulse_dv = rpod_ctrl.compute(
             ekf_lvlh=ekf_aug,             # EKF state — PROX_OPS guidance
             chi_pos_eci=chi_pos_m_prev,
             chi_vel_eci=chi_vel_ms_prev,
             t=t,
-            true_cw=true_cw_aug,          # TRUTH state — mode transitions + TERMINAL
+            true_cw=None,                 # truth is not a control input
             port_lvlh=port_lvlh_ctrl,
             cam_lost=cam_sensor.is_lost,
             port_axis_lvlh=port_axis_lvlh)
@@ -750,7 +772,7 @@ while t < T_SIM_MAX and not docked:
             pre_vel = R_e2l @ (dep_vel_eci - chi_vel_ms)
             R_l2e   = R_e2l.T
             dep_vel_eci += R_l2e @ impulse_dv
-            cw.dv_total += np.abs(impulse_dv)
+            cw.dv_total += float(np.linalg.norm(impulse_dv))  # FIX 2: scalar |dv|
 
             post_pos = R_e2l @ (dep_pos_eci - chi_pos_m)
             post_vel = R_e2l @ (dep_vel_eci - chi_vel_ms)
@@ -777,7 +799,7 @@ while t < T_SIM_MAX and not docked:
         if np.any(accel_cmd != 0):
             R_l2e = R_e2l.T
             dep_vel_eci += R_l2e @ accel_cmd * DT_OUTER
-            cw.dv_total += np.abs(accel_cmd) * DT_OUTER
+            cw.dv_total += float(np.linalg.norm(accel_cmd)) * DT_OUTER  # FIX 2: scalar
 
         # ── Deputy full-force propagation ───────────────────────────
         dep_pos_eci, dep_vel_eci = propagate_full_force(
@@ -911,7 +933,7 @@ while t < T_SIM_MAX and not docked:
             print(f"  [t={t:.0f}s]  {rpod_ctrl.mode.name:<15}  "
                   f"range={rng:.1f}m  "
                   f"v_close={v_cl*1e3:.2f}mm/s  "
-                  f"ΣΔv={np.sum(cw.dv_total)*1e3:.1f}mm/s")
+                  f"ΣΔv={cw.dv_total*1e3:.1f}mm/s")
 
         # ── Prox/terminal per-50s print ─────────────────────────────
         _t_slot_50 = int(round(t / 50.0))
@@ -1004,9 +1026,9 @@ if tel['err_deg']:
     print(f"\n  MEKF SS pointing: mean={np.mean(ss):.3f}°  "
           f"3σ={np.mean(ss)+3*np.std(ss):.3f}°")
 if tel['rn_t']:
-    total_dv = float(np.sum(cw.dv_total))
+    total_dv = float(cw.dv_total)   # FIX 2/3: scalar accumulator
     print(f"\n  Final range   : {tel['rn_range'][-1]:.3f}m")
-    print(f"  Total ΔV      : {total_dv*1e3:.1f}mm/s")
+    print(f"  Total ΔV      : {total_dv*1e3:.1f}mm/s  ({total_dv:.4f} m/s)")
     Isp = 220.0
     dm  = DEP_MASS_KG * (1 - np.exp(-total_dv / (Isp * 9.81)))
     print(f"  Propellant    : {dm*1e3:.2f}g  (Isp={Isp}s hydrazine)")

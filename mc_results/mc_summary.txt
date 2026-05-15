@@ -1,0 +1,46 @@
+======================================================================
+  GEO RPOD Monte Carlo — Summary Report
+======================================================================
+  Runs       : 300  (N_WORKERS=8)
+  PASS       : 299  (99.7%)
+  FAIL       : 1  (0.3%)
+
+── Mission Timeline (PASS runs) ─────────────────────────────────────
+  ADCS gate [s]: mean=768.543  std=1706.296  p5=70.430  p50=465.500  p95=1927.150  max=19069.500
+  Lambert start [s]: mean=1368.584  std=1706.308  p5=670.430  p50=1065.500  p95=2527.250  max=19669.600
+  Docking time [s]: mean=7041.185  std=4014.451  p5=4894.010  p50=5926.900  p95=10933.390  max=36068.300
+  ADCS stable dur [s]: mean=300.022  std=0.041  p5=300.000  p50=300.000  p95=300.100  max=300.100
+
+── Propellant Budget (PASS runs) ────────────────────────────────────
+  ΔV [mm/s]: mean=124846.326  std=41669.173  p5=108137.714  p50=118716.597  p95=143858.802  max=537625.275
+
+── Docking Accuracy (PASS runs) ─────────────────────────────────────
+  Port range [cm]: mean=29.308  std=2.294  p5=25.738  p50=29.907  p95=29.972  max=29.999
+  Port v_rel [mm/s]: mean=24.184  std=20.844  p5=1.171  p50=12.095  p95=49.986  max=49.998
+
+── ADCS Performance (all runs) ──────────────────────────────────────
+  MEKF SS err [deg]: mean=0.622  std=7.364  p5=0.022  p50=0.023  p95=0.025  max=101.277
+
+── Relative Nav (PASS runs) ─────────────────────────────────────────
+  EKF pos err mean [m]: mean=0.210  std=0.108  p5=0.155  p50=0.186  p95=0.289  max=1.342
+  EKF pos err max [m]: mean=27.942  std=2.246  p5=27.338  p50=27.432  p95=29.503  max=51.675
+
+── Dispersion Inputs ────────────────────────────────────────────────
+  Chief tumble [deg/s]: mean=1.132  std=0.559  p5=0.171  p50=1.181  p95=1.920  max=1.995
+  Deputy Cr: mean=1.497  std=0.043  p5=1.435  p50=1.492  p95=1.566  max=1.575
+  Deputy A/m [m²/kg]: mean=0.007  std=0.000  p5=0.007  p50=0.007  p95=0.008  max=0.008
+
+── Failure Breakdown ────────────────────────────────────────────────
+  TIMEOUT_T>80000s                            1  (0.3%)
+
+── Sensitivity Analysis (Pearson r: input vs KPI) ──────────────────
+  input            dock_time_hr    total_dv_ms     ekf_err_mean  
+  tumble_rate      +0.022           +0.113           +0.039         
+  dep_Cr           -0.022           -0.078           +0.035         
+  dep_Am           -0.004           -0.047           +0.033         
+  raan_deg         -0.024           +0.009           -0.015         
+  st_cross         +0.025           +0.064           -0.011         
+
+  |r| > 0.3 = moderate influence, |r| > 0.5 = strong
+
+======================================================================

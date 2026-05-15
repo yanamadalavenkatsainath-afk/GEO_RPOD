@@ -1,219 +1,320 @@
-# GEO Rendezvous and Proximity Operations (RPOD) Simulation
+# GEO RPOD Flight Simulation
 
-A full-stack, flight-representative GNC simulation of an autonomous GEO rendezvous and docking mission, implemented entirely in Python with no proprietary dependencies. Core navigation and guidance algorithms are ported to C and verified through a Software-in-the-Loop (SIL) framework.
+Python high-fidelity simulation for a GEO rendezvous, proximity operations, and docking (RPOD) mission using a 50 kg deputy spacecraft servicing a tumbling GEO chief.
 
-![Python](https://img.shields.io/badge/Python-3.11-blue)
-![C](https://img.shields.io/badge/C-Flight%20Code-orange)
-![License](https://img.shields.io/badge/License-MIT-green)
-![SIL](https://img.shields.io/badge/SIL-Verified%207nm-brightgreen)
+The model is built as an end-to-end GNC simulation: orbital environment, relative dynamics, sensors, attitude estimation, relative navigation, ADCS, Lambert transfer, terminal docking-port targeting, and Monte Carlo robustness analysis.
 
----
+This repository is the Python reference model. The embedded C flight-software port and SIL harness live in the companion `Satellite_GNC` repository.
 
-## Results Summary
+## Current Verification Status
 
-| Metric | Result |
-|--------|--------|
-| Docking capture | range < 10 cm AND v_rel < 10 mm/s |
-| Lambert ΔV budget | < 250 mm/s (typical ~180 mm/s) |
-| TH-EKF position error | < 2 m during far-field coast |
-| MEKF pointing accuracy | < 0.05° steady-state |
-| SIL C vs Python divergence | < 7 nm over 1 full GEO orbit |
-| Simulation ceiling | 80,000 s (~22 hr) |
+Latest Monte Carlo run:
 
----
+- Trials: `300`
+- Docked: `300 / 300`
+- Docking success: `100.0%`
+- Mean total delta-V: `7.136 m/s`
+- Median total delta-V: `6.020 m/s`
+- 95th percentile delta-V: `14.713 m/s`
+- Mean time to dock: `2.388 hr`
+- 95th percentile time to dock: `3.800 hr`
+- Mean propellant: `165.0 g` at `Isp = 220 s`
+- 95th percentile propellant: `339.7 g`
 
-## What This Is
+The latest summary is saved in:
 
-A closed-loop GNC simulation covering the complete autonomous rendezvous mission for a 50 kg GEO servicing jetpack. The simulation models the full pipeline from initial spacecraft tumbling through docking:
-
-- **Environment**: Full-force GEO orbit propagator (J2 + SRP), IGRF-13 magnetic field, NRLMSISE-00 atmospheric density, dual-cone eclipse model, gravity gradient torque, differential SRP between chief and deputy
-- **Sensors**: ADIS16488A gyroscope (Allan variance), magnetometer, sun sensor, star tracker, ranging and bearing sensor
-- **Estimator (attitude)**: QUEST (Wahba's problem, 3-vector) for initialisation, 6-state MEKF with Joseph-form covariance update
-- **Estimator (relative nav)**: TH-EKF (Tschauner-Hempel EKF) with CW STM + true anomaly correction for GEO eccentricity
-- **Guidance**: Two-impulse Lambert transfer (universal variable method, Stumpff functions), PROX_OPS velocity-profile PD closure, TERMINAL range-proportional deceleration
-- **Control**: B-dot detumbling, PD reaction wheel attitude control, cross-product momentum desaturation, formation hold PD
-- **FSW**: 10-phase hierarchical state machine (DETUMBLE → SUN_ACQ → FINE_POINTING → FORMATION_HOLD → LAMBERT → COAST → PROX_OPS → TERMINAL → DOCKING)
-- **SIL Framework**: TH-EKF, MEKF, and RPOD guidance ported to C with CMSIS-DSP matrix operations, verified to 7 nm numerical parity against Python golden model
-
----
-
-## Mission Sequence
-
-| Phase | Mode | Exit Condition |
-|-------|------|----------------|
-| 1 | DETUMBLE | \|ω\| < 3.5 deg/s |
-| 2 | SUN_ACQUISITION | Pointing error < 5° |
-| 3 | FINE_POINTING | Error < 1°, sustained 100 steps |
-| 4 | FORMATION_HOLD | 300 s EKF settle |
-| 5 | LAMBERT burn 1 | Burn applied |
-| 6 | COAST | t >= t_burn2 (~4 hr arc) |
-| 7 | LAMBERT burn 2 | v_rel nulled |
-| 8 | PROX_OPS | range < 0.8 m |
-| 9 | TERMINAL | range < 10 cm |
-| 10 | DOCKING | range < 10 cm AND v_rel < 10 mm/s |
-
----
-
-## Project Structure
-
-```
-flight sim/
-│
-├── main.py                          # Full mission simulation entry point
-│
-├── plant/
-│   └── spacecraft.py                # Rigid-body dynamics (Euler + quaternion, RK4)
-│
-├── environment/
-│   ├── geo_orbit.py                 # Full-force GEO propagator (J2 + SRP, RK4)
-│   ├── cw_dynamics.py               # Clohessy-Wiltshire relative dynamics
-│   ├── magnetic_field.py            # IGRF-13 geomagnetic field (degree/order 6)
-│   ├── solar_radiation_pressure.py  # SRP torque + dual-cone eclipse model
-│   ├── gravity_gradient.py          # Gravity gradient torque
-│   └── aerodynamic_drag.py          # NRLMSISE-00 drag (negligible at GEO)
-│
-├── sensors/
-│   ├── gyro.py                      # ADIS16488A model (ARW + BI + RRW)
-│   ├── magnetometer.py              # 3-axis mag with Gaussian noise
-│   ├── sun_sensor.py                # Coarse sun sensor with eclipse masking
-│   ├── star_tracker.py              # Quaternion output with noise
-│   └── ranging_sensor.py            # Range + azimuth + elevation sensor
-│
-├── estimation/
-│   ├── quest.py                     # QUEST attitude initialisation
-│   ├── mekf.py                      # 6-state MEKF (Joseph form)
-│   └── th_ekf.py                    # TH-EKF relative navigation filter
-│
-├── control/
-│   ├── lambert_controller.py        # RPOD guidance + FSW mode machine
-│   └── lambert_solver.py            # Universal variable Lambert solver
-│
-├── actuators/
-│   ├── reaction_wheel.py            # RW momentum model + saturation
-│   ├── magnetorquer.py              # MTQ torque + desaturation law
-│   └── bdot.py                      # B-dot detumble controller
-│
-├── utils/
-│   └── quaternion.py                # Quaternion algebra
-│
-└── Satellite_GNC/                   # C SIL framework
-    ├── src_c/
-    │   ├── linalg.h                 # Static matrix math (no malloc)
-    │   ├── th_ekf.h / th_ekf.c     # C port of TH-EKF
-    │   ├── mekf.h / mekf.c         # C port of MEKF (CMSIS-DSP)
-    │   └── rpod_ctrl.h / rpod_ctrl.c  # C port of PROX_OPS + TERMINAL
-    ├── sim_python/
-    │   ├── wrapper.py               # ctypes bridge (Python → C)
-    │   └── verify_sil.py            # SIL numerical parity verification
-    ├── tests/
-    │   ├── test_thekf.c             # TH-EKF C unit tests
-    │   ├── test_mekf.c              # MEKF C unit tests
-    │   └── test_rpod.c              # RPOD guidance C unit tests
-    └── build.bat                    # Compile + run all tests
+```text
+monte_carlo_summary.txt
 ```
 
----
+The latest Monte Carlo binary results are saved in:
 
-## Quickstart
-
-### 1. Install dependencies
-
-```bash
-pip install numpy matplotlib nrlmsise00
+```text
+monte_carlo_results.npz
 ```
 
-### 2. Run full mission simulation
+The latest plot bundle is:
 
-```bash
+```text
+monte_carlo_plots.png
+```
+
+## Key Figures
+
+### Monte Carlo Performance
+
+![GEO RPOD Monte Carlo](monte_carlo_plots.png)
+
+This figure shows the total delta-V distribution, terminal/proximity delta-V split, and sensitivity of total delta-V to chief tumble rate and mission duration.
+
+### ADCS / Mode Timeline
+
+![ADCS overview](Figure_1.png)
+
+This figure shows attitude rate convergence, disturbance torques, eclipse function, reaction-wheel momentum, MEKF pointing error, and FSW mode progression.
+
+### RPOD Trajectory
+
+![RPOD trajectory](Figure_2.png)
+
+This figure shows LVLH relative motion, truth-vs-EKF position channels, log-range closure, cumulative delta-V, and the final close-approach trajectory into the docking port.
+
+## Mission Scenario
+
+The reference scenario models a 50 kg deputy spacecraft operating near GEO.
+
+| Item | Value |
+|---|---:|
+| Chief orbit | GEO, `a = 42164 km`, `e = 0.0003`, `i = 0.8 deg` |
+| Chief longitude | `342.0 deg E` |
+| Deputy mass | `50 kg` |
+| Deputy thrust | `1 N` |
+| Deputy max acceleration | `20 mm/s^2` |
+| Initial standoff | `1000 m` trailing |
+| Inner ADCS step | `0.01 s` |
+| RPOD outer-loop step | `0.1 s` |
+| Docking capture radius | `0.30 m` |
+| Docking relative-speed gate | `0.05 m/s` |
+| Terminal takeover | `5 m` main-loop override |
+| Formation-hold EKF settle | `300 s` |
+
+## Architecture
+
+```text
+main.py
+  |
+  +-- environment/
+  |     GEO orbit, CW dynamics, SRP, drag, magnetic field,
+  |     gravity gradient, sun model, chief tumble
+  |
+  +-- plant/
+  |     deputy spacecraft rigid-body attitude dynamics
+  |
+  +-- sensors/
+  |     gyro, magnetometer, sun sensor, star tracker,
+  |     ranging/bearing sensor, camera/PnP-style port sensor
+  |
+  +-- estimation/
+  |     QUEST, MEKF, TH-EKF
+  |
+  +-- control/
+  |     Lambert solver, RPOD phase controller, ADCS controller
+  |
+  +-- fsw/
+        high-level mode manager
+```
+
+## Flight Sequence
+
+The nominal mission progresses through:
+
+```text
+DETUMBLE
+  -> SUN_ACQUISITION
+  -> FINE_POINTING
+  -> FORMATION_HOLD
+  -> LAMBERT
+  -> PROX_OPS
+  -> TERMINAL
+  -> DOCKING
+```
+
+Major behaviors:
+
+- B-dot detumbling reduces initial body rates.
+- QUEST seeds the attitude estimate.
+- MEKF maintains fine pointing using gyro/vector measurements.
+- TH-EKF estimates relative position and velocity.
+- Lambert guidance moves from standoff to close approach.
+- PROX_OPS uses continuous sqrt-law closure.
+- TERMINAL targets the docking port, not just the chief center of mass.
+- Docking is confirmed using port range and relative velocity.
+
+## Main Components
+
+### Attitude Dynamics and ADCS
+
+The deputy attitude model includes rigid-body rotational dynamics, reaction wheels, magnetorquers, environmental disturbances, and closed-loop pointing control.
+
+ADCS outputs tracked in the plots include:
+
+- angular rate,
+- wheel momentum,
+- disturbance torques,
+- MEKF pointing error,
+- mode-manager state.
+
+### Relative Dynamics
+
+Relative motion is propagated in LVLH using CW-style dynamics around a GEO chief. The simulation includes mission-relevant GEO perturbation terms such as differential solar radiation pressure.
+
+### Navigation
+
+Navigation is split into:
+
+- MEKF for attitude and gyro-bias estimation,
+- TH-EKF for relative orbit estimation,
+- camera/PnP-style chief pose and docking-port updates in close approach.
+
+Terminal logic uses direct close-range port measurements when available to avoid late-stage estimator lag.
+
+### RPOD Guidance
+
+The RPOD controller includes:
+
+- formation hold,
+- Lambert transfer,
+- lost-target handling,
+- PROX_OPS approach,
+- TERMINAL docking-port closure,
+- docking detection.
+
+The terminal controller uses a speed-limited range law and a docking-port target derived from chief pose.
+
+### Chief Attitude and Docking Port
+
+The chief is modeled as a tumbling target with a body-fixed docking port:
+
+```text
+DOCK_PORT_BODY = [0, 0, 0.5] m
+DOCK_AXIS_BODY = [0, 0, 1]
+```
+
+The simulation estimates and tracks the port in LVLH during terminal approach. This is one of the key differences between a simple translational rendezvous simulation and a 6-DOF servicing-relevant RPOD model.
+
+## Monte Carlo
+
+Run the Monte Carlo with:
+
+```bat
+python monte_carlo.py --trials 300 --workers 8
+```
+
+Outputs:
+
+```text
+monte_carlo_results.npz
+monte_carlo_summary.txt
+monte_carlo_plots.png
+```
+
+Latest statistical result:
+
+| Metric | Mean | Std | 5th % | Median | 95th % |
+|---|---:|---:|---:|---:|---:|
+| Total delta-V (m/s) | 7.136 | 4.061 | 3.727 | 6.020 | 14.713 |
+| PROX_OPS delta-V (m/s) | 0.644 | 0.055 | 0.610 | 0.632 | 0.713 |
+| TERMINAL delta-V (m/s) | 6.492 | 4.062 | 3.092 | 5.394 | 14.064 |
+| Time to dock (hr) | 2.388 | 1.850 | 1.556 | 1.909 | 3.800 |
+| Chief tumble (deg/s) | 0.148 | 0.060 | 0.059 | 0.148 | 0.236 |
+
+Notes:
+
+- Most of the delta-V is consumed in terminal docking-port tracking.
+- PROX_OPS delta-V is tightly clustered around `0.6-0.7 m/s`.
+- The long right tail in total delta-V is driven by difficult terminal geometry and longer docking timelines.
+- The latest run shows weak correlation between total delta-V and chief tumble rate (`-0.088`) and modest positive correlation with time-to-dock (`+0.239`).
+
+## Single-Run Simulation
+
+Run the nominal mission:
+
+```bat
 python main.py
 ```
 
-Produces two matplotlib figures:
-- **Figure 1**: Full mission overview — ADCS rates, pointing error, FSW mode timeline, RPOD range, ΔV budget, EKF covariance
-- **Figure 2**: Close-approach phase — PROX_OPS and TERMINAL guidance, range vs time, v_close profile
+Expected outputs:
 
-### 3. Build and run C SIL framework (Windows)
+- console mission timeline,
+- docking confirmation if successful,
+- ADCS summary figure,
+- RPOD trajectory figure.
 
-```bash
-cd Satellite_GNC
-$env:Path += ";C:\msys64\mingw64\bin"   # add gcc to PATH
-.\build.bat
+## Requirements
+
+Install Python dependencies from:
+
+```bat
+pip install -r Requirements.txt
 ```
 
-Expected output:
+Core dependencies include:
+
+- `numpy`
+- `scipy`
+- `matplotlib`
+
+The model is developed and exercised on Windows, but the code is pure Python apart from local path assumptions in some scripts.
+
+## Validation Philosophy
+
+The Python model is used as the algorithmic reference for:
+
+- mission feasibility,
+- guidance-law tuning,
+- estimator behavior,
+- docking-port terminal approach,
+- Monte Carlo performance,
+- embedded C port comparison.
+
+The companion C implementation should be treated as the flight-software candidate. This Python repository remains the higher-fidelity reference and analysis environment.
+
+## Current Limitations
+
+This is an engineering simulation, not a certified flight dynamics tool.
+
+Known limitations:
+
+- Contact dynamics are simplified; docking confirmation stops the run rather than simulating hard/soft capture mechanics.
+- Docking-port pose is modeled through simulated chief attitude and pose estimation, not a full optical image-processing stack.
+- GEO environmental models are suitable for GNC trade studies, not final mission operations.
+- Thermal, power, communications, plume impingement, and flexible-body dynamics are out of scope.
+- The Monte Carlo randomizes important RPOD parameters, but it is not yet a full mission assurance campaign.
+- FDIR is represented at the mode/guidance level, but a formal fault tree, FMECA matrix, and fault-injection campaign are still future work.
+
+## Industry-Grade Next Steps
+
+Before presenting this as a flight-ready GNC stack, the next review items are:
+
+1. Add a formal FDIR/FMECA table with hazard severity, detection logic, response, and verification test for each fault.
+2. Add fault-injection Monte Carlo cases: sensor dropout, stale packets, camera spikes, gyro bias jumps, port loss, actuator saturation, and missed guidance updates.
+3. Add multi-sample docking confirmation and explicit post-contact state handling.
+4. Add approach-axis and attitude-alignment gates for docking.
+5. Replace local path assumptions with a config file or environment variables.
+6. Version the Monte Carlo configuration with each results file.
+7. Cross-check Python results against the C SIL after every major guidance or estimator change.
+
+## Relationship to Embedded C Repo
+
+The Python simulation is the reference model. The C flight-software repository implements the embedded/SIL side:
+
+```text
+Satellite_GNC/
+  src_c/
+  sim_python/
+  tests/
 ```
-Built: gnc_lib.dll
-=== TH-EKF C Verification === ... ALL PASS
-=== MEKF C Verification    === ... ALL PASS
-=== RPOD C Verification    === ... ALL PASS (0 failures)
-✓ ALL PASS — C EKF matches Python golden model
-   Position divergence: 6.73e-09 m  (threshold 1e-04 m)
-```
 
----
+The C repo currently mirrors the key RPOD, TH-EKF, MEKF, ADCS, and mode-manager logic and is verified through C unit tests plus Python closed-loop SIL.
 
-## Key Parameters
+## Notes for Version Control
 
-| Parameter | Value | Location |
-|-----------|-------|----------|
-| Chief orbit | a = 42164 km, e = 0.0003, i = 0.8°, 342°E | `main.py` |
-| Deputy mass | 50 kg | `main.py` |
-| Deputy thrust | 1.0 N → accel_max = 20 mm/s² | `main.py` |
-| Deputy A/m | 0.00720 m²/kg | `main.py` |
-| Chief A/m | 0.01500 m²/kg | `main.py` |
-| Diff. SRP | 53.4 nm/s² (chief − deputy) | Computed |
-| Initial standoff | 1000 m trailing (LVLH y = −1000 m) | `main.py` |
-| Outer loop rate | 10 Hz (dt = 0.1 s) | `main.py` |
-| Inner ADCS rate | 100 Hz (dt = 0.01 s) | `main.py` |
-| Formation hold | 300 s EKF settle | `main.py` |
-| Lambert ΔV cap | 2.0 m/s | `lambert_controller.py` |
-| FAR_FIELD threshold | 500 m (Lambert → PROX_OPS) | `lambert_controller.py` |
-| TERMINAL threshold | 0.8 m (PROX_OPS → TERMINAL) | `lambert_controller.py` |
-| PROX_OPS time constant | 5 s | `lambert_controller.py` |
-| TERMINAL speed gain | k = 0.01 s⁻¹, v_max = 5 mm/s | `lambert_controller.py` |
-| Docking capture | range < 10 cm AND v_rel < 10 mm/s | `main.py` |
-| Simulation ceiling | 80,000 s (~22 hr) | `main.py` |
+Recommended to commit:
 
----
+- source code,
+- requirements,
+- README,
+- small summary artifacts such as `monte_carlo_summary.txt`,
+- selected result figures when useful for review.
 
-## Algorithm Notes
+Recommended to ignore or avoid committing by default:
 
-### Lambert Solver (universal variable method)
-Solves the two-point boundary value problem for a given time-of-flight using the universal variable z and Stumpff functions C(z), S(z). These unify the elliptic, parabolic, and hyperbolic cases into one formulation. Newton-Raphson iteration on the TOF equation converges to the required z. A TOF scan over candidate arcs [1, 2, 4, 6, 16] hr selects the minimum total ΔV solution within the 2 m/s budget cap.
+- large telemetry CSVs,
+- `__pycache__/`,
+- temporary plots,
+- large raw Monte Carlo archives unless they are part of a tagged result release.
 
-### TH-EKF (Tschauner-Hempel EKF)
-6-state relative navigation filter with state x = [δr, δv] in LVLH. Uses the Clohessy-Wiltshire State Transition Matrix with a true-anomaly correction via RK4 integration of dν/dt = h(1 + e·cos ν)²/p² — this corrects CW for the GEO eccentricity e = 0.0003, reducing the orbit-period error from ~42 m to below 1 m. Measurement model: nonlinear h(x) = [range, azimuth, elevation] with analytical Jacobian. Joseph-form update with 50-sigma Mahalanobis gate (far-field) and 5-sigma (nominal).
+## Author
 
-### MEKF
-6-state error-state formulation [dθ, dbias]. Predicts using gyro-corrected angular rate via quaternion kinematics Ω(ω) matrix. Updates from magnetometer, sun sensor, and star tracker using the skew-symmetric Jacobian H = [−S(z_pred) | 0]. Joseph form used for numerical stability. QUEST reseeds the MEKF if attitude error exceeds 25°.
-
-### PROX_OPS Controller
-Velocity-profile PD law: desired closing speed is selected from a lookup table based on range (200 mm/s at 500 m stepping down to 3 mm/s at 2 m). Acceleration command: `accel = −(v − v_des)/τ − ω_pos² · pos` with τ = 5 s and ω_pos = 0.5·n for a weak position restoring term. Hard-clamped to 20 mm/s².
-
-### TERMINAL Controller
-Range-proportional speed law: `v_des = min(k·range, 5 mm/s)` with k = 0.01 s⁻¹. As range → 0, v_des → 0 — the deputy decelerates to rest at the docking port without an explicit brake command. At 0.8 m: 5 mm/s. At 0.1 m: 1 mm/s.
-
-### SIL Framework
-TH-EKF, MEKF, and RPOD guidance ported to C with static memory allocation (no malloc). MEKF uses CMSIS-DSP `arm_mat_mult_f32` on ARM targets; plain C loops on desktop via `−DMEKF_NO_CMSIS`. The `wrapper.py` ctypes bridge injects identical sensor data into both implementations. Verified: position divergence 6.73 nm, velocity divergence 6.6 pm/s, covariance error 4.0e-12 over one full GEO orbit.
-
----
-
-## Notes on Differential SRP
-
-The chief (A/m = 0.0150) and deputy (A/m = 0.0072) experience different SRP accelerations — a differential of 53.4 nm/s². This creates a natural GEO equilibrium separation point at approximately 307 m. The PROX_OPS and TERMINAL controllers overcome this through their velocity-profile and range-proportional laws. This differential is a physically correct and important characteristic of GEO on-orbit servicing scenarios — not a simulation artefact.
-
----
-
-## References
-
-- Markley & Crassidis, *Fundamentals of Spacecraft Attitude Determination and Control*, Springer 2014
-- Vallado & McClain, *Fundamentals of Astrodynamics and Applications*, 4th ed., Microcosm Press 2013
-- Clohessy & Wiltshire, "Terminal Guidance System for Satellite Rendezvous," *J. Aerosp. Sci.*, 1960
-- Yamanaka & Ankersen, "New State Transition Matrix for Relative Motion on an Arbitrary Elliptical Orbit," *JGCD*, 2002
-- Battin, *An Introduction to the Mathematics and Methods of Astrodynamics*, AIAA 1999
-- Mignard & Farinella, "The theory of satellite orbits," *Celest. Mech.*, 1984
-- IGRF-13: Alken et al., *Earth, Planets and Space*, 2021
-- NRLMSISE-00: Picone et al., *J. Geophys. Res.*, 2002
-- ARM, *CMSIS-DSP Software Library*, developer.arm.com
-
----
+Venkat Sainath  
+MSc Space Engineering

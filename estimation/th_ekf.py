@@ -418,8 +418,9 @@ class THEKF:
         s  = np.sin(nt)
         c  = np.cos(nt)
         ax, ay, az = accel
-        ix = (ax*(4*s - 3*nt) + 2*ay*(1 - c)) / n**2
-        iy = (-2*ax*(1 - c) + ay*(4*s/n - 3*t)) / n
+        n2 = n ** 2
+        ix = (ax*(1 - c) + 2*ay*(nt - s)) / n2
+        iy = (2*ax*(s - nt)) / n2 + ay*(4*(1 - c)/n2 - 1.5*t*t)
         iz = az*(1 - c) / n**2
         vx = (ax*s + 2*ay*(1-c)) / n
         vy = (-2*ax*(1-c) + ay*(4*s - 3*nt)) / n

@@ -1,0 +1,22 @@
+=================================================================
+  GEO RPOD Monte Carlo Summary
+=================================================================
+  Trials total   : 300
+  Docking success: 300 / 300  (100.0%)
+
+  Metric                           Mean      Std     5th%    50th%    95th%
+  --------------------------------------------------------------
+  Total DV (m/s)                  7.136    4.061    3.727    6.020   14.713
+  PROX_OPS DV (m/s)               0.644    0.055    0.610    0.632    0.713
+  TERMINAL DV (m/s)               6.492    4.062    3.092    5.394   14.064
+  Time to dock (hr)               2.388    1.850    1.556    1.909    3.800
+  Chief tumble (deg/s)            0.148    0.060    0.059    0.148    0.236
+
+  Propellant (Isp=220.0s hydrazine):
+    Mean  : 165.0g
+    95th% : 339.7g
+    Worst : 755.6g
+
+  DV correlation with chief tumble rate : -0.088
+  DV correlation with time-to-dock      : +0.239
+=================================================================

@@ -6,13 +6,11 @@ Sequence:
 
 Key design decisions
 --------------------
-* `truth_range` and `true_cw` are always used for mode transitions and
-  guidance.  EKF state is only used for Lambert planning (far field).
-* PROX_OPS and TERMINAL use `truth_range` (passed in from main) for all
-  range checks — never `np.linalg.norm(state[:3])`.  This avoids the
-  stale-state bug where state is not yet updated after a burn.
-* Lambert burn-2 nulls the truth relative velocity directly; the planned
-  dv2 is only a fallback if truth is unavailable.
+* EKF/navigation state is used for mode transitions and guidance.
+  Truth is only for sensors, logging, and post-run scoring in the sim.
+* PROX_OPS and TERMINAL use the same estimated state for range checks
+  and acceleration commands so the Python loop matches the C flight loop.
+* Lambert burn-2 uses the planned correction from the Lambert solution.
 * If Lambert arrival range > FAR_FIELD_M, controller replans immediately
   rather than blindly entering PROX_OPS at wrong range.
 * PROX_OPS velocity profile closes from 500m to 0.8m safely.
@@ -131,15 +129,13 @@ class GEORPODController:
         chi_pos_eci : chief ECI position [m]
         chi_vel_eci : chief ECI velocity [m/s]
         t           : simulation time [s]
-        true_cw     : truth LVLH state [m, m/s] — used for all mode transitions
-                      and guidance in PROX_OPS / TERMINAL.
+        true_cw     : optional truth LVLH state [m, m/s] for diagnostics only.
         """
-        # truth_range is computed fresh here from true_cw.
-        # This is the ONLY authoritative range used for mode transitions.
-        # All guidance computations use ekf_lvlh — the loop is closed.
-        truth_state = true_cw if true_cw is not None else ekf_lvlh
-        truth_range = float(np.linalg.norm(truth_state[:3]))
-        truth_state_6 = truth_state[:6]   # 6-element for non-terminal use
+        # Flight-like interface: guidance and mode transitions use estimated
+        # navigation state. Truth is retained only as a diagnostic reference.
+        nav_state = np.asarray(ekf_lvlh, dtype=float)
+        nav_range = float(np.linalg.norm(nav_state[:3]))
+        truth_range = nav_range
 
         # ── Lost-target FSW ──────────────────────────────────────────
         # Trigger LOST_TARGET only when camera has been bad for >5s (rolling
@@ -168,7 +164,7 @@ class GEORPODController:
         elif self.mode == RPODMode.LAMBERT:
             return self._lambert_step(
                 ekf_lvlh, chi_pos_eci, chi_vel_eci, t,
-                truth_range, true_cw)
+                truth_range, None)
 
         elif self.mode == RPODMode.LOST_TARGET:
             return self._lost_target(ekf_lvlh, truth_range, t), None
@@ -206,7 +202,7 @@ class GEORPODController:
                 return self._prox_ops(ekf_lvlh, truth_range, t,
                                       port_lvlh=_port,
                                       port_axis_lvlh=port_axis_lvlh), None
-            return self._terminal(truth_state, t, port_lvlh=_port,
+            return self._terminal(nav_state, t, port_lvlh=_port,
                                   port_axis_lvlh=port_axis_lvlh), None
 
         return np.zeros(3), None
@@ -270,23 +266,18 @@ class GEORPODController:
 
             self._lam_last_plan_t = t
             return self._plan_lambert(
-                ekf_lvlh, chi_pos, chi_vel, t, truth_range, true_cw)
+                ekf_lvlh, chi_pos, chi_vel, t, truth_range, None)
 
         # ── Active arc: coast until burn-2 ────────────────────────────
         if t >= self._lam_burn2_t:
             self._lam_active = False
 
-            # Burn-2: null truth relative velocity
-            if true_cw is not None:
-                dv2 = -true_cw[3:6]
-                print(f"  Lambert burn-2 [{t:.0f}s]: "
-                      f"|dv2|={np.linalg.norm(dv2)*1e3:.2f}mm/s  "
-                      f"truth_range={truth_range:.1f}m")
-            elif self._lam_dv2_lvlh is not None:
+            # Burn-2: use the planned Lambert correction, not truth velocity.
+            if self._lam_dv2_lvlh is not None:
                 dv2 = self._lam_dv2_lvlh.copy()
-                print(f"  Lambert burn-2 [{t:.0f}s]: planned fallback "
+                print(f"  Lambert burn-2 [{t:.0f}s]: planned "
                       f"|dv2|={np.linalg.norm(dv2)*1e3:.2f}mm/s  "
-                      f"truth_range={truth_range:.1f}m")
+                      f"nav_range={truth_range:.1f}m")
             else:
                 dv2 = np.zeros(3)
                 print(f"  Lambert burn-2 [{t:.0f}s]: zero dv2 (no state)")
@@ -340,19 +331,6 @@ class GEORPODController:
         the predicted arrival range > LAMBERT_ARRIVAL_TOL_M are rejected.
         This is the main guard against the 307m stuck-range bug.
         """
-
-        # ── Fresh nav fix before planning ─────────────────────────────
-        if (self.ekf is not None and self.rng_sensor is not None
-                and true_cw is not None):
-            rng = np.linalg.norm(true_cw[:3])
-            if rng > 1.0:
-                ok = self.ekf.reinit_from_measurements(
-                    self.rng_sensor, true_cw[:3],
-                    n_avg=10, P_pos_m=2.0, P_vel_ms=0.05)
-                if ok:
-                    self.ekf.x[3:6] = true_cw[3:6]
-                    ekf_lvlh = np.concatenate([self.ekf.position,
-                                               self.ekf.velocity])
 
         R_l2e       = self._R_l2e(chi_pos, chi_vel)
         R_e2l       = self._R_e2l(chi_pos, chi_vel)
@@ -496,8 +474,7 @@ class GEORPODController:
         """
         Close from FAR_FIELD_M to TERMINAL_M.
 
-        truth_range is passed in from compute() and is always
-        np.linalg.norm(true_cw[:3]) — fresh every call.
+        truth_range is the navigation/EKF range passed in from compute().
 
         On PROX_OPS → TERMINAL transition, range is recomputed from
         state[:3] at that exact moment to avoid stale caller value.
@@ -511,8 +488,8 @@ class GEORPODController:
             return self._terminal(state, t, port_lvlh=port_lvlh,
                                   port_axis_lvlh=port_axis_lvlh)
 
-        # Deadband — very close, just hold
-        if truth_range < 0.05:
+        # Deadband — docked/very close, just hold
+        if truth_range < 0.20:
             return np.zeros(3)
 
         pos = state[:3]
@@ -577,7 +554,8 @@ class GEORPODController:
         Target the docking PORT directly (not CoM).
         Port position = port_lvlh (passed from main loop each step).
         Speed law: v_des = K_SPEED * port_range, capped at V_MAX_MS.
-        Inside DOCK_RANGE_M: cap speed at V_CAPTURE_MS (5mm/s).
+        Inside DOCK_RANGE_M: cap speed at V_CAPTURE_MS (1.5mm/s), but
+        keep closing until the docked threshold.
 
         Entry brake: if arriving with |v| > 30mm/s, hard-brake first.
 
@@ -585,9 +563,10 @@ class GEORPODController:
           com_range, port_range, target (CoM or PORT), v_des, v_actual,
           |vel|, |accel|, pos_lvlh — everything needed to diagnose issues.
         """
-        V_MAX_MS     = 0.050   # m/s  50mm/s far field
-        V_CAPTURE_MS = 0.005   # m/s  5mm/s inside capture sphere
+        V_MAX_MS     = 0.025   # m/s  25mm/s terminal max
+        V_CAPTURE_MS = 0.0015  # m/s  1.5mm/s inside capture sphere
         DOCK_RANGE_M = 0.30    # m    capture zone
+        DOCK_DONE_M  = 0.20    # m    docking complete
         import math
         K_SQRT       = V_MAX_MS / math.sqrt(max(TERMINAL_M, 0.1))
         DT_DIAG      = 25.0    # s    diagnostic print interval
@@ -599,11 +578,11 @@ class GEORPODController:
 
         # ── TAU gain scheduling: overdamped below 0.3m ───────────────
         if com_range < 0.30:
-            TAU = 5.0
+            TAU = 8.0
         elif com_range < 0.60:
-            TAU = 3.0
+            TAU = 5.0
         else:
-            TAU = 2.0
+            TAU = 3.0
 
         # ── EKF spike guard ───────────────────────────────────────────
         # port_lvlh = EKF_pos + ~0.5m body offset. When EKF spikes to
@@ -660,9 +639,9 @@ class GEORPODController:
             return accel
 
         # ── Target port directly ──────────────────────────────────────
-        # port_lvlh is now truth in TERMINAL (fixed in main.py).
+        # port_lvlh is the pose-estimated dock-port location from main.py.
         # Drive straight to port. Speed law on com_range (monotonic).
-        # When port_range < DOCK_RANGE_M → velocity null → docking.
+        # When port_range < DOCK_RANGE_M → creep at capture speed to docking.
         if port_range > 0.001:
             tgt_hat   = (port - pos) / port_range
             tgt_range = port_range
@@ -678,7 +657,7 @@ class GEORPODController:
         align_deg   = 0.0
         align_scale = 1.0
 
-        if tgt_range < DOCK_RANGE_M:
+        if tgt_range < DOCK_DONE_M:
             vel_des = np.zeros(3)
         else:
             vel_des = tgt_hat * v_des_mag
