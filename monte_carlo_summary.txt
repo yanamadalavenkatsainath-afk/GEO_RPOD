@@ -2,21 +2,38 @@
   GEO RPOD Monte Carlo Summary
 =================================================================
   Trials total   : 300
-  Docking success: 300 / 300  (100.0%)
+  Docking success: 279 / 300  (93.0%)
+
+  Stress-case pass rate:
+    camera_dropout          0 / 20   (  0.0%)
+    gyro_bias              37 / 38   ( 97.4%)
+    high_pose_noise        20 / 20   (100.0%)
+    nominal               165 / 165  (100.0%)
+    range_dropout          24 / 24   (100.0%)
+    slow_detumble          10 / 10   (100.0%)
+    weak_thruster          23 / 23   (100.0%)
+
+  Outcome counts:
+    DOCKED                    279
+    DOCK_TIMEOUT               20
+    ADCS_NOT_CONFIRMED          1
 
   Metric                           Mean      Std     5th%    50th%    95th%
   --------------------------------------------------------------
-  Total DV (m/s)                  7.136    4.061    3.727    6.020   14.713
-  PROX_OPS DV (m/s)               0.644    0.055    0.610    0.632    0.713
-  TERMINAL DV (m/s)               6.492    4.062    3.092    5.394   14.064
-  Time to dock (hr)               2.388    1.850    1.556    1.909    3.800
-  Chief tumble (deg/s)            0.148    0.060    0.059    0.148    0.236
+  Total DV (m/s)                  6.870    3.741    3.669    5.804   13.880
+  PROX_OPS DV (m/s)               0.641    0.059    0.610    0.632    0.678
+  TERMINAL DV (m/s)               6.228    3.743    3.034    5.125   13.250
+  Time to dock (hr)               2.361    1.879    1.560    1.912    3.490
+  Chief tumble (deg/s)            0.153    0.057    0.067    0.153    0.242
+  Max nav error (m)             307.486    0.294  306.996  307.507  307.958
+  Final port range (m)            0.221    0.049    0.154    0.203    0.299
+  Final port vrel (m/s)           0.020    0.022    0.000    0.002    0.050
 
   Propellant (Isp=220.0s hydrazine):
-    Mean  : 165.0g
-    95th% : 339.7g
-    Worst : 755.6g
+    Mean  : 158.8g
+    95th% : 320.5g
+    Worst : 730.8g
 
-  DV correlation with chief tumble rate : -0.088
-  DV correlation with time-to-dock      : +0.239
+  DV correlation with chief tumble rate : -0.161
+  DV correlation with time-to-dock      : +0.094
 =================================================================

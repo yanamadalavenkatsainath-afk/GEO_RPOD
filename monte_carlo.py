@@ -27,6 +27,7 @@ Outputs
 
 import numpy as np
 import sys, os, time, traceback, warnings
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 warnings.filterwarnings("ignore")
 
@@ -95,6 +96,78 @@ N_GEO           = np.sqrt(MU_GEO / (CHIEF_A_KM * 1e3)**3)
 I_SC            = np.diag([4.167, 4.167, 3.000])
 MAIN_TERMINAL_M = 5.0    # main.py override threshold
 
+MC_STRESS_CASES = (
+    "nominal",
+    "range_dropout",
+    "camera_dropout",
+    "gyro_bias",
+    "high_pose_noise",
+    "slow_detumble",
+    "weak_thruster",
+)
+
+MC_STRESS_WEIGHTS = np.array([0.52, 0.10, 0.10, 0.10, 0.08, 0.05, 0.05])
+MC_STRESS_WEIGHTS = MC_STRESS_WEIGHTS / np.sum(MC_STRESS_WEIGHTS)
+
+STRESS_PROFILES = {
+    "nominal": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+    },
+    "range_dropout": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": (120.0, 420.0),
+        "camera_dropout_s": None,
+    },
+    "camera_dropout": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": (15.0, 135.0),
+    },
+    "gyro_bias": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.radians(np.array([0.035, -0.020, 0.015])),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+    },
+    "high_pose_noise": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 3.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+    },
+    "slow_detumble": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.60,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+    },
+    "weak_thruster": {
+        "thrust_scale": 0.65,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+    },
+}
+
 
 # =====================================================================
 #  HELPERS
@@ -133,6 +206,34 @@ def propagate_full_force(pos, vel, dt_total, t_abs, Cr, Am, substep=60.0):
     return p, v_now
 
 
+def _stress_profile(stress_case):
+    return STRESS_PROFILES.get(stress_case, STRESS_PROFILES["nominal"])
+
+
+def _in_relative_window(t_now, t_ref, window):
+    if t_ref is None or window is None:
+        return False
+    start_s, stop_s = window
+    return (t_now >= t_ref + start_s) and (t_now <= t_ref + stop_s)
+
+
+def _failure_reason(docked, adcs_confirmed, phase2_active, rdv_started,
+                    t_term_start, crashed=False):
+    if crashed:
+        return "CRASH"
+    if docked:
+        return "DOCKED"
+    if not adcs_confirmed:
+        return "ADCS_NOT_CONFIRMED"
+    if not phase2_active:
+        return "RPOD_NOT_ACTIVE"
+    if not rdv_started:
+        return "RENDEZVOUS_NOT_STARTED"
+    if t_term_start is None:
+        return "TERMINAL_NOT_REACHED"
+    return "DOCK_TIMEOUT"
+
+
 # =====================================================================
 #  SINGLE TRIAL
 # =====================================================================
@@ -140,11 +241,13 @@ def run_trial(trial_id,
               chief_omega0_deg_s,   # np.ndarray shape (3,)
               chief_M0_deg,         # float
               sc_omega0_rad_s,      # np.ndarray shape (3,)
-              rng_seed):            # int — for sensor noise
+              rng_seed,             # int for sensor noise
+              stress_case="nominal"):
     """Run one full mission simulation. Returns dict of results."""
 
     rng = np.random.default_rng(rng_seed)
     np.random.seed(rng_seed)
+    profile = _stress_profile(stress_case)
 
     # ── Environment ──────────────────────────────────────────────────
     chief_orbit = GEOOrbitPropagator(
@@ -159,7 +262,7 @@ def run_trial(trial_id,
 
     # ── Spacecraft ───────────────────────────────────────────────────
     sc       = Spacecraft(I_SC)
-    sc.omega = sc_omega0_rad_s.copy()
+    sc.omega = sc_omega0_rad_s.copy() * profile["sc_omega_scale"]
 
     # ── Sensors ──────────────────────────────────────────────────────
     mag_sens     = Magnetometer()
@@ -192,7 +295,8 @@ def run_trial(trial_id,
     q_ref     = np.array([1., 0., 0., 0.])
     rpod_ctrl = GEORPODController(
         mu=MU_GEO, n_chief=N_GEO,
-        dep_mass_kg=DEP_MASS_KG, dep_thrust_N=DEP_THRUST_N,
+        dep_mass_kg=DEP_MASS_KG,
+        dep_thrust_N=DEP_THRUST_N * profile["thrust_scale"],
         Cr_chi=CHI_CR, Am_chi=CHI_AM,
         dock_capture_m=DOCK_RANGE_M,
         ekf=th_ekf, rng_sensor=rng_sensor)
@@ -224,6 +328,19 @@ def run_trial(trial_id,
     phase2_active  = False;  rdv_started  = False
     docked         = False;  ekf_coast_active = False
     th_ekf_pos_prev = np.zeros(3)
+    phase2_start_t = None
+    range_drop_ticks = 0
+    camera_drop_ticks = 0
+    max_nav_err_m = 0.0
+    min_port_range_m = np.inf
+    final_range_m = np.nan
+    final_port_range_m = np.nan
+    final_port_vrel_ms = np.nan
+
+    def apply_gyro_stress(omega, t_now):
+        if t_now >= 30.0:
+            return omega + profile["gyro_bias_rad_s"]
+        return omega
 
     # Per-trial DV split tracking
     dv_at_prox_start  = 0.0
@@ -259,7 +376,7 @@ def run_trial(trial_id,
 
         B_meas     = mag_sens.measure(sc.q, B_I)
         sun_meas   = sun_sens.measure(sc.q, sun_I) if not in_eclipse else np.zeros(3)
-        omega_meas = gyro.measure(sc.omega)
+        omega_meas = apply_gyro_stress(gyro.measure(sc.omega), t)
 
         if fsw.is_sun_acquiring:
             nadir_I = QUEST.nadir_inertial(chi_pos_km)
@@ -331,7 +448,7 @@ def run_trial(trial_id,
                     if q_fix[0] < 0: q_fix = -q_fix
                     mekf.q = q_fix.copy()
             for _ in range(N_INNER):
-                oi = gyro.measure(sc.omega)
+                oi = apply_gyro_stress(gyro.measure(sc.omega), t)
                 mekf.predict(oi)
                 mekf.update_vector(B_meas, B_I, mekf.R_mag)
                 if not in_eclipse:
@@ -366,6 +483,7 @@ def run_trial(trial_id,
         # ── Phase 2 activation ───────────────────────────────────────
         if adcs_confirmed and not phase2_active and t >= adcs_conf_t + FORM_HOLD_SETTLE_S:
             phase2_active = True
+            phase2_start_t = t
             cw.dv_total   = 0.0   # rendezvous DV budget starts here
             ok = th_ekf.reinit_from_measurements(
                 rng_sensor, cw.state[:3], n_avg=10, P_pos_m=2.0, P_vel_ms=0.001)
@@ -383,12 +501,26 @@ def run_trial(trial_id,
             true_cw     = np.concatenate([true_cw_pos, true_cw_vel])
             cw.state    = true_cw
             ekf_lvlh    = np.concatenate([th_ekf.position, th_ekf.velocity])
+            range_blocked = _in_relative_window(
+                t, phase2_start_t, profile["range_dropout_s"])
+            camera_blocked = _in_relative_window(
+                t, t_term_start, profile["camera_dropout_s"])
+            if range_blocked:
+                range_drop_ticks += 1
+            if camera_blocked:
+                camera_drop_ticks += 1
+            max_nav_err_m = max(
+                max_nav_err_m,
+                float(np.linalg.norm(th_ekf.x[0:3] - true_cw_pos)))
 
             # Lambert trigger
             if not rdv_started and t >= adcs_conf_t + 2*FORM_HOLD_SETTLE_S:
                 ekf_dir_seed = (th_ekf.x[0:3] /
                                 max(np.linalg.norm(th_ekf.x[0:3]), 1.0))
-                z_seed, R_seed = rng_sensor.measure(true_cw_pos, ekf_dir_seed)
+                if range_blocked:
+                    z_seed, R_seed = None, None
+                else:
+                    z_seed, R_seed = rng_sensor.measure(true_cw_pos, ekf_dir_seed)
                 if z_seed is not None:
                     pos_seed = rng_sensor.invert(z_seed)
                     th_ekf.initialise(
@@ -402,7 +534,10 @@ def run_trial(trial_id,
                 boresight_seed = (th_ekf.x[0:3] /
                                   max(np.linalg.norm(th_ekf.x[0:3]), 1.0))
                 for _ in range(20):
-                    z_w, R_w = rng_sensor.measure(true_cw_pos, boresight_seed)
+                    if range_blocked:
+                        z_w, R_w = None, None
+                    else:
+                        z_w, R_w = rng_sensor.measure(true_cw_pos, boresight_seed)
                     if z_w is not None:
                         th_ekf.predict(np.zeros(3))
                         th_ekf.update(z_w, R_w, gate_k=50.0)
@@ -446,11 +581,13 @@ def run_trial(trial_id,
             _nav_range_for_port = float(np.linalg.norm(th_ekf.x[0:3]))
             _direct_port_visible = (rpod_ctrl.mode == RPODMode.TERMINAL
                                     and _nav_range_for_port < 5.0
-                                    and not cam_sensor.is_lost)
+                                    and not cam_sensor.is_lost
+                                    and not camera_blocked)
             if _direct_port_visible:
                 port_eci_meas = chief_att.dock_port_eci(chi_pos_m_prev)
                 port_lvlh_true = R_e2l @ (port_eci_meas - chi_pos_m_prev)
-                port_sigma_m = max(0.01, 0.002 * _nav_range_for_port)
+                port_sigma_m = (max(0.01, 0.002 * _nav_range_for_port)
+                                * profile["port_noise_scale"])
                 port_meas = port_lvlh_true + rng.normal(0.0, port_sigma_m, 3)
                 if not hasattr(rpod_ctrl, '_port_lvlh_filt'):
                     rpod_ctrl._port_lvlh_filt = port_meas.copy()
@@ -490,7 +627,7 @@ def run_trial(trial_id,
                 t=t,
                 true_cw=None,
                 port_lvlh=port_lvlh_ctrl,
-                cam_lost=cam_sensor.is_lost,
+                cam_lost=(cam_sensor.is_lost or camera_blocked),
                 port_axis_lvlh=port_axis_lvlh)
 
             ekf_coast_active = (rpod_ctrl.mode == RPODMode.LAMBERT
@@ -540,7 +677,10 @@ def run_trial(trial_id,
                          else np.array([0., -1., 0.]))
 
             if ekf_coast_active:
-                z_c, _ = rng_sensor.measure(true_cw_pos, boresight)
+                if range_blocked:
+                    z_c = None
+                else:
+                    z_c, _ = rng_sensor.measure(true_cw_pos, boresight)
                 if z_c is not None:
                     th_ekf.x[0:3] = rng_sensor.invert(z_c)
                 v_dop, sig_v = rng_sensor.measure_doppler(
@@ -556,8 +696,11 @@ def run_trial(trial_id,
                 _in_term = (rpod_ctrl.mode == RPODMode.TERMINAL)
                 if not _in_term:
                     th_ekf.predict(accel_cmd)
-                z_cam, R_cam = cam_sensor.measure(true_cw_pos,
-                                                   q_chief=chief_att.quaternion)
+                if camera_blocked:
+                    z_cam, R_cam = None, None
+                else:
+                    z_cam, R_cam = cam_sensor.measure(
+                        true_cw_pos, q_chief=chief_att.quaternion)
                 if z_cam is not None:
                     if _in_term:
                         th_ekf.x[0:3] = z_cam
@@ -589,6 +732,10 @@ def run_trial(trial_id,
             rel_vel_p   = true_cw_vel - port_vel_d
             port_range  = np.linalg.norm(dep_to_port)
             port_vrel   = np.linalg.norm(rel_vel_p)
+            final_range_m = float(np.linalg.norm(true_cw_pos))
+            final_port_range_m = float(port_range)
+            final_port_vrel_ms = float(port_vrel)
+            min_port_range_m = min(min_port_range_m, final_port_range_m)
             if port_range < DOCK_RANGE_M and port_vrel < DOCK_VREL_MS:
                 docked = True
                 break
@@ -605,9 +752,14 @@ def run_trial(trial_id,
                else total_dv)
     term_dv = (total_dv - dv_at_term_start
                if t_term_start is not None else 0.0)
+    if not np.isfinite(min_port_range_m):
+        min_port_range_m = np.nan
 
     return {
         "trial":          trial_id,
+        "stress_case":    stress_case,
+        "failure_reason": _failure_reason(
+            docked, adcs_confirmed, phase2_active, rdv_started, t_term_start),
         "docked":         docked,
         "total_dv_ms":    total_dv,        # m/s
         "propellant_g":   dm * 1000,       # g
@@ -618,7 +770,15 @@ def run_trial(trial_id,
         "term_dv_ms":     term_dv,         # m/s
         "chief_omega_dps": float(np.linalg.norm(chief_omega0_deg_s)),
         "chief_M0_deg":   chief_M0_deg,
-        "sc_omega_rads":  float(np.linalg.norm(sc_omega0_rad_s)),
+        "sc_omega_rads":  float(np.linalg.norm(sc_omega0_rad_s)
+                                * profile["sc_omega_scale"]),
+        "final_range_m":  final_range_m,
+        "final_port_range_m": final_port_range_m,
+        "final_port_vrel_ms": final_port_vrel_ms,
+        "min_port_range_m": min_port_range_m,
+        "max_nav_err_m": max_nav_err_m,
+        "range_drop_s": range_drop_ticks * DT_OUTER,
+        "camera_drop_s": camera_drop_ticks * DT_OUTER,
     }
 
 
@@ -689,18 +849,29 @@ def run_monte_carlo_serial_legacy(n_trials=30, master_seed=42, n_workers=1):
 
 
 def _run_trial_from_params(params):
-    i, chief_omega0, chief_M0, sc_omega0, noise_seed = params
+    i, chief_omega0, chief_M0, sc_omega0, noise_seed, stress_case = params
     try:
-        return run_trial(i, chief_omega0, chief_M0, sc_omega0, noise_seed)
+        return run_trial(i, chief_omega0, chief_M0, sc_omega0, noise_seed,
+                         stress_case=stress_case)
     except Exception as e:
         return {
-            "trial": i, "docked": False,
+            "trial": i, "stress_case": stress_case,
+            "failure_reason": _failure_reason(
+                False, False, False, False, None, crashed=True),
+            "docked": False,
             "total_dv_ms": np.nan, "propellant_g": np.nan,
             "t_dock_s": None, "t_dock_hr": None, "t_adcs_s": None,
             "prox_dv_ms": np.nan, "term_dv_ms": np.nan,
             "chief_omega_dps": float(np.linalg.norm(chief_omega0)),
             "chief_M0_deg": chief_M0,
             "sc_omega_rads": float(np.linalg.norm(sc_omega0)),
+            "final_range_m": np.nan,
+            "final_port_range_m": np.nan,
+            "final_port_vrel_ms": np.nan,
+            "min_port_range_m": np.nan,
+            "max_nav_err_m": np.nan,
+            "range_drop_s": 0.0,
+            "camera_drop_s": 0.0,
             "error": repr(e),
             "traceback": traceback.format_exc(),
         }
@@ -714,12 +885,21 @@ def _print_trial_result(r, wall):
     print(f"  {r['trial']:3d}    {'YES' if r['docked'] else 'NO ':>5}  "
           f"{dv_str:>8}  {dock_str:>10}  {prox_str:>8}  {term_str:>8}  "
           f"{r['chief_omega_dps']:>11.3f}  {r['chief_M0_deg']:>7.1f}"
-          f"  [{wall:.0f}s]")
+          f"  {r.get('stress_case', 'nominal')[:14]:>14}  [{wall:.0f}s]")
     if "error" in r:
         print(f"         crashed: {r['error']}")
 
 
-def run_monte_carlo(n_trials=300, master_seed=42, n_workers=8):
+def _draw_stress_case(rng_master, stress_mode, trial_id):
+    if stress_mode == "nominal":
+        return "nominal"
+    if stress_mode == "sweep":
+        return MC_STRESS_CASES[trial_id % len(MC_STRESS_CASES)]
+    return str(rng_master.choice(MC_STRESS_CASES, p=MC_STRESS_WEIGHTS))
+
+
+def run_monte_carlo(n_trials=300, master_seed=42, n_workers=8,
+                    stress_mode="mixed"):
     rng_master = np.random.default_rng(master_seed)
     trial_params = []
     for i in range(n_trials):
@@ -733,13 +913,16 @@ def run_monte_carlo(n_trials=300, master_seed=42, n_workers=8):
         sc_dir /= np.linalg.norm(sc_dir)
         sc_omega0 = sc_dir * sc_mag
         noise_seed = int(rng_master.integers(0, 2**31))
-        trial_params.append((i, chief_omega0, chief_M0, sc_omega0, noise_seed))
+        stress_case = _draw_stress_case(rng_master, stress_mode, i)
+        trial_params.append((i, chief_omega0, chief_M0, sc_omega0,
+                             noise_seed, stress_case))
 
     print(f"\nRunning {n_trials} Monte Carlo trials with {n_workers} worker(s)...")
+    print(f"Stress mode: {stress_mode}")
     print(f"{'Trial':>6} {'Docked':>7} {'DV(m/s)':>9} "
           f"{'T_dock(hr)':>11} {'Prox_DV':>9} {'Term_DV':>9} "
-          f"{'Chief_w(d/s)':>13} {'M0(deg)':>8}")
-    print("-" * 80)
+          f"{'Chief_w(d/s)':>13} {'M0(deg)':>8} {'Stress':>14}")
+    print("-" * 98)
 
     results = []
     if n_workers <= 1:
@@ -770,12 +953,26 @@ def summarise(results, out_dir="."):
     n_total  = len(results)
     n_docked = len(docked_r)
 
-    dvs  = np.array([r['total_dv_ms'] for r in docked_r])
-    tdks = np.array([r['t_dock_hr']   for r in docked_r])
-    pdvs = np.array([r['prox_dv_ms']  for r in docked_r])
-    tdvs = np.array([r['term_dv_ms']  for r in docked_r])
-    oms  = np.array([r['chief_omega_dps'] for r in docked_r])
+    dvs  = np.array([r['total_dv_ms'] for r in docked_r], dtype=float)
+    tdks = np.array([r['t_dock_hr']   for r in docked_r], dtype=float)
+    pdvs = np.array([r['prox_dv_ms']  for r in docked_r], dtype=float)
+    tdvs = np.array([r['term_dv_ms']  for r in docked_r], dtype=float)
+    oms  = np.array([r['chief_omega_dps'] for r in docked_r], dtype=float)
+    nav_err = np.array([r.get('max_nav_err_m', np.nan) for r in docked_r],
+                       dtype=float)
+    final_port = np.array([r.get('final_port_range_m', np.nan)
+                           for r in docked_r], dtype=float)
+    final_vrel = np.array([r.get('final_port_vrel_ms', np.nan)
+                           for r in docked_r], dtype=float)
+    stress_all = np.array([r.get('stress_case', 'nominal') for r in results])
+    reason_all = np.array([r.get('failure_reason',
+                                 'DOCKED' if r['docked'] else 'UNKNOWN')
+                           for r in results])
     Isp  = 220.0; g0 = 9.81; m0 = 50.0
+    stress_counts = Counter(stress_all)
+    stress_success = Counter(r.get('stress_case', 'nominal')
+                             for r in results if r['docked'])
+    reason_counts = Counter(reason_all)
 
     lines = []
     lines.append("=" * 65)
@@ -784,6 +981,17 @@ def summarise(results, out_dir="."):
     lines.append(f"  Trials total   : {n_total}")
     lines.append(f"  Docking success: {n_docked} / {n_total}  "
                  f"({100*n_docked/n_total:.1f}%)")
+    lines.append("")
+    lines.append("  Stress-case pass rate:")
+    for case in sorted(stress_counts):
+        passed = stress_success[case]
+        total = stress_counts[case]
+        lines.append(f"    {case:<20} {passed:>4} / {total:<4}"
+                     f" ({100*passed/max(total, 1):>5.1f}%)")
+    lines.append("")
+    lines.append("  Outcome counts:")
+    for reason, count in reason_counts.most_common():
+        lines.append(f"    {reason:<24} {count:>4}")
     lines.append("")
     if n_docked > 0:
         lines.append(f"  {'Metric':<28} {'Mean':>8} {'Std':>8} "
@@ -795,7 +1003,12 @@ def summarise(results, out_dir="."):
             ("TERMINAL DV",   tdvs, "m/s"),
             ("Time to dock",  tdks, "hr"),
             ("Chief tumble",  oms,  "deg/s"),
+            ("Max nav error", nav_err[np.isfinite(nav_err)], "m"),
+            ("Final port range", final_port[np.isfinite(final_port)], "m"),
+            ("Final port vrel", final_vrel[np.isfinite(final_vrel)], "m/s"),
         ]:
+            if len(arr) == 0:
+                continue
             lines.append(
                 f"  {label+' ('+unit+')' :<28}"
                 f"  {np.mean(arr):>7.3f}"
@@ -837,18 +1050,27 @@ def summarise(results, out_dir="."):
              prox_dv_ms    = np.array([r['prox_dv_ms']     for r in results], dtype=float),
              term_dv_ms    = np.array([r['term_dv_ms']     for r in results], dtype=float),
              chief_omega_dps = np.array([r['chief_omega_dps'] for r in results], dtype=float),
-             chief_M0_deg  = np.array([r['chief_M0_deg']   for r in results], dtype=float))
+             chief_M0_deg  = np.array([r['chief_M0_deg']   for r in results], dtype=float),
+             stress_case   = stress_all,
+             failure_reason = reason_all,
+             final_range_m = np.array([r.get('final_range_m', np.nan) for r in results], dtype=float),
+             final_port_range_m = np.array([r.get('final_port_range_m', np.nan) for r in results], dtype=float),
+             final_port_vrel_ms = np.array([r.get('final_port_vrel_ms', np.nan) for r in results], dtype=float),
+             min_port_range_m = np.array([r.get('min_port_range_m', np.nan) for r in results], dtype=float),
+             max_nav_err_m = np.array([r.get('max_nav_err_m', np.nan) for r in results], dtype=float),
+             range_drop_s = np.array([r.get('range_drop_s', 0.0) for r in results], dtype=float),
+             camera_drop_s = np.array([r.get('camera_drop_s', 0.0) for r in results], dtype=float))
     print(f"\n  Raw data saved: {out_npz}")
     print(f"  Summary saved:  {out_txt}")
 
     # ── Plots ────────────────────────────────────────────────────────
-    if n_docked >= 2:
-        fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    if n_docked >= 1:
+        fig, axes = plt.subplots(2, 4, figsize=(18, 9))
         fig.suptitle(f"GEO RPOD Monte Carlo  (n={n_total}, "
                      f"{n_docked} docked)", fontsize=13, fontweight="bold")
 
         ax = axes[0, 0]
-        ax.hist(dvs, bins=min(15, n_docked), color="steelblue",
+        ax.hist(dvs, bins=max(1, min(18, n_docked)), color="steelblue",
                 edgecolor="white", linewidth=0.5)
         ax.axvline(np.mean(dvs), color="red", ls="--", lw=1.5,
                    label=f"Mean {np.mean(dvs):.2f} m/s")
@@ -858,28 +1080,75 @@ def summarise(results, out_dir="."):
         ax.legend(fontsize=8)
 
         ax = axes[0, 1]
-        ax.scatter(oms, dvs, c=tdks, cmap="plasma", s=50, zorder=3)
-        sc = ax.scatter(oms, dvs, c=tdks, cmap="plasma", s=50)
+        ax.hist(tdks, bins=max(1, min(18, n_docked)), color="seagreen",
+                edgecolor="white", linewidth=0.5)
+        ax.axvline(np.mean(tdks), color="black", ls="--", lw=1.2,
+                   label=f"Mean {np.mean(tdks):.2f} hr")
+        ax.set(xlabel="Time to dock (hr)", ylabel="Count",
+               title="Dock Time Distribution")
+        ax.legend(fontsize=8)
+
+        ax = axes[0, 2]
+        sc = ax.scatter(oms, dvs, c=tdks, cmap="plasma", s=45,
+                        edgecolor="black", linewidth=0.2)
         plt.colorbar(sc, ax=ax, label="Time to dock (hr)")
         ax.set(xlabel="Chief tumble rate (deg/s)", ylabel="Total DV (m/s)",
                title="DV vs Chief Tumble Rate")
 
-        ax = axes[1, 0]
-        bar_w = 0.35
-        idx   = np.arange(min(n_docked, 15))
-        sample_pdvs = pdvs[:len(idx)]
-        sample_tdvs = tdvs[:len(idx)]
-        ax.bar(idx, sample_pdvs, bar_w, label="PROX_OPS", color="steelblue")
-        ax.bar(idx+bar_w, sample_tdvs, bar_w, label="TERMINAL", color="tomato")
-        ax.set(xlabel="Trial", ylabel="DV (m/s)", title="DV Split (first 15 trials)")
+        ax = axes[0, 3]
+        cases = sorted(stress_counts)
+        x = np.arange(len(cases))
+        mean_prox = []
+        mean_term = []
+        for case in cases:
+            rr = [r for r in docked_r if r.get('stress_case', 'nominal') == case]
+            mean_prox.append(np.nanmean([r['prox_dv_ms'] for r in rr])
+                             if rr else 0.0)
+            mean_term.append(np.nanmean([r['term_dv_ms'] for r in rr])
+                             if rr else 0.0)
+        ax.bar(x, mean_prox, label="PROX_OPS", color="steelblue")
+        ax.bar(x, mean_term, bottom=mean_prox, label="TERMINAL", color="tomato")
+        ax.set_xticks(x)
+        ax.set_xticklabels(cases, rotation=35, ha="right", fontsize=8)
+        ax.set(ylabel="Mean DV (m/s)", title="Mean DV Split by Stress Case")
         ax.legend(fontsize=8)
 
+        ax = axes[1, 0]
+        success_pct = [
+            100.0 * stress_success[c] / max(stress_counts[c], 1)
+            for c in cases
+        ]
+        ax.bar(x, success_pct, color="mediumseagreen")
+        ax.set_ylim(0, 105)
+        ax.set_xticks(x)
+        ax.set_xticklabels(cases, rotation=35, ha="right", fontsize=8)
+        ax.set(ylabel="Docking success (%)", title="Pass Rate by Stress Case")
+
         ax = axes[1, 1]
-        ax.scatter(tdks, dvs, c=oms, cmap="viridis", s=50)
-        sc2 = ax.scatter(tdks, dvs, c=oms, cmap="viridis", s=50)
+        reasons = [r for r, _ in reason_counts.most_common()]
+        counts = [reason_counts[r] for r in reasons]
+        ax.bar(np.arange(len(reasons)), counts, color="slategray")
+        ax.set_xticks(np.arange(len(reasons)))
+        ax.set_xticklabels(reasons, rotation=35, ha="right", fontsize=8)
+        ax.set(ylabel="Trials", title="Outcome / Failure Mode Counts")
+
+        ax = axes[1, 2]
+        sc2 = ax.scatter(tdks, dvs, c=oms, cmap="viridis", s=45,
+                         edgecolor="black", linewidth=0.2)
         plt.colorbar(sc2, ax=ax, label="Chief tumble (deg/s)")
         ax.set(xlabel="Time to dock (hr)", ylabel="Total DV (m/s)",
                title="DV vs Mission Duration")
+
+        ax = axes[1, 3]
+        ax.scatter(final_port, final_vrel * 1000.0, c=dvs, cmap="cividis",
+                   s=45, edgecolor="black", linewidth=0.2)
+        ax.axvline(DOCK_RANGE_M, color="red", ls="--", lw=1.2,
+                   label=f"{DOCK_RANGE_M:.2f} m gate")
+        ax.axhline(DOCK_VREL_MS * 1000.0, color="orange", ls="--", lw=1.2,
+                   label=f"{DOCK_VREL_MS*1000:.0f} mm/s gate")
+        ax.set(xlabel="Final port range (m)", ylabel="Final port vrel (mm/s)",
+               title="Docking Gate Margin")
+        ax.legend(fontsize=8)
 
         fig.tight_layout()
         out_png = os.path.join(out_dir, "monte_carlo_plots.png")
@@ -905,11 +1174,15 @@ if __name__ == "__main__":
     parser.add_argument("--outdir",  type=str,
                         default=os.path.dirname(os.path.abspath(__file__)),
                         help="Output directory for results")
+    parser.add_argument("--stress-mode", type=str, default="mixed",
+                        choices=("mixed", "nominal", "sweep"),
+                        help="Stress-case selection: mixed, nominal, or sweep")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
     t_wall_start = time.time()
     results = run_monte_carlo(n_trials=args.trials, master_seed=args.seed,
-                              n_workers=args.workers)
+                              n_workers=args.workers,
+                              stress_mode=args.stress_mode)
     summarise(results, out_dir=args.outdir)
     print(f"\n  Total wall time: {(time.time()-t_wall_start)/60:.1f} min")
