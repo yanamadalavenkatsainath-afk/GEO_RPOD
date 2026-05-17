@@ -52,6 +52,8 @@ from actuators.bdot                       import BDotController
 from estimation.mekf                      import MEKF
 from estimation.quest                     import QUEST
 from estimation.th_ekf                    import THEKF
+from estimation.port_tracker              import PortTracker
+from estimation.terminal_nav_filter       import TerminalNavFilter
 from chief_attitude                       import ChiefAttitude
 from chief_pose_estimator                 import ChiefPoseEstimator
 from control.attitude_controller          import AttitudeController
@@ -88,6 +90,12 @@ FORM_HOLD_SETTLE_S = 300.0
 DOCK_RANGE_M    = 0.30
 DOCK_VREL_MS    = 0.05
 SIGMA_V_DOPPLER = 0.005
+TERM_NAV_ALPHA   = 0.35
+TERM_NAV_BETA    = 0.06
+TERM_NAV_VMAX_MS = 0.10
+TERM_NAV_GATE_M  = 0.25
+PORT_TRACK_ALPHA  = 0.40
+PORT_TRACK_GATE_M = 0.25
 ECLIPSE_NU_MIN  = 0.1
 DOCK_PORT_BODY  = np.array([0.0, 0.0, 0.5])
 DOCK_AXIS_BODY  = np.array([0.0, 0.0, 1.0])
@@ -548,27 +556,26 @@ def run_trial(trial_id,
                 dv_at_prox_start = cw.dv_total
                 t_prox_start     = t
 
-            # FD velocity (TERMINAL only — EKF elsewhere)
+            # Terminal alpha-beta velocity (EKF velocity elsewhere)
             ekf_pos_now = th_ekf.x[0:3].copy()
-            _use_fd_vel = (rpod_ctrl.mode == RPODMode.TERMINAL)
-            if _use_fd_vel and hasattr(rpod_ctrl, '_fd_pos_prev'):
-                fd_vel_raw = (ekf_pos_now - rpod_ctrl._fd_pos_prev) / DT_OUTER
-                fd_mag = np.linalg.norm(fd_vel_raw)
-                if fd_mag > 2.0:
-                    fd_vel_raw = fd_vel_raw * 2.0 / fd_mag
-                if not hasattr(rpod_ctrl, '_fd_vel_smooth'):
-                    rpod_ctrl._fd_vel_smooth = fd_vel_raw.copy()
-                else:
-                    rpod_ctrl._fd_vel_smooth = (0.3*fd_vel_raw +
-                                                 0.7*rpod_ctrl._fd_vel_smooth)
-                fd_vel = rpod_ctrl._fd_vel_smooth.copy()
+            _use_term_nav = (rpod_ctrl.mode == RPODMode.TERMINAL)
+            if _use_term_nav:
+                if not hasattr(rpod_ctrl, '_terminal_nav'):
+                    rpod_ctrl._terminal_nav = TerminalNavFilter(
+                        alpha=TERM_NAV_ALPHA,
+                        beta=TERM_NAV_BETA,
+                        v_max_ms=TERM_NAV_VMAX_MS,
+                        innovation_gate_m=TERM_NAV_GATE_M)
+                guidance_pos, guidance_vel = rpod_ctrl._terminal_nav.update(
+                    ekf_pos_now, DT_OUTER,
+                    measurement_valid=not (cam_sensor.is_lost or camera_blocked),
+                    vel_seed=th_ekf.x[3:6])
             else:
-                fd_vel = th_ekf.x[3:6].copy()
-                if not hasattr(rpod_ctrl, '_fd_vel_smooth'):
-                    rpod_ctrl._fd_vel_smooth = fd_vel.copy()
-            rpod_ctrl._fd_pos_prev = ekf_pos_now.copy()
-            guidance_vel = fd_vel if _use_fd_vel else th_ekf.x[3:6].copy()
-            ekf_lvlh_guided = np.concatenate([th_ekf.x[0:3], guidance_vel])
+                if hasattr(rpod_ctrl, '_terminal_nav'):
+                    rpod_ctrl._terminal_nav.reset()
+                guidance_pos = th_ekf.x[0:3].copy()
+                guidance_vel = th_ekf.x[3:6].copy()
+            ekf_lvlh_guided = np.concatenate([guidance_pos, guidance_vel])
 
             # Chief pose
             omega_est_body, omega_est_valid = chief_pose_est.update(
@@ -589,21 +596,25 @@ def run_trial(trial_id,
                 port_sigma_m = (max(0.01, 0.002 * _nav_range_for_port)
                                 * profile["port_noise_scale"])
                 port_meas = port_lvlh_true + rng.normal(0.0, port_sigma_m, 3)
-                if not hasattr(rpod_ctrl, '_port_lvlh_filt'):
-                    rpod_ctrl._port_lvlh_filt = port_meas.copy()
-                else:
-                    alpha_port = 0.20
-                    rpod_ctrl._port_lvlh_filt = (
-                        alpha_port * port_meas
-                        + (1.0 - alpha_port) * rpod_ctrl._port_lvlh_filt)
-                port_lvlh_ctrl = rpod_ctrl._port_lvlh_filt.copy()
+                if not hasattr(rpod_ctrl, '_port_tracker'):
+                    rpod_ctrl._port_tracker = PortTracker(
+                        alpha=PORT_TRACK_ALPHA,
+                        innovation_gate_m=PORT_TRACK_GATE_M)
+                port_lvlh_ctrl, _ = rpod_ctrl._port_tracker.update(
+                    port_meas, DT_OUTER, measurement_valid=True)
                 port_axis_lvlh = R_e2l @ chief_att.dock_axis_eci()
                 r_arm_lvlh     = port_lvlh_ctrl
             elif R_est_b2l is not None and omega_est_valid:
+                if hasattr(rpod_ctrl, '_port_tracker'):
+                    rpod_ctrl._port_tracker.update(
+                        np.zeros(3), DT_OUTER, measurement_valid=False)
                 port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
                 port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
                 r_arm_lvlh     = port_lvlh_ctrl
             else:
+                if hasattr(rpod_ctrl, '_port_tracker'):
+                    rpod_ctrl._port_tracker.update(
+                        np.zeros(3), DT_OUTER, measurement_valid=False)
                 port_lvlh_ctrl = np.zeros(3)
                 port_axis_lvlh = np.zeros(3)
                 r_arm_lvlh     = np.zeros(3)
@@ -617,8 +628,9 @@ def run_trial(trial_id,
                     and rpod_ctrl.mode == RPODMode.PROX_OPS
                     and _nav_range_now < MAIN_TERMINAL_M):
                 rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
-                dv_at_term_start = cw.dv_total
-                t_term_start     = t
+                if t_term_start is None:
+                    dv_at_term_start = cw.dv_total
+                    t_term_start     = t
 
             accel_cmd, impulse_dv = rpod_ctrl.compute(
                 ekf_lvlh=ekf_aug,

@@ -189,6 +189,25 @@ class GEORPODController:
             if not hasattr(self, '_term_min_range'):
                 self._term_min_range = truth_range
             self._term_min_range = min(self._term_min_range, truth_range)
+
+            # Terminal vision FDIR: stop blind docking attempts after a
+            # sustained camera outage. LOST_TARGET brakes to near-zero
+            # relative velocity and returns to PROX_OPS when vision recovers.
+            TERM_CAM_LOSS_HOLD_S = 2.0
+            if cam_lost:
+                if not hasattr(self, '_term_cam_lost_since'):
+                    self._term_cam_lost_since = t
+                if t - self._term_cam_lost_since >= TERM_CAM_LOSS_HOLD_S:
+                    print(f"  [TERM t={t:.0f}s]  CAMERA LOST -> LOST_TARGET hold")
+                    self._set_mode(RPODMode.LOST_TARGET, t)
+                    for attr in ('_term_entry_v', '_term_min_range',
+                                 '_term_braking', '_term_cam_lost_since'):
+                        if hasattr(self, attr):
+                            delattr(self, attr)
+                    return self._lost_target(ekf_lvlh, truth_range, t), None
+            elif hasattr(self, '_term_cam_lost_since'):
+                delattr(self, '_term_cam_lost_since')
+
             abort_ok = (truth_range > ABORT_RANGE_M
                         and time_in_terminal > ABORT_MIN_HOLD_S
                         and self._term_min_range > NO_ABORT_BELOW_M)
@@ -554,8 +573,8 @@ class GEORPODController:
         Target the docking PORT directly (not CoM).
         Port position = port_lvlh (passed from main loop each step).
         Speed law: v_des = K_SPEED * port_range, capped at V_MAX_MS.
-        Inside DOCK_RANGE_M: cap speed at V_CAPTURE_MS (1.5mm/s), but
-        keep closing until the docked threshold.
+        Inside DOCK_RANGE_M: cap speed at V_CAPTURE_MS, but keep closing
+        through estimator noise until the truth-side dock gate terminates.
 
         Entry brake: if arriving with |v| > 30mm/s, hard-brake first.
 
@@ -563,10 +582,12 @@ class GEORPODController:
           com_range, port_range, target (CoM or PORT), v_des, v_actual,
           |vel|, |accel|, pos_lvlh — everything needed to diagnose issues.
         """
-        V_MAX_MS     = 0.025   # m/s  25mm/s terminal max
-        V_CAPTURE_MS = 0.0015  # m/s  1.5mm/s inside capture sphere
-        DOCK_RANGE_M = 0.30    # m    capture zone
-        DOCK_DONE_M  = 0.20    # m    docking complete
+        V_MAX_MS      = 0.025  # m/s  25mm/s terminal max
+        V_APPROACH_MS = 0.010  # m/s  10mm/s near final approach
+        V_CAPTURE_MS  = 0.005  # m/s  5mm/s inside capture sphere
+        APPROACH_M    = 0.80   # m    start slowing before dock gate
+        DOCK_RANGE_M  = 0.30   # m    capture zone
+        DOCK_DONE_M   = 0.20   # m    docking complete
         import math
         K_SQRT       = V_MAX_MS / math.sqrt(max(TERMINAL_M, 0.1))
         DT_DIAG      = 25.0    # s    diagnostic print interval
@@ -651,16 +672,15 @@ class GEORPODController:
             tgt_range = com_range
 
         v_des_mag = min(K_SQRT * math.sqrt(max(com_range, 0.001)), V_MAX_MS)
+        if tgt_range < APPROACH_M:
+            v_des_mag = min(v_des_mag, V_APPROACH_MS)
         if tgt_range < DOCK_RANGE_M:
             v_des_mag = min(v_des_mag, V_CAPTURE_MS)
 
         align_deg   = 0.0
         align_scale = 1.0
 
-        if tgt_range < DOCK_DONE_M:
-            vel_des = np.zeros(3)
-        else:
-            vel_des = tgt_hat * v_des_mag
+        vel_des = tgt_hat * v_des_mag
 
         port_hat = tgt_hat
 
