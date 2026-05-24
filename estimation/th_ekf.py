@@ -202,6 +202,53 @@ class THEKF:
         self.P = 0.5 * (self.P + self.P.T)
         return True
 
+    def update_bearing(self,
+                       z_bearing: np.ndarray,
+                       R_bearing: np.ndarray,
+                       gate_k: float = 5.0) -> bool:
+        """
+        EKF update for monocular angles-only relative navigation.
+
+        Measurement:
+            z_bearing = [azimuth_rad, elevation_rad]
+
+        This intentionally excludes range. The update constrains line of
+        sight only; range must become observable through relative motion
+        geometry, e.g. a natural-motion circumnavigation arc or deliberate
+        cross-track/radial excitation.
+        """
+        dr = self.x[0:3]
+        r = np.linalg.norm(dr)
+        if r < 1.0:
+            return False
+
+        z_full = self._h(dr)
+        z_pred = z_full[1:3]
+        innov = np.asarray(z_bearing, dtype=float) - z_pred
+        innov[0] = self._wrap(innov[0])
+        innov[1] = self._wrap(innov[1])
+
+        H_full = self._H_jac(dr)
+        H = H_full[1:3, :]
+        S = H @ self.P @ H.T + R_bearing
+
+        try:
+            S_inv = np.linalg.inv(S)
+            mahal = float(innov @ S_inv @ innov)
+        except np.linalg.LinAlgError:
+            return False
+
+        if mahal > gate_k ** 2:
+            return False
+
+        K = self.P @ H.T @ S_inv
+        self.x = self.x + K @ innov
+
+        IKH = np.eye(6) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R_bearing @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
+        return True
+
     # ─────────────────────────────────────────────────────────────────
     # Update — position vector  (Phase 5: camera sensor)
     # ─────────────────────────────────────────────────────────────────

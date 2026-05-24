@@ -17,6 +17,15 @@ telemetry.csv
 *.csv
 *.log
 
+# Local Monte Carlo debug runs
+_mc*/
+
+# Local analysis/report helper scripts not intended for product pushes
+tools/
+
+# Experimental scratch guidance module
+control/nmc_guidance.py
+
 # Jupyter notebooks (if used)
 .ipynb_checkpoints/
 *.ipynb

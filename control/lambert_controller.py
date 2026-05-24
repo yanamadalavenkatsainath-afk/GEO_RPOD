@@ -41,6 +41,7 @@ class RPODMode(Enum):
     LAMBERT        = auto()
     PROX_OPS       = auto()
     TERMINAL       = auto()
+    SOFT_CAPTURE   = auto()
     DOCKING        = auto()
     LOST_TARGET    = auto()   # camera lost — hold position, stop closing
 
@@ -119,7 +120,9 @@ class GEORPODController:
     # Public API
     # ─────────────────────────────────────────────────────────────────
 
-    def compute(self, ekf_lvlh, chi_pos_eci, chi_vel_eci, t, true_cw=None, port_lvlh=None, cam_lost=False, port_axis_lvlh=None):
+    def compute(self, ekf_lvlh, chi_pos_eci, chi_vel_eci, t, true_cw=None,
+                port_lvlh=None, cam_lost=False, port_axis_lvlh=None,
+                attitude_align_deg=None):
         """
         Returns (accel_cmd [m/s²], impulse_dv [m/s] or None).
 
@@ -194,7 +197,8 @@ class GEORPODController:
             # sustained camera outage. LOST_TARGET brakes to near-zero
             # relative velocity and returns to PROX_OPS when vision recovers.
             TERM_CAM_LOSS_HOLD_S = 2.0
-            if cam_lost:
+            TERM_CAM_LOSS_ARM_M = 1.5
+            if cam_lost and truth_range > TERM_CAM_LOSS_ARM_M:
                 if not hasattr(self, '_term_cam_lost_since'):
                     self._term_cam_lost_since = t
                 if t - self._term_cam_lost_since >= TERM_CAM_LOSS_HOLD_S:
@@ -222,7 +226,13 @@ class GEORPODController:
                                       port_lvlh=_port,
                                       port_axis_lvlh=port_axis_lvlh), None
             return self._terminal(nav_state, t, port_lvlh=_port,
-                                  port_axis_lvlh=port_axis_lvlh), None
+                                  port_axis_lvlh=port_axis_lvlh,
+                                  attitude_align_deg=attitude_align_deg), None
+
+        elif self.mode == RPODMode.SOFT_CAPTURE:
+            _port = port_lvlh if port_lvlh is not None else np.zeros(3)
+            return self._soft_capture(nav_state, t, port_lvlh=_port,
+                                      port_axis_lvlh=port_axis_lvlh), None
 
         return np.zeros(3), None
 
@@ -249,6 +259,38 @@ class GEORPODController:
     # ─────────────────────────────────────────────────────────────────
     # Lambert — burn-1 + coast + burn-2
     # ─────────────────────────────────────────────────────────────────
+
+    def _soft_capture(self, state, t, port_lvlh=None, port_axis_lvlh=None):
+        """Damped compliant latch after terminal reaches the port envelope."""
+        pos = state[0:3]
+        vel = state[3:6]
+        port_vel = state[6:9] if len(state) >= 9 else np.zeros(3)
+
+        if port_lvlh is not None and np.linalg.norm(port_lvlh) > 1e-6:
+            port = np.asarray(port_lvlh, dtype=float)
+        else:
+            port = np.zeros(3)
+            port_vel = np.zeros(3)
+
+        err = port - pos
+        rel_vel = vel - port_vel
+        accel = 0.025 * err - 0.550 * rel_vel
+
+        mag = np.linalg.norm(accel)
+        if mag > self.accel_max:
+            accel *= self.accel_max / mag
+
+        if not hasattr(self, '_soft_diag_t'):
+            self._soft_diag_t = -999.0
+        t_slot = int(t / 25.0)
+        if t_slot != self._soft_diag_t:
+            self._soft_diag_t = t_slot
+            print(f"  [SOFT t={t:.0f}s]  "
+                  f"port={np.linalg.norm(err):.4f}m  "
+                  f"|v_rel|={np.linalg.norm(rel_vel)*1e3:.2f}mm/s  "
+                  f"|accel|={np.linalg.norm(accel)*1e6:.1f}Âµm/s2")
+
+        return accel
 
     def _lambert_step(self, ekf_lvlh, chi_pos, chi_vel, t,
                       truth_range, true_cw):
@@ -564,7 +606,8 @@ class GEORPODController:
     # TERMINAL — range-proportional deceleration TERMINAL_M → dock
     # ─────────────────────────────────────────────────────────────────
 
-    def _terminal(self, state, t, port_lvlh=None, port_axis_lvlh=None):
+    def _terminal(self, state, t, port_lvlh=None, port_axis_lvlh=None,
+                  attitude_align_deg=None):
         """
         Terminal guidance: direct port targeting with speed law.
 
@@ -582,12 +625,10 @@ class GEORPODController:
           com_range, port_range, target (CoM or PORT), v_des, v_actual,
           |vel|, |accel|, pos_lvlh — everything needed to diagnose issues.
         """
-        V_MAX_MS      = 0.025  # m/s  25mm/s terminal max
-        V_APPROACH_MS = 0.010  # m/s  10mm/s near final approach
-        V_CAPTURE_MS  = 0.005  # m/s  5mm/s inside capture sphere
-        APPROACH_M    = 0.80   # m    start slowing before dock gate
-        DOCK_RANGE_M  = 0.30   # m    capture zone
-        DOCK_DONE_M   = 0.20   # m    docking complete
+        V_MAX_MS     = 0.025   # m/s  25mm/s terminal max
+        V_CAPTURE_MS = 0.0015  # m/s  1.5mm/s inside capture sphere
+        DOCK_RANGE_M = 0.30    # m    capture zone
+        DOCK_DONE_M  = 0.20    # m    docking complete
         import math
         K_SQRT       = V_MAX_MS / math.sqrt(max(TERMINAL_M, 0.1))
         DT_DIAG      = 25.0    # s    diagnostic print interval
@@ -672,12 +713,13 @@ class GEORPODController:
             tgt_range = com_range
 
         v_des_mag = min(K_SQRT * math.sqrt(max(com_range, 0.001)), V_MAX_MS)
-        if tgt_range < APPROACH_M:
-            v_des_mag = min(v_des_mag, V_APPROACH_MS)
         if tgt_range < DOCK_RANGE_M:
             v_des_mag = min(v_des_mag, V_CAPTURE_MS)
 
-        align_deg   = 0.0
+        if attitude_align_deg is None or not np.isfinite(attitude_align_deg):
+            align_deg = float("nan")
+        else:
+            align_deg = float(attitude_align_deg)
         align_scale = 1.0
 
         vel_des = tgt_hat * v_des_mag
