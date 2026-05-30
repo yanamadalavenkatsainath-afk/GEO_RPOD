@@ -2,42 +2,46 @@
   GEO RPOD Monte Carlo Summary
 =================================================================
   Trials total   : 20
-  Docking success: 20 / 20  (100.0%)
+  Docking success: 13 / 20  (65.0%)
   Soft capture   : 20 / 20  (100.0%)
-  Hard strict    : 20 / 20  (100.0%)
-  Soft certified : 20 / 20  (100.0%)
-  Capture timeout: 0 / 20
+  Hard strict    : 13 / 20  (65.0%)
+  Soft certified : 13 / 20  (65.0%)
+  Capture timeout: 7 / 20
 
   Stress-case pass rate:
-    camera_dropout          2 / 2    (100.0%)
-    gyro_bias               6 / 6    (100.0%)
+    camera_dropout          1 / 2    ( 50.0%)
+    gyro_bias               4 / 6    ( 66.7%)
     high_pose_noise         3 / 3    (100.0%)
-    nominal                 6 / 6    (100.0%)
+    nominal                 4 / 6    ( 66.7%)
     range_dropout           1 / 1    (100.0%)
-    weak_thruster           2 / 2    (100.0%)
+    weak_thruster           0 / 2    (  0.0%)
 
   Outcome counts:
-    DOCKED                     20
+    DOCKED                     13
+    CAPTURE_TIMEOUT             7
+
+  Capture timeout detail:
+    SOFT_ALIGN_TIMEOUT          7
 
   Metric                           Mean      Std     5th%    50th%    95th%
   --------------------------------------------------------------
-  Total DV (m/s)                  3.104    1.108    2.023    2.838    5.415
-  PROX_OPS DV (m/s)               0.652    0.033    0.624    0.640    0.678
-  TERMINAL DV (m/s)               2.451    1.117    1.358    2.176    4.791
-  Time to dock (hr)               2.302    1.355    1.556    1.913    2.979
-  Chief tumble (deg/s)            0.161    0.053    0.061    0.180    0.236
-  Max nav error (m)             307.441    0.313  306.848  307.566  307.798
+  Total DV (m/s)                  2.703    1.504    1.524    2.173    5.387
+  PROX_OPS DV (m/s)               0.560    0.019    0.539    0.549    0.587
+  TERMINAL DV (m/s)               2.143    1.507    0.970    1.607    4.842
+  Time to dock (hr)               1.889    0.413    1.399    1.851    2.570
+  Chief tumble (deg/s)            0.164    0.059    0.059    0.190    0.239
+  Max nav error (m)             307.367    0.329  306.825  307.472  307.772
   Final port range (m)            0.000    0.000    0.000    0.000    0.000
   Final port vrel (m/s)           0.000    0.000    0.000    0.000    0.000
 
   Propellant (Isp=220.0s hydrazine):
-    Mean  : 71.8g
-    95th% : 125.3g
-    Worst : 130.6g
+    Mean  : 62.6g
+    95th% : 124.6g
+    Worst : 163.6g
 
   Worst docked DV case:
-    trial=13  stress=nominal  DV=5.644m/s  terminal=5.019m/s  align=1.5deg
+    trial=4  stress=gyro_bias  DV=7.071m/s  terminal=6.523m/s  align=6.2deg
 
-  DV correlation with chief tumble rate : +0.309
-  DV correlation with time-to-dock      : +0.027
+  DV correlation with chief tumble rate : -0.103
+  DV correlation with time-to-dock      : +0.907
 =================================================================

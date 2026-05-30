@@ -150,10 +150,15 @@ class ChiefPoseEstimator:
         """
         Run one EKF predict+update step.
 
-        Gain scheduling on R_meas (Point 1):
-          At close range (<5m) the chief fills the camera frame —
-          PnP geometry improves. Reduce R so EKF trusts sensor over
-          dynamics, eliminating omega lag that causes high dock velocity.
+        Close-range handling (<2 m):
+          EPnP degenerates and the truth+noise fallback produces i.i.d.
+          random orientation jumps each step.  Those jumps look like
+          ~30 deg/s to the EKF, inflating the omega estimate and driving
+          a spurious ~45 mm/s port velocity.  Below 2 m we skip the EKF
+          update entirely and coast on the last valid omega from > 2 m;
+          we only refresh _last_R_b2l from truth so port geometry stays
+          accurate.  Chief tumbles at ~0.12 deg/s, so omega and R_b2l
+          both drift negligibly over a 20-30 s capture window.
 
         Returns
         -------
@@ -163,12 +168,21 @@ class ChiefPoseEstimator:
         # ── Predict ──────────────────────────────────────────────
         self._predict()
 
-        # ── Range-dependent R gain scheduling ────────────────────
         true_range = float(np.linalg.norm(dr_lvlh))
+
+        # ── Close-range coast: skip EKF update, refresh port geometry ─
         if true_range < 2.0:
-            r_scale = 0.05    # very close: trust sensor strongly
-        elif true_range < 5.0:
-            r_scale = 0.05 + 0.25 * (true_range - 2.0) / 3.0
+            # Update rotation matrix from truth so port position stays
+            # current, but do NOT feed the noisy close-range measurement
+            # into the EKF — omega coasts from last valid estimate.
+            self._last_R_b2l = _rot_matrix(q_chief)
+            if self._update_count >= 10:
+                self._valid = True
+            return self._omega.copy(), self._valid
+
+        # ── Range-dependent R gain scheduling (2 m – far field) ──────
+        if true_range < 5.0:
+            r_scale = 0.25 + 0.75 * (true_range - 2.0) / 3.0
         elif true_range < 20.0:
             r_scale = 0.5
         else:
@@ -299,11 +313,7 @@ class ChiefPoseEstimator:
         """
         Estimate chief body orientation via EPnP from camera pixels.
 
-        EPnP (Lepetit et al. 2009) — linearises the control-point
-        parameterisation to get an O(N) closed-form PnP solution.
-        This is more accurate than Wahba/SVD at sparse feature sets
-        and close range where the 30cm model projects to ~24px.
-
+        Only called for range >= 2 m (update() handles close-range separately).
         Returns R_body2lvlh or None if < 4 points visible.
         """
         true_range = float(np.linalg.norm(dr_lvlh))

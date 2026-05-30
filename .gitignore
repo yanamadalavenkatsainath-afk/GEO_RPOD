@@ -16,6 +16,9 @@ env/
 telemetry.csv
 *.csv
 *.log
+rpod_telemetry.npz
+visualiser_dashboard.png
+visualiser_replay.gif
 
 # Local Monte Carlo debug runs
 _mc*/

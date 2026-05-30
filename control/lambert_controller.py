@@ -196,8 +196,8 @@ class GEORPODController:
             # Terminal vision FDIR: stop blind docking attempts after a
             # sustained camera outage. LOST_TARGET brakes to near-zero
             # relative velocity and returns to PROX_OPS when vision recovers.
-            TERM_CAM_LOSS_HOLD_S = 2.0
-            TERM_CAM_LOSS_ARM_M = 1.5
+            TERM_CAM_LOSS_HOLD_S = 30.0   # dock-axis alignment rotates gimbal away from chief; allow longer outage
+            TERM_CAM_LOSS_ARM_M = 0.5    # only abort if camera lost AND range > 50cm (not right at capture)
             if cam_lost and truth_range > TERM_CAM_LOSS_ARM_M:
                 if not hasattr(self, '_term_cam_lost_since'):
                     self._term_cam_lost_since = t
@@ -212,9 +212,13 @@ class GEORPODController:
             elif hasattr(self, '_term_cam_lost_since'):
                 delattr(self, '_term_cam_lost_since')
 
+            # Abort if clearly diverged: current range > 5× closest approach AND > 15m.
+            # The old guard (_term_min_range > 1.0m) permanently blocked abort after
+            # any sub-1m near-miss, causing ΔV blowup as the spacecraft drifted to
+            # 200m+ with no way to return to PROX_OPS.
             abort_ok = (truth_range > ABORT_RANGE_M
                         and time_in_terminal > ABORT_MIN_HOLD_S
-                        and self._term_min_range > NO_ABORT_BELOW_M)
+                        and truth_range > 5.0 * self._term_min_range)
             if abort_ok:
                 print(f"  [TERM t={t:.0f}s]  ABORT -> PROX_OPS  "
                       f"truth_range={truth_range:.1f}m > {ABORT_RANGE_M:.0f}m  "
@@ -640,11 +644,11 @@ class GEORPODController:
 
         # ── TAU gain scheduling: overdamped below 0.3m ───────────────
         if com_range < 0.30:
-            TAU = 8.0
+            TAU = 10.0
         elif com_range < 0.60:
-            TAU = 5.0
+            TAU = 8.0
         else:
-            TAU = 3.0
+            TAU = 6.0
 
         # ── EKF spike guard ───────────────────────────────────────────
         # port_lvlh = EKF_pos + ~0.5m body offset. When EKF spikes to
@@ -657,8 +661,10 @@ class GEORPODController:
         if port_lvlh is not None and np.linalg.norm(port_lvlh) > 1e-6:
             _cand_range = float(np.linalg.norm(port_lvlh - pos))
             port = port_lvlh if _cand_range < _PORT_SANITY_M else np.zeros(3)
+            port_source = "PORT" if _cand_range < _PORT_SANITY_M else "COM_SANITY"
         else:
             port = np.zeros(3)
+            port_source = "COM_NO_PORT"
         port_range = float(np.linalg.norm(port - pos))
 
         # ── Entry velocity brake — resets each TERMINAL entry ─────────
@@ -667,7 +673,7 @@ class GEORPODController:
         if not hasattr(self, '_term_entry_key') or self._term_entry_key != _entry_key:
             self._term_entry_key = _entry_key
             self._term_entry_v   = np.linalg.norm(vel)
-            self._term_braking   = self._term_entry_v > 0.015  # brake if >15mm/s
+            self._term_braking   = self._term_entry_v > 2 * V_MAX_MS  # brake only if >2×V_MAX (50mm/s)
             self._term_diag_t    = -999.0
             # ── Covariance reset at TERMINAL entry (Point 3) ──────────
             # Zero off-diagonal P terms so filter forgets 500m approach history.
@@ -737,6 +743,16 @@ class GEORPODController:
             self._term_diag_t = t_slot
             v_cl_port = float(np.dot(port_hat if port_range > 0.001
                                      else np.zeros(3), vel))
+            v_des_along = float(np.dot(port_hat, vel_des))
+            v_err_along = float(np.dot(port_hat, vel_des - vel))
+            accel_along = float(np.dot(port_hat, accel))
+            vel_lat = vel - port_hat * float(np.dot(port_hat, vel))
+            print(f"  [TERMDBG t={t:.0f}s] target={port_source} "
+                  f"v_along={v_cl_port*1e3:.2f}mm/s "
+                  f"v_des_along={v_des_along*1e3:.2f}mm/s "
+                  f"v_err={v_err_along*1e3:.2f}mm/s "
+                  f"v_lat={np.linalg.norm(vel_lat)*1e3:.2f}mm/s "
+                  f"a_along={accel_along*1e6:.1f}um/s2")
             print(f"  [TERM t={t:.0f}s]  "
                   f"com={com_range:.4f}m  port={port_range:.4f}m  "
                   f"v_des={v_des_mag*1e3:.3f}mm/s  align={align_deg:.1f}deg  "

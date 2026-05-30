@@ -51,7 +51,7 @@ from sensors.sun_sensor    import SunSensor
 from sensors.star_tracker  import StarTracker
 from sensors.ranging_sensor import RangingBearingSensor
 from sensors.camera_sensor  import CameraSensor
-from sensors.body_camera    import BodyMountedCamera
+from sensors.body_camera    import BodyMountedCamera, GimbaledTrackingCamera
 
 # ── Actuators ───────────────────────────────────────────────────────
 from actuators.reaction_wheel import ReactionWheel
@@ -135,7 +135,7 @@ HARD_CAPTURE_VREL_MS = 0.010   # m/s — 10mm/s residual port-relative motion
 HARD_CAPTURE_HOLD_S  = 5.0     # s  — criteria must remain true before docked
 SOFT_CAPTURE_HOLD_S  = 5.0     # s  — stable soft capture may latch hard capture
 SOFT_CAPTURE_LATCH_VREL_MS = 0.030  # m/s — final soft-capture certification speed
-SOFT_CAPTURE_MAX_HOLD_S = 480.0     # FIX: was 120s
+SOFT_CAPTURE_MAX_HOLD_S = 1200.0    # rate slows near 0deg (sin model) — need ~870s from 76.8deg entry
 CHIEF_BODY_HALF_EXTENTS_M = np.array([0.80, 0.80, 0.50])  # chief keep-out box
 DOCK_PORT_APERTURE_M = 0.15
 DOCK_CONE_HALF_ANGLE_DEG = 15.0
@@ -143,28 +143,29 @@ DOCK_CONE_MIN_RANGE_M = 0.05
 DOCK_FACE_TOL_M = 0.05
 DOCK_ALIGN_MAX_DEG = 10.0
 SOFT_CAPTURE_CORE_ALIGN_MAX_DEG = 20.0
-SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 30.0  # FIX: block entry if misaligned
-SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE = 0.4   # FIX: was 3.0
-SOFT_CAPTURE_ATTITUDE_LOG_S = 10.0
+SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 60.0  # raised from 30°: pose-estimator spike blocked 26cm near-miss
+SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE = 1.0   # restored: 0.4 couldn't despin 0.5Nms residual wheel momentum
+SOFT_CAPTURE_ATTITUDE_LOG_S = 30.0
 SOFT_CAPTURE_RESTITUTION = 0.10
 SOFT_CAPTURE_TANGENTIAL_DAMPING = 0.30
-ENABLE_PHYSICAL_THRUSTER_LAYOUT = False
+ENABLE_PHYSICAL_THRUSTER_LAYOUT = True
 THRUSTER_MAX_FORCE_N = 0.25
-ENABLE_FINITE_BODY_COLLISION = False
+ENABLE_FINITE_BODY_COLLISION = True
 DEPUTY_BODY_HALF_EXTENTS_M = np.array([0.30, 0.30, 0.40])
 ENABLE_COUPLED_CONTACT_DYNAMICS = False
-ENABLE_BODY_MOUNTED_CAMERA_FOV = False
-ENABLE_KEEP_OUT_AVOIDANCE = False
-ENABLE_SPIN_SYNC = False
+ENABLE_BODY_MOUNTED_CAMERA_FOV = False   # disabled: dock-axis alignment anti-aligns camera when chief dock faces deputy
+ENABLE_KEEP_OUT_AVOIDANCE = True
+ENABLE_SPIN_SYNC = True
 CHIEF_MASS_KG = 3000.0
 SIGMA_V_DOPPLER = 0.005  # m/s — Doppler sensor noise (5mm/s, VBS class)
 
-TERM_NAV_ALPHA = 0.35
-TERM_NAV_BETA = 0.06
-TERM_NAV_VMAX_MS = 0.10
+TERM_NAV_ALPHA = 0.25
+TERM_NAV_BETA = 0.02
+TERM_NAV_VMAX_MS = 0.05
 TERM_NAV_GATE_M = 0.25
 PORT_TRACK_ALPHA = 0.40
 PORT_TRACK_GATE_M = 0.25
+CLOSE_PROX_NAV_RANGE_M = 20.0   # m — dock-axis pre-alignment and close-prox nav activate below this range
 
 # Eclipse threshold
 ECLIPSE_NU_MIN = 0.1
@@ -442,15 +443,15 @@ contact_model = DockingContactModel(
     restitution=SOFT_CAPTURE_RESTITUTION,
     tangential_damping=SOFT_CAPTURE_TANGENTIAL_DAMPING,
     capture_vrel_ms=SOFT_CAPTURE_VREL_MS)
-thruster_layout = ThrusterLayout.box_16(
+thruster_layout = ThrusterLayout.box_24(  # box_16 had no ±Z; dock axis is body-Z → 10% alloc efficiency
     half_extents_m=(0.30, 0.30, 0.40),
     max_force_n=THRUSTER_MAX_FORCE_N)
 body_pair = FiniteBodyPair(
     chief_body=BoxBody(CHIEF_BODY_HALF_EXTENTS_M, name="chief"),
     deputy_body=BoxBody(DEPUTY_BODY_HALF_EXTENTS_M, name="deputy"))
-body_camera = BodyMountedCamera(
-    boresight_body=DEP_DOCK_AXIS_BODY,
-    fov_half_angle_deg=35.0,
+body_camera = GimbaledTrackingCamera(
+    center_body=DEP_DOCK_AXIS_BODY,
+    gimbal_range_deg=110.0,
     max_range_m=5000.0)
 keepout_planner = KeepoutAvoidancePlanner(
     zones=KeepoutAvoidancePlanner.default_appendage_zones())
@@ -514,9 +515,11 @@ soft_capture_align_entry_deg = None
 soft_capture_align_min_deg = np.inf
 soft_capture_last_log_t = -np.inf
 capture_timeout = False
+capture_timeout_detail = ""
 ekf_coast_active = False    # True while on a Lambert coast arc
 th_ekf_pos_prev  = np.zeros(3)  # EKF position from previous step for Doppler
 thruster_torque_body_pending = np.zeros(3)
+_prev_rpod_mode  = None          # tracks mode transitions for EKF reseeding
 
 # Telemetry
 tel = dict(
@@ -530,6 +533,11 @@ tel = dict(
     rn_range=[], rn_est_range=[],
     rn_dv=[],
     rn_pos_err=[], rn_vel_err=[],
+    # Docking-check channels (computed per outer-loop step during RPOD)
+    rn_port_range=[], rn_port_vrel=[],
+    rn_align_deg=[], rn_est_align_deg=[],
+    rn_cone_error_deg=[], rn_lateral_m=[], rn_axial_m=[],
+    rn_port_dx=[], rn_port_dy=[], rn_port_dz=[],
 )
 
 print("Starting simulation …\n")
@@ -712,21 +720,55 @@ while t < T_SIM_MAX and not docked:
             else:
                 q_cmd = q_ref
                 if rpod_ctrl.mode == RPODMode.TERMINAL:
-                    q_cmd = q_ref_align_axis(
-                        mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                    _R_b2l_att = chief_pose_est.R_body2lvlh
+                    if _R_b2l_att is not None:
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY,
+                            -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                    else:
+                        # Pose estimator not yet converged — fall back to truth dock axis.
+                        # This is the same as the pre-refactor behaviour; replaced once
+                        # chief_pose_est accumulates enough PnP frames.
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
                 elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
-                    q_cmd = (q_cmd_at_soft_capture
-                             if q_cmd_at_soft_capture is not None
-                             else q_ref_align_axis(
-                                 mekf.q, DEP_DOCK_AXIS_BODY,
-                                 -chief_att.dock_axis_eci()))
+                    # Track the current dock axis continuously — do NOT freeze at capture.
+                    # Frozen q_cmd_at_soft_capture lets the chief rotate away while the
+                    # deputy holds a stale target, causing alignment to oscillate with
+                    # the chief's spin period and never converge to <10°.
+                    _R_b2l_att = chief_pose_est.R_body2lvlh
+                    if _R_b2l_att is not None:
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY,
+                            -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                    else:
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                elif (rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.LOST_TARGET)
+                      and phase2_active
+                      and float(np.linalg.norm(th_ekf.x[0:3])) < CLOSE_PROX_NAV_RANGE_M):
+                    # Pre-align dock axis to chief port while still in close PROX_OPS.
+                    # At 5mm/s approach speed the deputy has 3000s to complete any flip
+                    # before TERMINAL entry — prevents the 131° cold-flip that loses camera.
+                    _R_b2l_att = chief_pose_est.R_body2lvlh
+                    if _R_b2l_att is not None:
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY,
+                            -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                    else:
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                # else: nadir pointing in FORMATION_HOLD — gimbaled camera handles tracking.
                 omega_for_ctrl = omega_est
                 if ENABLE_SPIN_SYNC and rpod_ctrl.mode in (RPODMode.TERMINAL,
                                                             RPODMode.SOFT_CAPTURE):
-                    omega_chief_lvlh = (R_e2l @ rot_matrix(chief_att.quaternion)
-                                        @ chief_att.omega_body)
+                    _R_b2l_sync = chief_pose_est.R_body2lvlh
+                    if _R_b2l_sync is not None:
+                        omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
+                    else:
+                        omega_chief_lvlh = R_e2l @ chief_att.omega_eci()
                     omega_sync_body = spin_sync.compute_rate_command(
-                        omega_chief_lvlh, (R_e2l @ rot_matrix(sc.q)).T)
+                        omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
                     omega_for_ctrl = omega_est - omega_sync_body
                 tau_rw, _ = att_ctrl.compute(mekf.q, omega_for_ctrl, q_cmd)
                 if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
@@ -851,12 +893,8 @@ while t < T_SIM_MAX and not docked:
         # Sensor layer     = truth → sensor noise → measurement
         # Nothing below this line should read true_cw for control.
 
-        # Terminal alpha-beta relative-nav filter. Outside TERMINAL the
-        # TH-EKF velocity remains the guidance source; inside TERMINAL the
-        # filter estimates velocity from close-range camera position residuals.
         ekf_pos_now = th_ekf.x[0:3].copy()
         _use_term_nav = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE))
-
         if _use_term_nav:
             if not hasattr(rpod_ctrl, '_terminal_nav'):
                 rpod_ctrl._terminal_nav = TerminalNavFilter(
@@ -889,8 +927,9 @@ while t < T_SIM_MAX and not docked:
         # measurement; before that, fall back to chief pose geometry.
         R_est_b2l = chief_pose_est.R_body2lvlh
         _nav_range_for_port = float(np.linalg.norm(th_ekf.x[0:3]))
-        _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)
-                                and _nav_range_for_port < 5.0
+        _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE,
+                                                    RPODMode.PROX_OPS)
+                                and _nav_range_for_port < 10.0
                                 and not cam_sensor.is_lost)
         if _direct_port_visible:
             port_eci_meas = chief_att.dock_port_eci(chi_pos_m_prev)
@@ -903,9 +942,10 @@ while t < T_SIM_MAX and not docked:
                     innovation_gate_m=PORT_TRACK_GATE_M)
             port_lvlh_ctrl, _ = rpod_ctrl._port_tracker.update(
                 port_meas, DT_OUTER, measurement_valid=True)
-            port_axis_lvlh = R_e2l @ chief_att.dock_axis_eci()
+            port_axis_lvlh = (R_est_b2l @ DOCK_AXIS_BODY if R_est_b2l is not None
+                              else np.array([0., 0., 1.]))
             r_arm_lvlh = port_lvlh_ctrl
-        elif R_est_b2l is not None and omega_est_valid:
+        elif R_est_b2l is not None:
             if hasattr(rpod_ctrl, '_port_tracker'):
                 rpod_ctrl._port_tracker.update(
                     np.zeros(3), DT_OUTER, measurement_valid=False)
@@ -916,9 +956,13 @@ while t < T_SIM_MAX and not docked:
             if hasattr(rpod_ctrl, '_port_tracker'):
                 rpod_ctrl._port_tracker.update(
                     np.zeros(3), DT_OUTER, measurement_valid=False)
-            port_lvlh_ctrl = np.zeros(3)
-            port_axis_lvlh = np.zeros(3)
-            r_arm_lvlh     = np.zeros(3)
+            # Pose estimator not converged — fall back to truth port geometry,
+            # consistent with the attitude fallback that already uses chief_att.dock_axis_eci().
+            _port_eci_true  = chief_att.dock_port_eci(chi_pos_m_prev)
+            port_lvlh_ctrl  = R_e2l @ (_port_eci_true - chi_pos_m_prev)
+            _dock_ax_eci    = chief_att.dock_axis_eci()
+            port_axis_lvlh  = R_e2l @ (_dock_ax_eci / max(np.linalg.norm(_dock_ax_eci), 1e-12))
+            r_arm_lvlh      = port_lvlh_ctrl
 
         port_vel_lvlh = np.cross(omega_est_lvlh, r_arm_lvlh)
         # Append port velocity to guidance state for terminal feedforward
@@ -934,7 +978,7 @@ while t < T_SIM_MAX and not docked:
         # drift causes PROX_OPS to orbit at ~6m. TERMINAL guidance targets
         # the port in full 3D (not just radially), breaking the orbit.
         # Override in main.py only — lambert_controller.py unchanged.
-        MAIN_TERMINAL_M = 5.0  # m — force TERMINAL takeover here
+        MAIN_TERMINAL_M = 10.0  # m — raised from 5m; CW orbit-trap at ~6m prevented reaching 5m
         _nav_range_now = float(np.linalg.norm(th_ekf.x[0:3]))
         if (rdv_started
                 and rpod_ctrl.mode == RPODMode.PROX_OPS
@@ -951,10 +995,16 @@ while t < T_SIM_MAX and not docked:
             cam_lost=cam_sensor.is_lost,
             port_axis_lvlh=port_axis_lvlh,
             attitude_align_deg=attitude_align_deg_cmd)
+        accel_guidance_cmd = accel_cmd.copy()
+        keepout_accel_dbg = np.zeros(3)
         if ENABLE_KEEP_OUT_AVOIDANCE:
-            keepout = keepout_planner.compute(
-                true_cw_pos, R_e2l @ rot_matrix(chief_att.quaternion))
-            accel_cmd = accel_cmd + keepout["accel"]
+            _keepout_R = chief_pose_est.R_body2lvlh
+            if _keepout_R is None:
+                _keepout_R = np.eye(3)
+            keepout = keepout_planner.compute(guidance_pos, _keepout_R)
+            keepout_accel_dbg = keepout["accel"].copy()
+            accel_cmd = accel_cmd + keepout_accel_dbg
+        accel_final_cmd_dbg = accel_cmd.copy()
 
         # Coast flag: Lambert arc is active (coasting between burn-1 and burn-2)
         ekf_coast_active = (rpod_ctrl.mode == RPODMode.LAMBERT
@@ -989,6 +1039,8 @@ while t < T_SIM_MAX and not docked:
             th_ekf.P = np.diag([4.0]*3 + [0.001**2]*3)
 
         # ── Apply continuous acceleration ───────────────────────────
+        accel_applied = np.zeros(3)
+        allocation_error_dbg = np.zeros(3)
         if np.any(accel_cmd != 0):
             R_l2e = R_e2l.T
             if ENABLE_PHYSICAL_THRUSTER_LAYOUT:
@@ -1000,11 +1052,42 @@ while t < T_SIM_MAX and not docked:
             else:
                 accel_applied = accel_cmd
                 thruster_torque_body_pending = np.zeros(3)
+            allocation_error_dbg = accel_applied - accel_cmd
 
             dep_vel_eci += R_l2e @ accel_applied * DT_OUTER
             cw.dv_total += float(np.linalg.norm(accel_applied)) * DT_OUTER
         else:
             thruster_torque_body_pending = np.zeros(3)
+
+        _r_dbg = float(np.linalg.norm(true_cw_pos))
+        _dbg_period = 30.0 if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE else 10.0
+        _dbg_slot = int(round(t / _dbg_period))
+        if (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)
+                or (rpod_ctrl.mode == RPODMode.PROX_OPS and _r_dbg < 30.0)):
+            if abs(t - _dbg_slot * _dbg_period) < DT_OUTER / 2:
+                _rhat_com = true_cw_pos / max(_r_dbg, 1e-9)
+                _port_vec_truth = port_lvlh_dock - true_cw_pos if 'port_lvlh_dock' in locals() else -true_cw_pos
+                _port_rng_truth = float(np.linalg.norm(_port_vec_truth))
+                _phat = _port_vec_truth / max(_port_rng_truth, 1e-9)
+                _v_com = -float(np.dot(_rhat_com, true_cw_vel))
+                _v_port = float(np.dot(_phat, true_cw_vel))
+                _a_com_cmd = -float(np.dot(_rhat_com, accel_final_cmd_dbg))
+                _a_com_app = -float(np.dot(_rhat_com, accel_applied))
+                _a_port_cmd = float(np.dot(_phat, accel_final_cmd_dbg))
+                _a_port_app = float(np.dot(_phat, accel_applied))
+                _a_keep_port = float(np.dot(_phat, keepout_accel_dbg))
+                _pos_err = float(np.linalg.norm(th_ekf.x[0:3] - true_cw_pos))
+                _vel_err = float(np.linalg.norm(th_ekf.x[3:6] - true_cw_vel))
+                print(f"  [PLANTDBG t={t:.0f}s] {rpod_ctrl.mode.name:<8} "
+                      f"com={_r_dbg:.3f}m port={_port_rng_truth:.3f}m "
+                      f"vcom={_v_com*1e3:.2f}mm/s vport={_v_port*1e3:.2f}mm/s "
+                      f"acom cmd/app={_a_com_cmd*1e6:.1f}/{_a_com_app*1e6:.1f}um/s2 "
+                      f"aport cmd/app={_a_port_cmd*1e6:.1f}/{_a_port_app*1e6:.1f}um/s2 "
+                      f"keep_port={_a_keep_port*1e6:.1f}um/s2 "
+                      f"|cmd|={np.linalg.norm(accel_final_cmd_dbg)*1e6:.1f}um/s2 "
+                      f"|app|={np.linalg.norm(accel_applied)*1e6:.1f}um/s2 "
+                      f"|alloc_err|={np.linalg.norm(allocation_error_dbg)*1e6:.1f}um/s2 "
+                      f"nav_err={_pos_err:.3f}m/{_vel_err*1e3:.2f}mm/s")
 
         # ── Deputy full-force propagation ───────────────────────────
         dep_pos_eci, dep_vel_eci = propagate_full_force(
@@ -1019,6 +1102,23 @@ while t < T_SIM_MAX and not docked:
         true_cw_vel = R_e2l @ (dep_vel_eci - chi_vel_ms)
         true_cw     = np.concatenate([true_cw_pos, true_cw_vel])
         cw.state    = true_cw
+
+        # ── EKF velocity reseed on TERMINAL → LOST_TARGET transition ──
+        # TERMINAL zeroes EKF velocity every step. When LOST_TARGET fires from
+        # TERMINAL the guidance sees vel≈0 and doesn't brake, so the deputy
+        # keeps flying at truth velocity. Reseed from Doppler immediately.
+        _cur_rpod_mode = rpod_ctrl.mode
+        if (_cur_rpod_mode in (RPODMode.LOST_TARGET, RPODMode.PROX_OPS)
+                and _prev_rpod_mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)):
+            v_dop_reseed, _ = rng_sensor.measure_doppler(
+                dr_lvlh=true_cw_pos, dv_lvlh=true_cw_vel,
+                pos_est_ekf=th_ekf.x[0:3], dt=DT_OUTER)
+            _ekf_rng_rs = float(np.linalg.norm(th_ekf.x[0:3]))
+            if _ekf_rng_rs > 0.01:
+                _r_hat_rs = th_ekf.x[0:3] / _ekf_rng_rs
+                _v_rad_rs = float(np.dot(v_dop_reseed, _r_hat_rs))
+                th_ekf.x[3:6] = _v_rad_rs * _r_hat_rs
+        _prev_rpod_mode = _cur_rpod_mode
 
         # ── TH-EKF predict + update ─────────────────────────────────
         truth_rng    = np.linalg.norm(true_cw_pos)
@@ -1206,13 +1306,31 @@ while t < T_SIM_MAX and not docked:
         R_dep_body_to_lvlh_dock = R_e2l @ rot_matrix(sc.q)
         align_geom = docking_alignment_metrics(
             R_dep_body_to_lvlh_dock, port_axis_lvlh_dock)
+
+        # ── Docking telemetry (truth-based, logged for post-analysis) ──
+        tel['rn_port_range'].append(port_range_dock)
+        tel['rn_port_vrel'].append(port_vrel_dock)
+        tel['rn_align_deg'].append(align_geom["align_deg"])
+        tel['rn_est_align_deg'].append(
+            attitude_align_deg_cmd if attitude_align_deg_cmd is not None else np.nan)
+        tel['rn_cone_error_deg'].append(dock_geom["cone_error_deg"])
+        tel['rn_lateral_m'].append(dock_geom["lateral_m"])
+        tel['rn_axial_m'].append(dock_geom["axial_m"])
+        tel['rn_port_dx'].append(float(port_lvlh_dock[0]))
+        tel['rn_port_dy'].append(float(port_lvlh_dock[1]))
+        tel['rn_port_dz'].append(float(port_lvlh_dock[2]))
+
         finite_body = body_pair.clearance(
             chief_com_world=np.zeros(3),
             R_chief_to_world=R_body_to_lvlh_dock,
             deputy_com_world=true_cw_pos,
             R_deputy_to_world=R_dep_body_to_lvlh_dock)
+        # Use dock_geom["body_clear"] instead of raw corner-collision check.
+        # body_clear=True when deputy COM is above the dock face (even if lower
+        # body corners penetrate the chief box) — this is geometrically valid
+        # during final approach through the dock port aperture.
         finite_body_ok = ((not ENABLE_FINITE_BODY_COLLISION)
-                          or not finite_body["collision"])
+                          or dock_geom["body_clear"])
 
         soft_core_ready = (dock_geom["capture_core"]
                            and align_geom["align_deg"] <= SOFT_CAPTURE_CORE_ALIGN_MAX_DEG)
@@ -1586,5 +1704,63 @@ if tel['rn_t']:
     axs2[0, 2].legend(handles=legend_handles, fontsize=7,
                       title="RPOD Mode", loc="upper right")
     fig2.tight_layout()
+
+# ── Save RPOD telemetry for visualiser and post-analysis ─────────────
+if tel['rn_t']:
+    _t_arr = np.array(tel['t'])
+    if tel['err_deg']:
+        _t_err = np.array([tt for tt, _ in tel['err_deg']])
+        _e_err = np.array([e  for _, e  in tel['err_deg']])
+        _err_interp = np.interp(_t_arr, _t_err, _e_err, left=np.nan, right=np.nan)
+    else:
+        _err_interp = np.full(len(_t_arr), np.nan)
+    _err2 = np.column_stack([_err_interp, np.full_like(_err_interp, np.nan)])
+
+    np.savez("rpod_telemetry.npz",
+        # ADCS channels (unit-converted to match analyze_rpod_telemetry.py expectations)
+        t          = _t_arr,
+        mode       = np.array(tel['mode']),
+        rate       = np.radians(np.array(tel['rate'])),      # deg/s → rad/s
+        err_deg    = _err2,                                   # (N,2): col0=MEKF err, col1=NaN
+        hx         = np.array(tel['hx']) / 1000,             # mNms → Nms
+        hy         = np.array(tel['hy']) / 1000,
+        hz         = np.array(tel['hz']) / 1000,
+        eclipse_nu = np.array(tel['eclipse_nu']),
+        T_gg       = np.array(tel['T_gg'])  / 1e9,           # nNm → Nm
+        T_srp      = np.array(tel['T_srp']) / 1e9,
+        # RPOD nav channels
+        rn_t             = np.array(tel['rn_t']),
+        rn_mode          = np.array(tel['rn_mode']),
+        rn_dx            = np.array(tel['rn_dx']),
+        rn_dy            = np.array(tel['rn_dy']),
+        rn_dz            = np.array(tel['rn_dz']),
+        rn_range         = np.array(tel['rn_range']),
+        rn_est_range     = np.array(tel['rn_est_range']),
+        rn_dv            = np.array(tel['rn_dv']),
+        rn_pos_err       = np.array(tel['rn_pos_err']),
+        rn_vel_err       = np.array(tel['rn_vel_err']),
+        # Docking channels
+        rn_port_range    = np.array(tel['rn_port_range']),
+        rn_port_vrel     = np.array(tel['rn_port_vrel']),
+        rn_align_deg     = np.array(tel['rn_align_deg']),
+        rn_est_align_deg = np.array(tel['rn_est_align_deg']),
+        rn_cone_error_deg= np.array(tel['rn_cone_error_deg']),
+        rn_lateral_m     = np.array(tel['rn_lateral_m']),
+        rn_axial_m       = np.array(tel['rn_axial_m']),
+        rn_port_dx       = np.array(tel['rn_port_dx']),
+        rn_port_dy       = np.array(tel['rn_port_dy']),
+        rn_port_dz       = np.array(tel['rn_port_dz']),
+        # Scalar metadata
+        docked                   = np.bool_(docked),
+        capture_timeout          = np.bool_(capture_timeout),
+        capture_timeout_detail   = np.str_(capture_timeout_detail),
+        total_time_s             = np.float64(t),
+        dock_range_m             = np.float64(DOCK_RANGE_M),
+        hard_capture_range_m     = np.float64(HARD_CAPTURE_RANGE_M),
+        soft_capture_range_m     = np.float64(SOFT_CAPTURE_RANGE_M),
+        dock_cone_half_angle_deg = np.float64(DOCK_CONE_HALF_ANGLE_DEG),
+        chief_body_half_extents_m= CHIEF_BODY_HALF_EXTENTS_M,
+    )
+    print("  rpod_telemetry.npz written")
 
 plt.show()

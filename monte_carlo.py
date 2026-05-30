@@ -108,7 +108,7 @@ HARD_CAPTURE_VREL_MS = 0.010
 HARD_CAPTURE_HOLD_S  = 5.0
 SOFT_CAPTURE_HOLD_S  = 5.0
 SOFT_CAPTURE_LATCH_VREL_MS = 0.030
-SOFT_CAPTURE_MAX_HOLD_S = 480.0   # FIX
+SOFT_CAPTURE_MAX_HOLD_S = 1200.0
 CHIEF_BODY_HALF_EXTENTS_M = np.array([0.80, 0.80, 0.50])
 DOCK_PORT_APERTURE_M = 0.15
 DOCK_CONE_HALF_ANGLE_DEG = 15.0
@@ -116,8 +116,8 @@ DOCK_CONE_MIN_RANGE_M = 0.05
 DOCK_FACE_TOL_M = 0.05
 DOCK_ALIGN_MAX_DEG = 10.0
 SOFT_CAPTURE_CORE_ALIGN_MAX_DEG = 20.0
-SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 30.0  # FIX
-SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE = 0.4   # FIX
+SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 30.0
+SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE = 1.0
 SOFT_CAPTURE_RESTITUTION = 0.10
 SOFT_CAPTURE_TANGENTIAL_DAMPING = 0.30
 ENABLE_PHYSICAL_THRUSTER_LAYOUT = False
@@ -126,16 +126,17 @@ ENABLE_FINITE_BODY_COLLISION = False
 DEPUTY_BODY_HALF_EXTENTS_M = np.array([0.30, 0.30, 0.40])
 ENABLE_COUPLED_CONTACT_DYNAMICS = False
 ENABLE_BODY_MOUNTED_CAMERA_FOV = False
-ENABLE_KEEP_OUT_AVOIDANCE = False
-ENABLE_SPIN_SYNC = False
+ENABLE_KEEP_OUT_AVOIDANCE = True
+ENABLE_SPIN_SYNC = True
 CHIEF_MASS_KG = 3000.0
 SIGMA_V_DOPPLER = 0.005
-TERM_NAV_ALPHA   = 0.35
-TERM_NAV_BETA    = 0.06
-TERM_NAV_VMAX_MS = 0.10
+TERM_NAV_ALPHA   = 0.25
+TERM_NAV_BETA    = 0.02
+TERM_NAV_VMAX_MS = 0.05
 TERM_NAV_GATE_M  = 0.25
 PORT_TRACK_ALPHA  = 0.40
 PORT_TRACK_GATE_M = 0.25
+CLOSE_PROX_NAV_RANGE_M = 20.0
 ECLIPSE_NU_MIN  = 0.1
 DOCK_PORT_BODY  = np.array([0.0, 0.0, 0.5])
 DOCK_AXIS_BODY  = np.array([0.0, 0.0, 1.0])
@@ -143,7 +144,7 @@ DEP_DOCK_AXIS_BODY = np.array([0.0, 0.0, 1.0])
 MU_GEO          = 3.986004418e14
 N_GEO           = np.sqrt(MU_GEO / (CHIEF_A_KM * 1e3)**3)
 I_SC            = np.diag([4.167, 4.167, 3.000])
-MAIN_TERMINAL_M = 5.0    # main.py override threshold
+MAIN_TERMINAL_M = 10.0   # raised from 5m: CW orbit-trap at ~6m prevented reaching 5m
 
 MC_STRESS_CASES = (
     "nominal",
@@ -669,18 +670,32 @@ def run_trial(trial_id,
                         q_cmd = q_ref_align_axis(
                             mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
                     elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
-                        q_cmd = (q_cmd_at_soft_capture
-                                 if q_cmd_at_soft_capture is not None
-                                 else q_ref_align_axis(
-                                     mekf.q, DEP_DOCK_AXIS_BODY,
-                                     -chief_att.dock_axis_eci()))
+                        _R_b2l_att = chief_pose_est.R_body2lvlh
+                        if _R_b2l_att is not None:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY,
+                                -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                        else:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                    elif (rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.LOST_TARGET)
+                          and phase2_active
+                          and float(np.linalg.norm(th_ekf.x[0:3])) < CLOSE_PROX_NAV_RANGE_M):
+                        _R_b2l_att = chief_pose_est.R_body2lvlh
+                        if _R_b2l_att is not None:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY,
+                                -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                        else:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
                     omega_for_ctrl = omega_est
                     if ENABLE_SPIN_SYNC and rpod_ctrl.mode in (RPODMode.TERMINAL,
                                                                 RPODMode.SOFT_CAPTURE):
                         omega_chief_lvlh = (R_e2l @ rot_matrix(chief_att.quaternion)
                                             @ chief_att.omega_body)
                         omega_sync_body = spin_sync.compute_rate_command(
-                            omega_chief_lvlh, (R_e2l @ rot_matrix(sc.q)).T)
+                            omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
                         omega_for_ctrl = omega_est - omega_sync_body
                     tau_rw, _ = att_ctrl.compute(mekf.q, omega_for_ctrl, q_cmd)
                     if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
@@ -772,7 +787,10 @@ def run_trial(trial_id,
                 dv_at_prox_start = cw.dv_total
                 t_prox_start     = t
 
-            # Terminal alpha-beta velocity (EKF velocity elsewhere)
+            # Terminal/close-prox alpha-beta velocity (EKF velocity elsewhere).
+            # Physical thruster allocation can leak tiny lateral velocity that
+            # radial Doppler does not observe well; below 20m use camera-smoothed
+            # position to recover lateral velocity gently.
             ekf_pos_now = th_ekf.x[0:3].copy()
             _use_term_nav = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE))
             if _use_term_nav:

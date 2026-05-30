@@ -1,709 +1,473 @@
 """
-Live 3D Orbital Visualiser  —  Dual Panel
-==========================================
-Run from sim root:   python3 visualiser.py
+RPOD post-run visualizer for main.py.
 
-LEFT panel  — Global ECI orbit view (~8500 km scale)
-              Earth sphere, orbit ring, chief gold trail
-              Both dots visible on the orbit arc
+Run:
+    py -3.11 main.py
+    py -3.11 visualiser.py
 
-RIGHT panel — Close-up LVLH view centred on chief (~300 m window)
-              Chief always at centre, deputy orbits around it,
-              orange separation line, range label
-              THIS is where the 100 m gap is actually visible
-
-HUD (centre top) — T+, mode, range, DV, MEKF, Phase-1 gate, RDV
-
-Close window -> post-sim Figure 2 (LVLH spatial) + Figure 3 (3D views)
+main.py writes rpod_telemetry.npz at the end of a run. This visualizer reads
+that file and shows the actual end-to-end RPOD timeline, close approach, and
+docking-port approach cone used by the current simulation.
 """
 
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+
 import numpy as np
-import matplotlib
-matplotlib.use('TkAgg')   # swap to 'Qt5Agg' if needed
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D   # noqa
-import matplotlib.animation as animation
-from matplotlib.lines import Line2D
-import sys, os, io, contextlib
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from plant.spacecraft                     import Spacecraft
-from sensors.gyro                         import Gyro
-from sensors.magnetometer                 import Magnetometer
-from sensors.sun_sensor                   import SunSensor
-from environment.magnetic_field           import MagneticField
-from environment.sun_model                import SunModel
-from environment.orbit                    import OrbitPropagator
-from environment.gravity_gradient         import GravityGradient
-from environment.solar_radiation_pressure import SolarRadiationPressure
-from environment.aerodynamic_drag         import AerodynamicDrag
-from environment.cw_dynamics              import CWDynamics
-from actuators.reaction_wheel             import ReactionWheel
-from actuators.magnetorquer               import Magnetorquer
-from actuators.bdot                       import BDotController
-from control.attitude_controller          import AttitudeController
-from control.rendezvous_controller        import RendezvousController, RelNavMode
-from estimation.mekf                      import MEKF
-from estimation.quest                     import QUEST
-from estimation.cw_ekf                    import CWEKF
-from utils.quaternion                     import quat_error
-from fsw.mode_manager                     import ModeManager, Mode
-from sensors.ranging_sensor               import RangingBearingSensor
-
-# ─────────────────────────────────────────────────────────────────────
-#  Config
-# ─────────────────────────────────────────────────────────────────────
-T_SIM_MAX           = 7200.0
-dt_outer            = 0.1
-dt_inner            = 0.01
-N_INNER             = int(dt_outer / dt_inner)
-
-TLE_LINE1 = "1 25544U 98067A   25001.50000000  .00006789  00000-0  12345-3 0  9999"
-TLE_LINE2 = "2 25544  51.6400 208.9163 0001147  83.8771  11.2433 15.49815689432399"
-R_CHIEF_KM   = 6371.0 + 410.0
-I_CHIEF_DEG  = 51.6
-OFFSET_LVLH  = np.array([0., 100., 0.])   # m
-
-ADCS_STABLE_DEG  = 1.0
-ADCS_STABLE_SUST = 100
-RDV_DELAY_S      = 300.0
-
-I_sc = np.diag([0.030, 0.025, 0.010])
-
-TRAIL_LEN           = 600    # samples per trail buffer
-ANIM_INTERVAL       = 50     # ms per frame
-SIM_STEPS_PER_FRAME = 50
-
-# tight-view half-width — scales with current range so deputy stays visible
-TIGHT_MIN_KM  = 0.15   # 150 m minimum
-TIGHT_SCALE   = 1.8    # multiplier on current range
-
-# ─────────────────────────────────────────────────────────────────────
-#  Initialise simulation
-# ─────────────────────────────────────────────────────────────────────
-print("Initialising simulation...")
-
-with contextlib.redirect_stdout(io.StringIO()):
-    gg        = GravityGradient(I_sc)
-    srp       = SolarRadiationPressure()
-    drag      = AerodynamicDrag(Cd=2.2, f107=150., f107a=150., ap=4.0)
-    sc        = Spacecraft(I_sc)
-    sc.omega  = np.radians(np.array([5., 8., 12.]))
-    orbit     = OrbitPropagator(tle_line1=TLE_LINE1, tle_line2=TLE_LINE2)
-    mag_field = MagneticField(epoch_year=2025.0)
-    sun_model = SunModel(epoch_year=2025.0)
-    mag_sens  = Magnetometer()
-    sun_sens  = SunSensor()
-    gyro      = Gyro(dt=dt_inner, bias_init_max_deg_s=0.05)
-    rw        = ReactionWheel(h_max=0.004)
-    mtq       = Magnetorquer(m_max=0.2)
-    bdot      = BDotController(k_bdot=2e5, m_max=0.2)
-    ctrl      = AttitudeController(Kp=0.0005, Kd=0.008)
-    quest_alg = QUEST()
-    mekf      = MEKF(dt_inner)
-    mekf.P[0:3, 0:3] = np.eye(3) * np.radians(5.0)**2
-    fsw       = ModeManager()
-
-    cw = CWDynamics(chief_orbit_radius_km=R_CHIEF_KM)
-    cw.set_initial_offset(dr_lvlh_m=OFFSET_LVLH, dv_lvlh_ms=None)
-
-    rng_sensor = RangingBearingSensor(
-        sigma_range_m=0.5, sigma_range_frac=0.002,
-        sigma_angle_rad=np.radians(0.1), fov_half_deg=60.0, max_range_m=5000.0)
-
-    cw_ekf   = CWEKF(n=cw.n, dt=dt_outer)
-    rel_ctrl = RendezvousController(n=cw.n, mode=RelNavMode.FORMATION_HOLD,
-                                    target_lvlh=OFFSET_LVLH)
-
-# ─────────────────────────────────────────────────────────────────────
-#  Sim state
-# ─────────────────────────────────────────────────────────────────────
-S = dict(
-    t=0.0,
-    q_ref=np.array([1., 0., 0., 0.]),
-    last_good_q=None, last_good_t=-999.,
-    mekf_seeded=False,
-    adcs_stable_cnt=0,
-    phase1_confirmed=False, phase1_conf_t=None,
-    phase2_active=False, rdv_triggered=False,
-    mode_name='DETUMBLE',
-    adcs_err_deg=0., total_dv_ms=0.,
-    running=True,
-    # ECI km
-    chief_pos_km=np.array([R_CHIEF_KM, 0., 0.]),
-    deputy_pos_km=np.array([R_CHIEF_KM, 0.0001, 0.]),
-    # LVLH relative position in km (for right panel)
-    dr_km=np.array([0., 0.1, 0.]),
-    chief_trail_eci=[],    # ECI km — for left panel
-    deputy_trail_eci=[],   # ECI km — for left panel
-    chief_trail_rel=[],    # always [0,0,0] — for right panel
-    deputy_trail_rel=[],   # LVLH km — for right panel
-)
-
-TEL = dict(t=[], dx=[], dy=[], dz=[], sep=[],
-           burns=[], chief_eci=[], deputy_eci=[])
-
-# ─────────────────────────────────────────────────────────────────────
-#  Simulation step
-# ─────────────────────────────────────────────────────────────────────
-def sim_step():
-    if S['t'] >= T_SIM_MAX:
-        S['running'] = False
-        return
-
-    with contextlib.redirect_stdout(io.StringIO()):
-        pos_km, vel_km = orbit.step(dt_outer)
-    pos_km = np.array(pos_km)
-    vel_km = np.array(vel_km)
-
-    with contextlib.redirect_stdout(io.StringIO()):
-        B_I        = mag_field.get_field(pos_km)
-        B_meas     = mag_sens.measure(sc.q, B_I)
-        sun_I      = sun_model.get_sun_vector(t_seconds=S['t'])
-        sun_meas   = sun_sens.measure(sc.q, sun_I)
-        omega_meas = gyro.measure(sc.omega)
-        sun_pos_km = sun_I * 1.496e8
-        T_gg       = gg.compute(pos_km, sc.q)
-        T_srp, nu  = srp.compute(sc.q, sun_I, pos_km=pos_km,
-                                  sun_pos_km=sun_pos_km)
-        T_aero, _  = drag.compute(sc.q, pos_km, vel_km, t_seconds=S['t'])
-    dist = T_gg + T_srp + T_aero
-
-    if fsw.is_sun_acquiring:
-        in_ecl  = (nu < 0.1)
-        nadir_I = QUEST.nadir_inertial(pos_km)
-        nadir_b = QUEST.nadir_body_from_earth_sensor(pos_km, sc.q)
-        vb = [B_meas, nadir_b]  if in_ecl else [B_meas, sun_meas, nadir_b]
-        vi = [B_I,    nadir_I]  if in_ecl else [B_I,    sun_I,    nadir_I]
-        wt = [0.85,   0.15]     if in_ecl else [0.70,   0.20,     0.10]
-        q_q, q_qual = quest_alg.compute_multi(
-            vectors_body=vb, vectors_inertial=vi, weights=wt)
-        if q_q[0] < 0: q_q = -q_q
-        if q_qual > 0.01:
-            S['last_good_q'] = q_q.copy()
-            if S['last_good_q'][0] < 0: S['last_good_q'] = -S['last_good_q']
-            S['last_good_t'] = S['t']
-        elif S['last_good_q'] is not None and S['t'] - S['last_good_t'] < 120.0:
-            wx, wy, wz = omega_meas - mekf.bias
-            Om = np.array([[ 0,-wx,-wy,-wz],[wx, 0, wz,-wy],
-                           [wy,-wz,  0, wx],[wz, wy,-wx, 0]])
-            S['last_good_q'] += 0.5 * dt_outer * Om @ S['last_good_q']
-            S['last_good_q'] /= np.linalg.norm(S['last_good_q'])
-            if S['last_good_q'][0] < 0: S['last_good_q'] = -S['last_good_q']
-
-    triad = 5.0 if S['last_good_q'] is not None else 180.0
-    mode  = fsw.update(S['t'], sc.omega, rw.h, triad_err_deg=triad)
-    S['mode_name'] = mode.name
-
-    if mode == Mode.FINE_POINTING and not S['mekf_seeded']:
-        seed = S['last_good_q'].copy() if S['last_good_q'] is not None else sc.q.copy()
-        if seed[0] < 0: seed = -seed
-        mekf.q = seed
-        mekf.P[0:3, 0:3] = np.eye(3) * np.radians(5.)**2
-        S['mekf_seeded'] = True
-
-    if not S['phase1_confirmed'] and S['mekf_seeded'] and mode == Mode.FINE_POINTING:
-        qe = quat_error(sc.q, mekf.q)
-        if qe[0] < 0: qe = -qe
-        err = float(np.degrees(2.0 * np.linalg.norm(qe[1:])))
-        S['adcs_err_deg'] = err
-        S['adcs_stable_cnt'] = S['adcs_stable_cnt'] + 1 if err < ADCS_STABLE_DEG else 0
-        if S['adcs_stable_cnt'] >= ADCS_STABLE_SUST:
-            S['phase1_confirmed'] = True
-            S['phase1_conf_t']    = S['t']
-            print(f"  Phase 1 confirmed at t={S['t']:.1f}s")
-    elif mode != Mode.FINE_POINTING:
-        S['adcs_stable_cnt'] = 0
-
-    with contextlib.redirect_stdout(io.StringIO()):
-        if mode == Mode.SAFE_MODE:
-            sc.step(np.zeros(3), dist, dt_outer)
-        elif mode in (Mode.DETUMBLE, Mode.SUN_ACQUISITION):
-            m_cmd, _ = bdot.compute(B_meas, sc.omega, B_I, dt_outer)
-            sc.step(mtq.compute_torque(m_cmd, B_meas), dist, dt_outer)
-        elif mode in (Mode.FINE_POINTING, Mode.MOMENTUM_DUMP):
-            if S['mekf_seeded'] and S['last_good_q'] is not None:
-                qe = quat_error(sc.q, mekf.q)
-                if qe[0] < 0: qe = -qe
-                if np.degrees(2 * np.linalg.norm(qe[1:])) > 25.0:
-                    nadir_I = QUEST.nadir_inertial(pos_km)
-                    nadir_b = QUEST.nadir_body_from_earth_sensor(pos_km, sc.q)
-                    qf, _ = quest_alg.compute_multi(
-                        vectors_body=[B_meas, sun_meas, nadir_b],
-                        vectors_inertial=[B_I, sun_I, nadir_I],
-                        weights=[0.70, 0.20, 0.10])
-                    if qf[0] < 0: qf = -qf
-                    mekf.q = qf.copy()
-            for _ in range(N_INNER):
-                oi = gyro.measure(sc.omega)
-                mekf.predict(oi)
-                mekf.update_vector(B_meas, B_I, mekf.R_mag)
-                mekf.update_vector(sun_meas, sun_I, mekf.R_sun)
-                omega_est = sc.omega - mekf.bias
-                if mode == Mode.MOMENTUM_DUMP:
-                    torque_cmd = np.zeros(3)
-                    rw.apply_torque(torque_cmd, dt_inner)
-                    m_cmd = np.clip(mtq.compute_dipole(rw.h, B_meas)*5.,
-                                    -mtq.m_max, mtq.m_max)
-                else:
-                    torque_cmd, _ = ctrl.compute(mekf.q, omega_est, S['q_ref'])
-                    rw.apply_torque(torque_cmd, dt_inner)
-                    m_cmd = mtq.compute_dipole(rw.h, B_meas)
-                torque_mtq = mtq.compute_torque(m_cmd, B_meas)
-                sc.step(torque_mtq, dist, dt_inner,
-                        tau_rw=torque_cmd, h_rw=rw.h.copy())
-            if S['mekf_seeded'] and mode == Mode.FINE_POINTING:
-                qe = quat_error(sc.q, mekf.q)
-                if qe[0] < 0: qe = -qe
-                S['adcs_err_deg'] = np.degrees(2 * np.linalg.norm(qe[1:]))
-
-    # Deputy open-loop Phase 1
-    if not S['phase2_active']:
-        cw.step(dt_outer, np.zeros(3))
-
-    # Phase 2 activation
-    if (S['phase1_confirmed'] and not S['phase2_active']
-            and S['t'] >= S['phase1_conf_t'] + RDV_DELAY_S):
-        S['phase2_active'] = True
-        np.random.seed(42)
-        cw_ekf.initialise(
-            cw.state + np.array([5.,5.,5.,0.02,0.02,0.02])*np.random.randn(6))
-        print(f"  Phase 2 active at t={S['t']:.1f}s  range={cw.range_m:.1f}m")
-
-    if S['phase2_active']:
-        if (not S['rdv_triggered'] and mode == Mode.FINE_POINTING
-                and S['t'] >= S['phase1_conf_t'] + RDV_DELAY_S + 120.0):
-            rel_ctrl.set_mode(RelNavMode.RENDEZVOUS, t=S['t'])
-            S['rdv_triggered'] = True
-            print(f"  Rendezvous triggered at t={S['t']:.1f}s")
-
-        accel_cmd, impulse_dv = rel_ctrl.compute(cw_ekf.x, S['t'])
-        if impulse_dv is not None:
-            TEL['burns'].append((S['t'], float(cw.state[0]),
-                                 float(cw.state[1]), float(cw.state[2])))
-            cw.apply_impulse(impulse_dv)
-            cw_ekf.x[3:6] += impulse_dv
-            S['total_dv_ms'] += float(np.linalg.norm(impulse_dv))
-            print(f"  dv [{S['t']:.0f}s] [{impulse_dv[0]:.4f},"
-                  f"{impulse_dv[1]:.4f},{impulse_dv[2]:.4f}] m/s")
-
-        true_cw = cw.step(dt_outer, accel_cmd)
-        cw_ekf.predict(accel_cmd)
-        z, R = rng_sensor.measure(true_cw[:3], np.array([0.,1.,0.]))
-        if z is not None:
-            cw_ekf.update(z, R)
-
-    # ECI positions
-    pos_m  = pos_km * 1e3
-    vel_m  = vel_km * 1e3
-    dr_m   = cw.state[:3]
-    dep_m  = CWDynamics.lvlh_to_eci(dr_m, pos_m, vel_m)
-    dep_km = dep_m * 1e-3
-    dr_km  = dr_m * 1e-3   # LVLH relative [km] — for right panel
-
-    S['chief_pos_km']  = pos_km
-    S['deputy_pos_km'] = dep_km
-    S['dr_km']         = dr_km
-
-    # Left panel trails (ECI)
-    S['chief_trail_eci'].append(pos_km.copy())
-    S['deputy_trail_eci'].append(dep_km.copy())
-    if len(S['chief_trail_eci'])  > TRAIL_LEN: S['chief_trail_eci'].pop(0)
-    if len(S['deputy_trail_eci']) > TRAIL_LEN: S['deputy_trail_eci'].pop(0)
-
-    # Right panel trails (LVLH, relative to chief)
-    # Chief is always [0,0,0]; deputy is dr_km
-    S['chief_trail_rel'].append(np.zeros(3))
-    S['deputy_trail_rel'].append(dr_km.copy())
-    if len(S['chief_trail_rel'])  > TRAIL_LEN: S['chief_trail_rel'].pop(0)
-    if len(S['deputy_trail_rel']) > TRAIL_LEN: S['deputy_trail_rel'].pop(0)
-
-    # Telemetry
-    TEL['t'].append(S['t'])
-    TEL['dx'].append(dr_m[0]);  TEL['dy'].append(dr_m[1])
-    TEL['dz'].append(dr_m[2])
-    TEL['sep'].append(float(np.linalg.norm(dr_m)))
-    TEL['chief_eci'].append(pos_km.copy())
-    TEL['deputy_eci'].append(dep_km.copy())
-
-    S['t'] += dt_outer
+from matplotlib.animation import FuncAnimation
+from matplotlib.patches import Circle, Polygon, Rectangle
+from matplotlib.collections import LineCollection
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Build Figure 1 — dual-panel live animation
-# ─────────────────────────────────────────────────────────────────────
-plt.style.use('dark_background')
-fig1 = plt.figure(figsize=(18, 9), facecolor='#040810')
-fig1.suptitle('3U CubeSat Formation — Live Orbital Simulation',
-              color='white', fontsize=13, fontweight='bold',
-              fontfamily='monospace', y=0.98)
+ROOT = Path(__file__).resolve().parent
+DEFAULT_TELEMETRY = ROOT / "rpod_telemetry.npz"
 
-# ── LEFT: global ECI orbit ────────────────────────────────────────────
-ax_orb = fig1.add_subplot(1, 2, 1, projection='3d', facecolor='#040810')
-ax_orb.set_title('Global Orbit  (ECI, km scale)',
-                  color='#aaaaaa', fontsize=9, fontfamily='monospace', pad=4)
-
-u_e = np.linspace(0, 2*np.pi, 40)
-v_e = np.linspace(0,   np.pi, 40)
-R_E = 6371.0
-xe = R_E * np.outer(np.cos(u_e), np.sin(v_e))
-ye = R_E * np.outer(np.sin(u_e), np.sin(v_e))
-ze = R_E * np.outer(np.ones_like(u_e), np.cos(v_e))
-ax_orb.plot_surface(xe, ye, ze, color='#1a4a7c', alpha=0.35,
-                    linewidth=0, antialiased=True)
-
-th  = np.linspace(0, 2*np.pi, 300)
-inc = np.radians(I_CHIEF_DEG)
-rx  = R_CHIEF_KM * np.cos(th)
-ry  = R_CHIEF_KM * np.sin(th) * np.cos(inc)
-rz  = R_CHIEF_KM * np.sin(th) * np.sin(inc)
-ax_orb.plot(rx, ry, rz, '--', color='#ffffff40', lw=0.9)
-
-orb_chief_trail,  = ax_orb.plot([], [], [], '-', color='#FFD700', lw=1.5, alpha=0.9)
-orb_deputy_trail, = ax_orb.plot([], [], [], '-', color='#00DCFF', lw=1.0, alpha=0.7)
-orb_chief_dot,    = ax_orb.plot([], [], [], 'o', color='#FFD700', ms=10,
-                                 markeredgecolor='white', markeredgewidth=1.0)
-orb_deputy_dot,   = ax_orb.plot([], [], [], 'o', color='#00DCFF', ms=10,
-                                 markeredgecolor='white', markeredgewidth=1.0)
-
-lim_orb = R_CHIEF_KM * 1.25
-ax_orb.set_xlim(-lim_orb, lim_orb)
-ax_orb.set_ylim(-lim_orb, lim_orb)
-ax_orb.set_zlim(-lim_orb, lim_orb)
-ax_orb.set_xlabel('X [km]', color='#555', fontsize=7, labelpad=0)
-ax_orb.set_ylabel('Y [km]', color='#555', fontsize=7, labelpad=0)
-ax_orb.set_zlabel('Z [km]', color='#555', fontsize=7, labelpad=0)
-ax_orb.tick_params(colors='#333', labelsize=5)
-for pane in [ax_orb.xaxis.pane, ax_orb.yaxis.pane, ax_orb.zaxis.pane]:
-    pane.fill = False; pane.set_edgecolor('#111')
-ax_orb.grid(True, color='#111', lw=0.3)
-ax_orb.set_box_aspect([1, 1, 1])
-ax_orb.view_init(elev=35, azim=120)
-ax_orb.legend(handles=[
-    Line2D([0],[0], marker='o', color='#FFD700', ms=7, lw=1.2,
-           label='Chief', markeredgecolor='white'),
-    Line2D([0],[0], marker='o', color='#00DCFF', ms=7, lw=0,
-           label='Deputy (offset ~100m)', markeredgecolor='white'),
-], loc='upper right', facecolor='#040810cc', edgecolor='#333',
-   labelcolor='white', fontsize=8)
-
-# ── RIGHT: tight LVLH close-up  (chief at centre, deputy ~100 m away) ─
-ax_rel = fig1.add_subplot(1, 2, 2, projection='3d', facecolor='#040810')
-ax_rel.set_title('Close-Up  (LVLH frame — metres scale)',
-                  color='#aaaaaa', fontsize=9, fontfamily='monospace', pad=4)
-
-# Chief is a large fixed star at origin
-ax_rel.plot([0], [0], [0], '*', color='#FFD700', ms=18,
-            markeredgecolor='white', markeredgewidth=1.0, zorder=10,
-            label='Chief (fixed origin)')
-
-rel_deputy_trail, = ax_rel.plot([], [], [], '-', color='#00DCFF', lw=1.8, alpha=0.9)
-rel_deputy_dot,   = ax_rel.plot([], [], [], 'o', color='#00DCFF', ms=14,
-                                 markeredgecolor='white', markeredgewidth=1.5)
-rel_sep_line,     = ax_rel.plot([], [], [], '-', color='#FF6B35', lw=2.5, alpha=0.95)
-rel_sep_lbl       = ax_rel.text2D(0.02, 0.06, '',
-                                   transform=ax_rel.transAxes,
-                                   color='#FF6B35', fontsize=11,
-                                   fontfamily='monospace', fontweight='bold')
-
-# Axes in km, sized to show 300 m either side of chief
-# (auto-rescales in update once range changes significantly)
-_T = 0.30   # initial half-width km
-ax_rel.set_xlim(-_T, _T); ax_rel.set_ylim(-_T, _T); ax_rel.set_zlim(-_T, _T)
-ax_rel.set_xlabel('Radial dx [km]',       color='#666', fontsize=7, labelpad=0)
-ax_rel.set_ylabel('Along-track dy [km]',  color='#666', fontsize=7, labelpad=0)
-ax_rel.set_zlabel('Cross-track dz [km]',  color='#666', fontsize=7, labelpad=0)
-ax_rel.tick_params(colors='#444', labelsize=6)
-for pane in [ax_rel.xaxis.pane, ax_rel.yaxis.pane, ax_rel.zaxis.pane]:
-    pane.fill = False; pane.set_edgecolor('#1a1a1a')
-ax_rel.grid(True, color='#1a1a1a', lw=0.5)
-ax_rel.set_box_aspect([1, 1, 1])
-ax_rel.view_init(elev=25, azim=45)
-ax_rel.legend(handles=[
-    Line2D([0],[0], marker='*', color='#FFD700', ms=10, lw=0,
-           label='Chief', markeredgecolor='white'),
-    Line2D([0],[0], marker='o', color='#00DCFF', ms=8, lw=1.5,
-           label='Deputy', markeredgecolor='white'),
-    Line2D([0],[0], color='#FF6B35', lw=2.0, label='Separation'),
-], loc='upper right', facecolor='#040810cc', edgecolor='#444',
-   labelcolor='white', fontsize=9)
-
-# HUD — centre top
-hud = fig1.text(0.50, 0.955, '', color='#00FF88',
-                fontsize=9, fontfamily='monospace',
-                verticalalignment='top', horizontalalignment='center',
-                bbox=dict(boxstyle='round,pad=0.4', facecolor='#00000099',
-                          edgecolor='#00FF8844', linewidth=0.8))
-
-MODE_COLOURS = {
-    'DETUMBLE':        '#FF4444',
-    'SUN_ACQUISITION': '#FF9900',
-    'FINE_POINTING':   '#00FF88',
-    'MOMENTUM_DUMP':   '#AA44FF',
-    'SAFE_MODE':       '#FF0000',
+RPOD_MODE_LABELS = {
+    1: "FORMATION_HOLD",
+    2: "LAMBERT",
+    3: "PROX_OPS",
+    4: "TERMINAL",
+    5: "SOFT_CAPTURE",
+    6: "DOCKING",
+    7: "LOST_TARGET",
 }
 
-# ─────────────────────────────────────────────────────────────────────
-#  Animation update
-# ─────────────────────────────────────────────────────────────────────
-def update(frame):
-    if not S['running']:
+RPOD_MODE_COLORS = {
+    1: "#5b8db8",
+    2: "#dd8a28",
+    3: "#d75b45",
+    4: "#b8223c",
+    5: "#c61d83",
+    6: "#c8a100",
+    7: "#777777",
+}
+
+EARTH_RADIUS_KM = 6371.0
+
+
+def load_npz(path: Path) -> dict[str, np.ndarray]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist. Run main.py first so it can write "
+            "rpod_telemetry.npz."
+        )
+    with np.load(path, allow_pickle=True) as data:
+        return {k: data[k] for k in data.files}
+
+
+def arr(data: dict[str, np.ndarray], key: str, default: float = np.nan) -> np.ndarray:
+    if key in data:
+        return np.asarray(data[key])
+    n = len(data.get("rn_t", []))
+    return np.full(n, default)
+
+
+def scalar(data: dict[str, np.ndarray], key: str, default):
+    value = data.get(key)
+    if value is None:
+        return default
+    return np.asarray(value).item()
+
+
+def finite_points(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mask = np.isfinite(x) & np.isfinite(y)
+    return x[mask], y[mask]
+
+
+def add_mode_bands(ax, t: np.ndarray, mode: np.ndarray) -> None:
+    if len(t) == 0:
         return
-    for _ in range(SIM_STEPS_PER_FRAME):
-        sim_step()
-        if not S['running']:
-            break
-    if len(S['chief_trail_eci']) < 2:
-        return
+    edges = np.concatenate(([0], np.where(np.diff(mode))[0] + 1, [len(mode)]))
+    for start, stop in zip(edges[:-1], edges[1:]):
+        m = int(mode[start])
+        ax.axvspan(
+            t[start] / 3600.0,
+            t[stop - 1] / 3600.0,
+            color=RPOD_MODE_COLORS.get(m, "#999999"),
+            alpha=0.10,
+            lw=0,
+        )
 
-    # ── LEFT panel ────────────────────────────────────────────────────
-    ct = np.array(S['chief_trail_eci'])
-    dt = np.array(S['deputy_trail_eci'])
-    cp = S['chief_pos_km']
-    dp = S['deputy_pos_km']
 
-    orb_chief_trail.set_data(ct[:, 0], ct[:, 1])
-    orb_chief_trail.set_3d_properties(ct[:, 2])
-    orb_deputy_trail.set_data(dt[:, 0], dt[:, 1])
-    orb_deputy_trail.set_3d_properties(dt[:, 2])
-    orb_chief_dot.set_data([cp[0]], [cp[1]])
-    orb_chief_dot.set_3d_properties([cp[2]])
-    orb_deputy_dot.set_data([dp[0]], [dp[1]])
-    orb_deputy_dot.set_3d_properties([dp[2]])
-    ax_orb.view_init(elev=35, azim=120 + S['t'] * 0.003)
+def colored_path(ax, x: np.ndarray, y: np.ndarray, c: np.ndarray, cmap="viridis"):
+    points = np.array([x, y]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    lc = LineCollection(segments, cmap=cmap, linewidth=1.7, alpha=0.9)
+    lc.set_array(c[:-1])
+    ax.add_collection(lc)
+    return lc
 
-    # ── RIGHT panel ───────────────────────────────────────────────────
-    drt = np.array(S['deputy_trail_rel'])   # LVLH km trail
-    dr  = S['dr_km']                        # current LVLH km
 
-    # Chief is fixed at 0,0,0 — plot deputy trail relative
-    # Note: LVLH axes: dx=radial, dy=along-track, dz=cross-track
-    # Map to plot as  X=dx, Y=dy, Z=dz
-    rel_deputy_trail.set_data(drt[:, 0], drt[:, 1])
-    rel_deputy_trail.set_3d_properties(drt[:, 2])
-    rel_deputy_dot.set_data([dr[0]], [dr[1]])
-    rel_deputy_dot.set_3d_properties([dr[2]])
-    # Separation line from chief (0,0,0) to deputy
-    rel_sep_line.set_data([0, dr[0]], [0, dr[1]])
-    rel_sep_line.set_3d_properties([0, dr[2]])
+def cone_polygon(port_y: float, port_x: float, half_angle_deg: float,
+                 length_m: float) -> Polygon:
+    half_width = math.tan(math.radians(half_angle_deg)) * length_m
+    # Main view uses horizontal y and vertical x. The port axis is shown as
+    # the +y approach corridor in this 2D projection.
+    pts = np.array([
+        [port_y, port_x],
+        [port_y + length_m, port_x + half_width],
+        [port_y + length_m, port_x - half_width],
+    ])
+    return Polygon(pts, closed=True, facecolor="#4c9f70", alpha=0.14,
+                   edgecolor="#2f7d53", lw=1.2)
 
-    range_m = cw.range_m
-    rel_sep_lbl.set_text(f'Range: {range_m:.1f} m')
 
-    # Auto-scale right panel around current range
-    hw = max(TIGHT_MIN_KM, range_m * 1e-3 * TIGHT_SCALE)
-    ax_rel.set_xlim(-hw, hw); ax_rel.set_ylim(-hw, hw); ax_rel.set_zlim(-hw, hw)
-    ax_rel.view_init(elev=25, azim=45 + S['t'] * 0.006)
+def draw_chief(ax, half_extents: np.ndarray) -> None:
+    hx, hy = float(half_extents[0]), float(half_extents[1])
+    ax.add_patch(Rectangle((-hy, -hx), 2 * hy, 2 * hx, facecolor="#e8e8e8",
+                           edgecolor="#222222", lw=1.2, zorder=2))
+    ax.plot(0.0, 0.0, "k+", ms=8, mew=1.2, label="chief COM", zorder=4)
 
-    # ── HUD ───────────────────────────────────────────────────────────
-    mc = MODE_COLOURS.get(S['mode_name'], '#FFFFFF')
-    p1 = (f"OK t={S['phase1_conf_t']:.0f}s" if S['phase1_confirmed']
-          else f"cnt={S['adcs_stable_cnt']}/{ADCS_STABLE_SUST}")
-    hud.set_text(
-        f"  T+{S['t']/60:5.1f} min  [{S['t']:.0f}/{T_SIM_MAX:.0f}s]  |  "
-        f"MODE: {S['mode_name']}  |  "
-        f"RANGE: {range_m:.2f} m  |  "
-        f"DV: {S['total_dv_ms']*1000:.2f} mm/s  |  "
-        f"MEKF: {S['adcs_err_deg']:.2f} deg  |  "
-        f"P1: {p1}  |  "
-        f"RDV: {'ACTIVE' if S['rdv_triggered'] else 'WAITING'}"
+
+def set_axes_equal_3d(ax, radius: float) -> None:
+    ax.set_xlim(-radius, radius)
+    ax.set_ylim(-radius, radius)
+    ax.set_zlim(-radius, radius)
+    ax.set_box_aspect((1, 1, 1))
+
+
+def draw_earth(ax) -> None:
+    u = np.linspace(0.0, 2.0 * np.pi, 80)
+    v = np.linspace(0.0, np.pi, 40)
+    x = EARTH_RADIUS_KM * np.outer(np.cos(u), np.sin(v))
+    y = EARTH_RADIUS_KM * np.outer(np.sin(u), np.sin(v))
+    z = EARTH_RADIUS_KM * np.outer(np.ones_like(u), np.cos(v))
+    ax.plot_surface(x, y, z, color="#3f80c2", alpha=0.55, linewidth=0,
+                    shade=True, zorder=0)
+    theta = np.linspace(0.0, 2.0 * np.pi, 240)
+    ax.plot(EARTH_RADIUS_KM * np.cos(theta),
+            EARTH_RADIUS_KM * np.sin(theta),
+            np.zeros_like(theta), color="white", lw=0.8, alpha=0.7)
+
+
+def mission_dashboard(data: dict[str, np.ndarray], save_path: Path | None) -> None:
+    t = arr(data, "rn_t").astype(float)
+    mode = arr(data, "rn_mode").astype(int)
+    dx = arr(data, "rn_dx").astype(float)
+    dy = arr(data, "rn_dy").astype(float)
+    dz = arr(data, "rn_dz").astype(float)
+    ex = arr(data, "rn_edx").astype(float)
+    ey = arr(data, "rn_edy").astype(float)
+    ez = arr(data, "rn_edz").astype(float)
+    rng = arr(data, "rn_range").astype(float)
+    est_rng = arr(data, "rn_est_range").astype(float)
+    dv = arr(data, "rn_dv").astype(float)
+    pos_err = arr(data, "rn_pos_err").astype(float)
+    port_x = arr(data, "rn_port_dx").astype(float)
+    port_y = arr(data, "rn_port_dy").astype(float)
+    port_z = arr(data, "rn_port_dz").astype(float)
+    port_rng = arr(data, "rn_port_range").astype(float)
+    port_vrel = arr(data, "rn_port_vrel").astype(float)
+    align = arr(data, "rn_align_deg").astype(float)
+    cone_err = arr(data, "rn_cone_error_deg").astype(float)
+    lateral = arr(data, "rn_lateral_m").astype(float)
+
+    if len(t) == 0:
+        raise ValueError("Telemetry file has no RPOD samples.")
+
+    docked = bool(scalar(data, "docked", False))
+    timeout = bool(scalar(data, "capture_timeout", False))
+    timeout_detail = str(scalar(data, "capture_timeout_detail", ""))
+    cone_half = float(scalar(data, "dock_cone_half_angle_deg", 15.0))
+    dock_range = float(scalar(data, "dock_range_m", 0.30))
+    hard_range = float(scalar(data, "hard_capture_range_m", 0.08))
+    chief_half = np.asarray(data.get("chief_body_half_extents_m", [0.8, 0.8, 0.5]),
+                            dtype=float)
+
+    status = "DOCKED" if docked else ("CAPTURE TIMEOUT" if timeout else "NOT DOCKED")
+    if timeout_detail and timeout:
+        status += f" ({timeout_detail})"
+
+    fig = plt.figure(figsize=(16, 9))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1.3, 1.0, 1.0])
+    fig.suptitle(f"main.py RPOD replay - {status}", fontsize=14, fontweight="bold")
+
+    ax_path = fig.add_subplot(gs[:, 0])
+    ax_close = fig.add_subplot(gs[0, 1])
+    ax_range = fig.add_subplot(gs[0, 2])
+    ax_align = fig.add_subplot(gs[1, 1])
+    ax_err = fig.add_subplot(gs[1, 2])
+
+    lc = colored_path(ax_path, dy, dx, t / 3600.0)
+    ax_path.plot(dy[0], dx[0], "o", color="#1f8f4d", ms=7, label="start")
+    ax_path.plot(dy[-1], dx[-1], "s", color="#b8223c", ms=7, label="end")
+    ax_path.plot(port_y, port_x, color="#333333", lw=0.9, alpha=0.55,
+                 label="dock port")
+    ax_path.plot(0.0, 0.0, "k*", ms=12, label="chief COM")
+    ax_path.set_title("End-to-end LVLH trajectory")
+    ax_path.set_xlabel("along-track y [m]")
+    ax_path.set_ylabel("radial x [m]")
+    ax_path.axis("equal")
+    ax_path.grid(True, alpha=0.3)
+    ax_path.legend(fontsize=8, loc="best")
+    cbar = fig.colorbar(lc, ax=ax_path, fraction=0.046, pad=0.04)
+    cbar.set_label("mission time [hr]")
+
+    close_mask = rng < max(2.0, np.nanmin(rng) + 2.0)
+    if not np.any(close_mask):
+        close_mask = np.arange(len(t)) > max(0, len(t) - 500)
+    draw_chief(ax_close, chief_half)
+    final_port_y = float(port_y[np.isfinite(port_y)][-1]) if np.any(np.isfinite(port_y)) else 0.5
+    final_port_x = float(port_x[np.isfinite(port_x)][-1]) if np.any(np.isfinite(port_x)) else 0.0
+    ax_close.add_patch(cone_polygon(final_port_y, final_port_x, cone_half, 0.75))
+    ax_close.add_patch(Circle((final_port_y, final_port_x), dock_range,
+                              fill=False, ec="#b8223c", lw=1.3,
+                              label="soft-capture range"))
+    ax_close.add_patch(Circle((final_port_y, final_port_x), hard_range,
+                              fill=False, ec="#c8a100", lw=1.2,
+                              ls="--", label="hard-capture range"))
+    ax_close.plot(port_y[close_mask], port_x[close_mask], color="#333333",
+                  lw=1.0, alpha=0.8, label="port")
+    lc2 = colored_path(ax_close, dy[close_mask], dx[close_mask],
+                       t[close_mask] / 3600.0, cmap="plasma")
+    ax_close.plot(dy[-1], dx[-1], "s", color="#b8223c", ms=7, label="deputy end")
+    ax_close.set_title("Close approach with docking cone")
+    ax_close.set_xlabel("along-track y [m]")
+    ax_close.set_ylabel("radial x [m]")
+    ax_close.axis("equal")
+    ax_close.set_xlim(final_port_y - 0.8, final_port_y + 1.0)
+    ax_close.set_ylim(final_port_x - 0.8, final_port_x + 0.8)
+    ax_close.grid(True, alpha=0.3)
+    ax_close.legend(fontsize=7, loc="best")
+
+    add_mode_bands(ax_range, t, mode)
+    ax_range.semilogy(t / 3600.0, np.maximum(rng, 1e-4),
+                      color="#553C9A", label="COM range")
+    ax_range.semilogy(t / 3600.0, np.maximum(port_rng, 1e-4),
+                      color="#b8223c", label="port range")
+    ax_range.semilogy(t / 3600.0, np.maximum(est_rng, 1e-4),
+                      color="#2b6cb0", ls="--", alpha=0.8, label="EKF range")
+    ax_range.axhline(dock_range, color="#b8223c", ls=":", lw=1)
+    ax_range.set_title("Range closure")
+    ax_range.set_xlabel("time [hr]")
+    ax_range.set_ylabel("range [m]")
+    ax_range.legend(fontsize=8)
+
+    add_mode_bands(ax_align, t, mode)
+    ax_align.plot(t / 3600.0, align, color="#b8223c", label="axis alignment")
+    ax_align.plot(t / 3600.0, cone_err, color="#2f7d53", label="cone error")
+    ax_align.axhline(30.0, color="#777777", ls=":", lw=1, label="soft entry")
+    ax_align.axhline(10.0, color="#222222", ls="--", lw=1, label="hard align")
+    ax_align.set_title("Attitude and approach cone")
+    ax_align.set_xlabel("time [hr]")
+    ax_align.set_ylabel("deg")
+    ax_align.set_ylim(bottom=0)
+    ax_align.legend(fontsize=8)
+
+    add_mode_bands(ax_err, t, mode)
+    ax_err.plot(t / 3600.0, dv * 1e3, color="#2b6cb0", label="cum DV [mm/s]")
+    ax_err.set_title("DV, estimation, contact quality")
+    ax_err.set_xlabel("time [hr]")
+    ax_err.set_ylabel("DV [mm/s]", color="#2b6cb0")
+    ax_err.tick_params(axis="y", labelcolor="#2b6cb0")
+    ax2 = ax_err.twinx()
+    ax2.semilogy(t / 3600.0, np.maximum(pos_err, 1e-4),
+                 color="#b8223c", ls="--", alpha=0.8, label="pos err [m]")
+    ax2.semilogy(t / 3600.0, np.maximum(port_vrel * 1e3, 1e-3),
+                 color="#555555", ls=":", alpha=0.8, label="port vrel [mm/s]")
+    ax2.semilogy(t / 3600.0, np.maximum(lateral, 1e-4),
+                 color="#2f7d53", alpha=0.8, label="lateral [m]")
+    ax2.set_ylabel("log scale")
+    lines, labels = ax_err.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax_err.legend(lines + lines2, labels + labels2, fontsize=8, loc="best")
+
+    mode_handles = [
+        Rectangle((0, 0), 1, 1, color=color, alpha=0.25,
+                  label=RPOD_MODE_LABELS.get(mode_id, str(mode_id)))
+        for mode_id, color in RPOD_MODE_COLORS.items()
+        if np.any(mode == mode_id)
+    ]
+    if mode_handles:
+        fig.legend(handles=mode_handles, loc="lower center", ncol=len(mode_handles),
+                   fontsize=8, frameon=False)
+
+    fig.tight_layout(rect=[0, 0.04, 1, 0.95])
+    if save_path:
+        fig.savefig(save_path, dpi=180)
+        print(f"Saved visualizer figure: {save_path}")
+
+
+def mission_animation(data: dict[str, np.ndarray], save_path: Path | None) -> None:
+    t = arr(data, "rn_t").astype(float)
+    dx = arr(data, "rn_dx").astype(float)
+    dy = arr(data, "rn_dy").astype(float)
+    rng = arr(data, "rn_range").astype(float)
+    port_x = arr(data, "rn_port_dx").astype(float)
+    port_y = arr(data, "rn_port_dy").astype(float)
+    align = arr(data, "rn_align_deg").astype(float)
+    port_rng = arr(data, "rn_port_range").astype(float)
+    cone_half = float(scalar(data, "dock_cone_half_angle_deg", 15.0))
+    dock_range = float(scalar(data, "dock_range_m", 0.30))
+    chief_half = np.asarray(data.get("chief_body_half_extents_m", [0.8, 0.8, 0.5]),
+                            dtype=float)
+
+    finite = np.isfinite(dx) & np.isfinite(dy)
+    idx = np.where(finite)[0]
+    if len(idx) == 0:
+        raise ValueError("No finite trajectory samples for animation.")
+    stride = max(1, len(idx) // 900)
+    frames = idx[::stride]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    draw_chief(ax, chief_half)
+    final_port_y = float(port_y[np.isfinite(port_y)][-1]) if np.any(np.isfinite(port_y)) else 0.5
+    final_port_x = float(port_x[np.isfinite(port_x)][-1]) if np.any(np.isfinite(port_x)) else 0.0
+    ax.add_patch(cone_polygon(final_port_y, final_port_x, cone_half, 0.75))
+    ax.add_patch(Circle((final_port_y, final_port_x), dock_range, fill=False,
+                        ec="#b8223c", lw=1.2))
+    trace, = ax.plot([], [], color="#553C9A", lw=1.5)
+    deputy, = ax.plot([], [], "o", color="#b8223c", ms=8)
+    port_dot, = ax.plot([], [], "s", color="#222222", ms=5)
+    hud = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top",
+                  ha="left", fontsize=10,
+                  bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
+    ax.set_title("Close-range RPOD replay")
+    ax.set_xlabel("along-track y [m]")
+    ax.set_ylabel("radial x [m]")
+    ax.axis("equal")
+    ax.set_xlim(final_port_y - 0.9, final_port_y + 1.0)
+    ax.set_ylim(final_port_x - 0.9, final_port_x + 0.9)
+    ax.grid(True, alpha=0.3)
+
+    def update(frame_index: int):
+        i = frames[frame_index]
+        trail_start = max(0, i - 1200)
+        trace.set_data(dy[trail_start:i + 1], dx[trail_start:i + 1])
+        deputy.set_data([dy[i]], [dx[i]])
+        port_dot.set_data([port_y[i]], [port_x[i]])
+        hud.set_text(
+            f"t={t[i] / 3600.0:.2f} hr\n"
+            f"COM range={rng[i]:.3f} m\n"
+            f"port range={port_rng[i]:.3f} m\n"
+            f"align={align[i]:.1f} deg"
+        )
+        return trace, deputy, port_dot, hud
+
+    anim = FuncAnimation(fig, update, frames=len(frames), interval=35, blit=True)
+    if save_path:
+        anim.save(save_path, writer="pillow", fps=24)
+        print(f"Saved visualizer animation: {save_path}")
+    return anim
+
+
+def orbit_animation(data: dict[str, np.ndarray], save_path: Path | None):
+    t = arr(data, "viz_t").astype(float)
+    cx = arr(data, "viz_chief_x_km").astype(float)
+    cy = arr(data, "viz_chief_y_km").astype(float)
+    cz = arr(data, "viz_chief_z_km").astype(float)
+    dx = arr(data, "viz_dep_x_km").astype(float)
+    dy = arr(data, "viz_dep_y_km").astype(float)
+    dz = arr(data, "viz_dep_z_km").astype(float)
+    rpod_mode = arr(data, "viz_rpod_mode", default=0).astype(int)
+
+    finite = (np.isfinite(cx) & np.isfinite(cy) & np.isfinite(cz)
+              & np.isfinite(dx) & np.isfinite(dy) & np.isfinite(dz))
+    idx = np.where(finite)[0]
+    if len(idx) < 2:
+        print("No ECI orbit samples in telemetry; run main.py again with the updated exporter.")
+        return None
+
+    stride = max(1, len(idx) // 1200)
+    frames = idx[::stride]
+    orbit_radius = max(
+        float(np.nanmax(np.linalg.norm(np.column_stack([cx, cy, cz]), axis=1))),
+        EARTH_RADIUS_KM * 1.2,
     )
-    hud.set_color(mc)
+    view_radius = orbit_radius * 1.12
+
+    fig = plt.figure(figsize=(11, 9))
+    ax = fig.add_subplot(111, projection="3d")
+    fig.suptitle("GMAT-style ECI orbit replay from main.py", fontsize=14,
+                 fontweight="bold")
+    draw_earth(ax)
+    ax.plot(cx[idx], cy[idx], cz[idx], color="#c8a100", lw=0.9, alpha=0.35,
+            label="chief orbit")
+    ax.plot(dx[idx], dy[idx], dz[idx], color="#b8223c", lw=0.8, alpha=0.25,
+            label="deputy path")
+    chief_trail, = ax.plot([], [], [], color="#ffd34d", lw=2.0)
+    deputy_trail, = ax.plot([], [], [], color="#ff4d5e", lw=2.0)
+    chief_dot, = ax.plot([], [], [], "o", color="#ffd34d", ms=8,
+                         label="chief")
+    deputy_dot, = ax.plot([], [], [], "o", color="#ff4d5e", ms=6,
+                          label="deputy")
+    tether, = ax.plot([], [], [], color="white", lw=1.1, alpha=0.75)
+    hud = ax.text2D(0.02, 0.96, "", transform=ax.transAxes,
+                    fontsize=10,
+                    bbox=dict(facecolor="black", alpha=0.35,
+                              edgecolor="none"),
+                    color="white")
+    ax.set_xlabel("ECI X [km]")
+    ax.set_ylabel("ECI Y [km]")
+    ax.set_zlabel("ECI Z [km]")
+    set_axes_equal_3d(ax, view_radius)
+    ax.view_init(elev=24, azim=38)
+    ax.legend(loc="upper right")
+
+    def update(frame_index: int):
+        i = frames[frame_index]
+        trail_start = max(0, i - 180)
+        chief_trail.set_data(cx[trail_start:i + 1], cy[trail_start:i + 1])
+        chief_trail.set_3d_properties(cz[trail_start:i + 1])
+        deputy_trail.set_data(dx[trail_start:i + 1], dy[trail_start:i + 1])
+        deputy_trail.set_3d_properties(dz[trail_start:i + 1])
+        chief_dot.set_data([cx[i]], [cy[i]])
+        chief_dot.set_3d_properties([cz[i]])
+        deputy_dot.set_data([dx[i]], [dy[i]])
+        deputy_dot.set_3d_properties([dz[i]])
+        tether.set_data([cx[i], dx[i]], [cy[i], dy[i]])
+        tether.set_3d_properties([cz[i], dz[i]])
+        rel_m = 1000.0 * np.linalg.norm([dx[i] - cx[i], dy[i] - cy[i], dz[i] - cz[i]])
+        mode_name = RPOD_MODE_LABELS.get(int(rpod_mode[i]), "ADCS/SETUP")
+        hud.set_text(
+            f"T+ {t[i] / 3600.0:.2f} hr\n"
+            f"mode: {mode_name}\n"
+            f"chief radius: {np.linalg.norm([cx[i], cy[i], cz[i]]):.0f} km\n"
+            f"separation: {rel_m:.2f} m"
+        )
+        ax.view_init(elev=24, azim=38 + 0.02 * frame_index)
+        return chief_trail, deputy_trail, chief_dot, deputy_dot, tether, hud
+
+    anim = FuncAnimation(fig, update, frames=len(frames), interval=35, blit=False)
+    if save_path:
+        anim.save(save_path, writer="pillow", fps=24)
+        print(f"Saved orbit animation: {save_path}")
+    return anim
 
 
-print("Starting live 3D visualisation...")
-print("  LEFT  = global ECI orbit   (both dots on the orbit arc)")
-print("  RIGHT = close-up LVLH view (chief=star, deputy=cyan, orange=separation)")
-print("  Close window to show post-sim spatial figures")
-print()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Visualize main.py RPOD telemetry.")
+    parser.add_argument("--telemetry", type=Path, default=DEFAULT_TELEMETRY,
+                        help="Path to rpod_telemetry.npz from main.py.")
+    parser.add_argument("--save", type=Path, default=None,
+                        help="Optional PNG path for the dashboard.")
+    parser.add_argument("--animate", action="store_true",
+                        help="Also open a close-range replay animation.")
+    parser.add_argument("--no-orbit", action="store_true",
+                        help="Do not open the GMAT-style Earth orbit replay.")
+    parser.add_argument("--save-animation", type=Path, default=None,
+                        help="Optional GIF path for --animate.")
+    parser.add_argument("--save-orbit-animation", type=Path, default=None,
+                        help="Optional GIF path for the Earth orbit replay.")
+    args = parser.parse_args()
 
-ani = animation.FuncAnimation(
-    fig1, update,
-    interval=ANIM_INTERVAL,
-    blit=False,
-    cache_frame_data=False)
+    data = load_npz(args.telemetry)
+    animations = []
+    mission_dashboard(data, args.save)
+    if not args.no_orbit or args.save_orbit_animation:
+        anim = orbit_animation(data, args.save_orbit_animation)
+        if anim is not None:
+            animations.append(anim)
+    if args.animate or args.save_animation:
+        anim = mission_animation(data, args.save_animation)
+        if anim is not None:
+            animations.append(anim)
+    plt.show()
 
-plt.tight_layout()
-plt.show()
 
-
-# ─────────────────────────────────────────────────────────────────────
-#  Post-sim figures
-# ─────────────────────────────────────────────────────────────────────
-if len(TEL['t']) < 2:
-    print("No telemetry — exiting.")
-    raise SystemExit
-
-plt.rcParams.update({"font.size": 10, "axes.grid": True,
-                     "grid.alpha": 0.35, "lines.linewidth": 1.2})
-plt.style.use('default')
-
-t_arr  = np.array(TEL['t'])
-dx_arr = np.array(TEL['dx'])
-dy_arr = np.array(TEL['dy'])
-dz_arr = np.array(TEL['dz'])
-sep    = np.array(TEL['sep'])
-c_eci  = np.array(TEL['chief_eci'])
-d_eci  = np.array(TEL['deputy_eci'])
-burns  = TEL['burns']
-
-print(f"\n  Post-sim summary")
-print(f"  Total sim time   : {t_arr[-1]:.0f}s  ({t_arr[-1]/60:.1f} min)")
-print(f"  Final separation : {sep[-1]:.3f} m")
-print(f"  Total DV         : {S['total_dv_ms']*1000:.3f} mm/s")
-print(f"  Burns recorded   : {len(burns)}")
-
-# ── Figure 2: LVLH spatial overview ──────────────────────────────────
-fig2 = plt.figure(figsize=(18, 11))
-fig2.suptitle("Spacecraft Spatial Relationship — LVLH Frame  (post-sim)",
-              fontsize=13, fontweight='bold')
-
-# 2a: top-down — dy (along-track) vs dx (radial), chief at origin
-ax2a = fig2.add_subplot(2, 3, (1, 2))
-sc2a = ax2a.scatter(dy_arr, dx_arr, c=t_arr, cmap='plasma', s=5, zorder=4)
-plt.colorbar(sc2a, ax=ax2a, label='Time [s]')
-ax2a.plot(0, 0, 'k*', ms=20, zorder=8, label='Chief (LVLH origin)')
-ax2a.plot(dy_arr[0],  dx_arr[0],  'go', ms=11, zorder=7,
-          label=f'Deputy start  ({dy_arr[0]:.1f}, {dx_arr[0]:.1f}) m')
-ax2a.plot(dy_arr[-1], dx_arr[-1], 'rs', ms=11, zorder=7,
-          label=f'Deputy end  ({dy_arr[-1]:.1f}, {dx_arr[-1]:.1f}) m')
-N_sl = max(1, len(t_arr) // 30)
-for i in range(0, len(t_arr), N_sl):
-    a = 0.06 + 0.45 * (i / len(t_arr))
-    ax2a.plot([0, dy_arr[i]], [0, dx_arr[i]],
-              color='slategray', lw=0.7, alpha=a, zorder=1)
-ax2a.plot([0, dy_arr[-1]], [0, dx_arr[-1]], 'r--', lw=2.2, alpha=0.9, zorder=6,
-          label=f'Final separation = {sep[-1]:.2f} m')
-for bt, bdx, bdy, bdz in burns:
-    ax2a.plot(bdy, bdx, 'r^', ms=12, zorder=9)
-    ax2a.annotate(f'dv\n{bt:.0f}s', xy=(bdy, bdx), xytext=(bdy+3, bdx+3),
-                  fontsize=7, color='darkred', fontweight='bold',
-                  arrowprops=dict(arrowstyle='->', color='darkred', lw=0.7))
-ax2a.set(xlabel='Along-Track dy [m]', ylabel='Radial dx [m]',
-         title='Top-Down LVLH: Chief (star) & Deputy Path — Separation Lines')
-ax2a.legend(fontsize=8); ax2a.set_aspect('equal', adjustable='datalim')
-ax2a.grid(True, alpha=0.3)
-
-# 2b: separation over time
-ax2b = fig2.add_subplot(2, 3, 3)
-ax2b.fill_between(t_arr, sep, alpha=0.15, color='purple')
-ax2b.plot(t_arr, sep, color='purple', lw=1.8, label='|separation|')
-ax2b.axhline(sep[-1], color='red',   ls='--', lw=1.2,
-             label=f'Final: {sep[-1]:.2f} m')
-ax2b.axhline(sep[0],  color='green', ls=':',  lw=1.2,
-             label=f'Initial: {sep[0]:.2f} m')
-for bt, bdx, bdy, bdz in burns:
-    idx = np.argmin(np.abs(t_arr - bt))
-    ax2b.axvline(bt, color='darkred', lw=1.0, alpha=0.7, ls=':')
-    ax2b.annotate('dv', xy=(bt, sep[idx]),
-                  fontsize=7, color='darkred', fontweight='bold')
-ax2b.set(xlabel='Time [s]', ylabel='Distance [m]',
-         title='Chief–Deputy Separation Over Time')
-ax2b.legend(fontsize=8); ax2b.grid(True, alpha=0.3)
-
-# 2c: side view (dy vs dz)
-ax2c = fig2.add_subplot(2, 3, 4)
-ax2c.scatter(dy_arr, dz_arr, c=t_arr, cmap='plasma', s=5, zorder=4)
-ax2c.plot(0, 0, 'k*', ms=16, zorder=8, label='Chief')
-ax2c.plot(dy_arr[0],  dz_arr[0],  'go', ms=9, zorder=7, label='Start')
-ax2c.plot(dy_arr[-1], dz_arr[-1], 'rs', ms=9, zorder=7, label='End')
-for i in range(0, len(t_arr), max(1, len(t_arr)//30)):
-    ax2c.plot([0, dy_arr[i]], [0, dz_arr[i]],
-              color='slategray', lw=0.6, alpha=0.15, zorder=1)
-ax2c.plot([0, dy_arr[-1]], [0, dz_arr[-1]], 'r--', lw=1.8, alpha=0.8, zorder=6)
-for bt, bdx, bdy, bdz in burns:
-    ax2c.plot(bdy, bdz, 'r^', ms=10, zorder=9)
-ax2c.set(xlabel='Along-Track dy [m]', ylabel='Cross-Track dz [m]',
-         title='Side View (Along-Track vs Cross-Track)')
-ax2c.legend(fontsize=8); ax2c.set_aspect('equal', adjustable='datalim')
-ax2c.grid(True, alpha=0.3)
-
-# 2d: front view (dx vs dz)
-ax2d = fig2.add_subplot(2, 3, 5)
-ax2d.scatter(dx_arr, dz_arr, c=t_arr, cmap='plasma', s=5, zorder=4)
-ax2d.plot(0, 0, 'k*', ms=16, zorder=8, label='Chief')
-ax2d.plot(dx_arr[0],  dz_arr[0],  'go', ms=9, zorder=7, label='Start')
-ax2d.plot(dx_arr[-1], dz_arr[-1], 'rs', ms=9, zorder=7, label='End')
-for i in range(0, len(t_arr), max(1, len(t_arr)//30)):
-    ax2d.plot([0, dx_arr[i]], [0, dz_arr[i]],
-              color='slategray', lw=0.6, alpha=0.15, zorder=1)
-ax2d.plot([0, dx_arr[-1]], [0, dz_arr[-1]], 'r--', lw=1.8, alpha=0.8, zorder=6)
-for bt, bdx, bdy, bdz in burns:
-    ax2d.plot(bdx, bdz, 'r^', ms=10, zorder=9)
-ax2d.set(xlabel='Radial dx [m]', ylabel='Cross-Track dz [m]',
-         title='Front View (Radial vs Cross-Track)')
-ax2d.legend(fontsize=8); ax2d.set_aspect('equal', adjustable='datalim')
-ax2d.grid(True, alpha=0.3)
-
-# 2e: per-axis separation
-ax2e = fig2.add_subplot(2, 3, 6)
-ax2e.plot(t_arr, np.abs(dx_arr), color='royalblue',  lw=1.3, label='|dx| radial')
-ax2e.plot(t_arr, np.abs(dy_arr), color='darkorange', lw=1.3, label='|dy| along-track')
-ax2e.plot(t_arr, np.abs(dz_arr), color='green',      lw=1.3, label='|dz| cross-track')
-ax2e.plot(t_arr, sep,            color='purple',     lw=2.0, ls='--', label='total |sep|')
-for bt, *_ in burns:
-    ax2e.axvline(bt, color='darkred', lw=1.0, alpha=0.6, ls=':')
-    ax2e.annotate('dv', xy=(bt, max(sep)*0.92),
-                  fontsize=7, color='darkred', fontweight='bold')
-ax2e.set(xlabel='Time [s]', ylabel='Distance [m]',
-         title='Per-Axis Separation Components')
-ax2e.legend(fontsize=8); ax2e.grid(True, alpha=0.3)
-
-fig2.tight_layout()
-
-# ── Figure 3: 3D views ────────────────────────────────────────────────
-fig3 = plt.figure(figsize=(16, 7))
-fig3.suptitle("3D Trajectory Views", fontsize=13, fontweight='bold')
-
-# 3a: 3D LVLH
-ax3a = fig3.add_subplot(1, 2, 1, projection='3d')
-norm3d = plt.Normalize(t_arr.min(), t_arr.max())
-cmap3d = plt.cm.plasma
-sk3 = max(1, len(t_arr) // 2000)
-for i in range(0, len(t_arr)-1, sk3):
-    ax3a.plot(dy_arr[i:i+2], dx_arr[i:i+2], dz_arr[i:i+2],
-              color=cmap3d(norm3d(t_arr[i])), lw=1.2, alpha=0.8)
-ax3a.scatter([0],[0],[0], color='black', s=150, marker='*', zorder=10,
-             label='Chief')
-ax3a.scatter([dy_arr[0]], [dx_arr[0]], [dz_arr[0]],
-             color='lime', s=80, zorder=9, label='Start')
-ax3a.scatter([dy_arr[-1]], [dx_arr[-1]], [dz_arr[-1]],
-             color='red', s=80, zorder=9, marker='s',
-             label=f'End (sep={sep[-1]:.1f}m)')
-ax3a.plot([0, dy_arr[-1]], [0, dx_arr[-1]], [0, dz_arr[-1]],
-          'r--', lw=1.8, alpha=0.8, label='Final sep line')
-for i in range(0, len(t_arr), max(1, len(t_arr)//20)):
-    ax3a.plot([0, dy_arr[i]], [0, dx_arr[i]], [0, dz_arr[i]],
-              color='gray', lw=0.5, alpha=0.18)
-for bt, bdx, bdy, bdz in burns:
-    ax3a.scatter([bdy],[bdx],[bdz], color='darkred', s=80, marker='^', zorder=9)
-ax3a.set(xlabel='dy [m]', ylabel='dx [m]', zlabel='dz [m]',
-         title='3D LVLH Trajectory\n(Chief at origin, colour = time)')
-ax3a.legend(fontsize=8)
-
-# 3b: ECI orbital paths
-ax3b = fig3.add_subplot(1, 2, 2, projection='3d')
-ax3b.plot_surface(xe, ye, ze, color='steelblue', alpha=0.12, linewidth=0)
-ax3b.plot(rx, ry, rz, '--', color='gray', lw=0.8, alpha=0.4)
-sk_e = max(1, len(t_arr) // 800)
-ax3b.plot(c_eci[::sk_e,0], c_eci[::sk_e,1], c_eci[::sk_e,2],
-          color='gold', lw=1.4, alpha=0.9, label='Chief')
-ax3b.plot(d_eci[::sk_e,0], d_eci[::sk_e,1], d_eci[::sk_e,2],
-          color='cyan', lw=1.4, alpha=0.9, label='Deputy')
-ax3b.scatter([c_eci[-1,0]],[c_eci[-1,1]],[c_eci[-1,2]],
-             color='gold', s=80, marker='o')
-ax3b.scatter([d_eci[-1,0]],[d_eci[-1,1]],[d_eci[-1,2]],
-             color='cyan', s=80, marker='o')
-ax3b.plot([c_eci[-1,0],d_eci[-1,0]],[c_eci[-1,1],d_eci[-1,1]],
-          [c_eci[-1,2],d_eci[-1,2]],
-          'r-', lw=2.0, alpha=0.9, label=f'Final sep={sep[-1]:.1f}m')
-ax3b.set(xlabel='X [km]', ylabel='Y [km]', zlabel='Z [km]',
-         title='ECI Orbits\n(Gold=Chief, Cyan=Deputy)')
-ax3b.legend(fontsize=8)
-lim3b = R_CHIEF_KM * 1.1
-ax3b.set_xlim(-lim3b, lim3b); ax3b.set_ylim(-lim3b, lim3b)
-ax3b.set_zlim(-lim3b, lim3b); ax3b.set_box_aspect([1, 1, 1])
-
-fig3.tight_layout()
-plt.show()
+if __name__ == "__main__":
+    main()

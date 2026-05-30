@@ -61,7 +61,80 @@ class ThrusterLayout:
         dirs = np.array([e[1] for e in entries], dtype=float)
         return cls(pos, dirs, max_force_n)
 
-    def allocate(self, force_body_n, torque_body_nm=None):
+    @classmethod
+    def box_24(cls, half_extents_m=(0.30, 0.30, 0.40), max_force_n=0.25):
+        """
+        Twenty-four-thruster box layout: ±X, ±Y, ±Z opposing pairs at face edges.
+
+        Extends box_16 with four ±Z thruster pairs mounted at the x/y corners,
+        giving full 6-axis force authority and better torque decoupling.
+
+            ±X:  8 thrusters at (0, ±hy, ±hz)
+            ±Y:  8 thrusters at (±hx, 0, ±hz)
+            ±Z:  8 thrusters at (±hx, ±hy, 0)   ← new
+        """
+        hx, hy, hz = map(float, half_extents_m)
+        entries = []
+        # ±X thrusters at y/z face edges
+        for sy in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                entries.append(([0.0, sy * hy, sz * hz], [ 1.0, 0.0, 0.0]))
+                entries.append(([0.0, sy * hy, sz * hz], [-1.0, 0.0, 0.0]))
+        # ±Y thrusters at x/z face edges
+        for sx in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                entries.append(([sx * hx, 0.0, sz * hz], [0.0,  1.0, 0.0]))
+                entries.append(([sx * hx, 0.0, sz * hz], [0.0, -1.0, 0.0]))
+        # ±Z thrusters at x/y face edges
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                entries.append(([sx * hx, sy * hy, 0.0], [0.0, 0.0,  1.0]))
+                entries.append(([sx * hx, sy * hy, 0.0], [0.0, 0.0, -1.0]))
+
+        pos  = np.array([e[0] for e in entries], dtype=float)
+        dirs = np.array([e[1] for e in entries], dtype=float)
+        return cls(pos, dirs, max_force_n)
+
+    def chief_mask(self, chief_dir_body, cone_half_deg=45.0):
+        """
+        Boolean mask of thrusters whose exhaust plume points toward the chief.
+
+        A thruster fires with force in direction d. Its exhaust plume goes in
+        -d. We block thrusters where the plume direction (-d) falls within
+        cone_half_deg of the chief direction c_hat:
+
+            dot(-d, c_hat) >= cos(cone_half_deg)
+            ⟺  dot(d, c_hat) <= -cos(cone_half_deg)
+
+        Parameters
+        ----------
+        chief_dir_body : (3,) unit vector from deputy toward chief, in body frame
+        cone_half_deg  : plume exclusion cone half-angle [deg]. Default 45°.
+
+        Returns
+        -------
+        mask : (n_thrusters,) bool — True = thruster is blocked
+        """
+        c = np.asarray(chief_dir_body, dtype=float)
+        norm = float(np.linalg.norm(c))
+        if norm < 1e-9:
+            return np.zeros(len(self.directions_body), dtype=bool)
+        c_hat = c / norm
+        cos_thresh = float(np.cos(np.radians(cone_half_deg)))
+        # dot(d, c_hat) <= -cos_thresh  ↔  plume within cone of chief
+        return (self.directions_body @ c_hat) <= -cos_thresh
+
+    def allocate(self, force_body_n, torque_body_nm=None, excluded=None):
+        """
+        Map a requested wrench to non-negative thruster forces.
+
+        Parameters
+        ----------
+        force_body_n   : (3,) desired force in body frame [N]
+        torque_body_nm : (3,) desired torque in body frame [N·m], default zeros
+        excluded       : (n_thrusters,) bool mask — True = thruster locked at 0
+                         (used for chief plume-avoidance)
+        """
         force_body_n = np.asarray(force_body_n, dtype=float)
         if torque_body_nm is None:
             torque_body_nm = np.zeros(3)
@@ -70,7 +143,13 @@ class ThrusterLayout:
 
         free = np.ones(self._A.shape[1], dtype=bool)
         forces = np.zeros(self._A.shape[1])
-        remaining = desired.copy()
+
+        # Lock excluded thrusters at zero before solving
+        if excluded is not None:
+            exc = np.asarray(excluded, dtype=bool)
+            free[exc] = False
+
+        remaining = desired - self._A[:, ~free] @ forces[~free]
 
         for _ in range(self._A.shape[1] + 1):
             if not np.any(free):

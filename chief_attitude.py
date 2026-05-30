@@ -225,3 +225,7 @@ class ChiefAttitude:
     @property
     def omega_body(self) -> np.ndarray:
         return self.omega.copy()
+
+    def omega_eci(self) -> np.ndarray:
+        """Angular rate expressed in ECI frame [rad/s]."""
+        return _rot_matrix(self.q) @ self.omega
