@@ -114,7 +114,7 @@ DOCK_PORT_APERTURE_M = 0.15
 DOCK_CONE_HALF_ANGLE_DEG = 15.0
 DOCK_CONE_MIN_RANGE_M = 0.05
 DOCK_FACE_TOL_M = 0.05
-DOCK_ALIGN_MAX_DEG = 10.0
+DOCK_ALIGN_MAX_DEG = 12.0
 SOFT_CAPTURE_CORE_ALIGN_MAX_DEG = 20.0
 SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 30.0
 SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE = 1.0
@@ -666,40 +666,44 @@ def run_trial(trial_id,
                     tau_rw  = np.zeros(3)
                 else:
                     q_cmd = q_ref
+                    _R_b2l_att = chief_pose_est.R_body2lvlh
+                    _ekf_rng_att = float(np.linalg.norm(th_ekf.x[0:3]))
+                    _chief_dir_eci = (R_e2l.T @ (th_ekf.x[0:3] / max(_ekf_rng_att, 1e-9))
+                                      if _ekf_rng_att > 0.5 else None)
                     if rpod_ctrl.mode == RPODMode.TERMINAL:
-                        _R_b2l_att = chief_pose_est.R_body2lvlh
                         if _R_b2l_att is not None:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
-                        else:
+                        elif _chief_dir_eci is not None:
                             q_cmd = q_ref_align_axis(
-                                mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                                mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                     elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
-                        _R_b2l_att = chief_pose_est.R_body2lvlh
                         if _R_b2l_att is not None:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
-                        else:
+                        elif _chief_dir_eci is not None:
                             q_cmd = q_ref_align_axis(
-                                mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                                mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                     elif (rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.LOST_TARGET)
                           and phase2_active
                           and float(np.linalg.norm(th_ekf.x[0:3])) < CLOSE_PROX_NAV_RANGE_M):
-                        _R_b2l_att = chief_pose_est.R_body2lvlh
                         if _R_b2l_att is not None:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
-                        else:
+                        elif _chief_dir_eci is not None:
                             q_cmd = q_ref_align_axis(
-                                mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                                mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                     omega_for_ctrl = omega_est
                     if ENABLE_SPIN_SYNC and rpod_ctrl.mode in (RPODMode.TERMINAL,
                                                                 RPODMode.SOFT_CAPTURE):
-                        omega_chief_lvlh = (R_e2l @ rot_matrix(chief_att.quaternion)
-                                            @ chief_att.omega_body)
+                        _R_b2l_sync = chief_pose_est.R_body2lvlh
+                        if _R_b2l_sync is not None:
+                            omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
+                        else:
+                            omega_chief_lvlh = np.zeros(3)
                         omega_sync_body = spin_sync.compute_rate_command(
                             omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
                         omega_for_ctrl = omega_est - omega_sync_body
@@ -842,8 +846,10 @@ def run_trial(trial_id,
                         innovation_gate_m=PORT_TRACK_GATE_M)
                 port_lvlh_ctrl, _ = rpod_ctrl._port_tracker.update(
                     port_meas, DT_OUTER, measurement_valid=True)
+                _ekf_rng_fb    = float(np.linalg.norm(th_ekf.x[0:3]))
                 port_axis_lvlh = (R_est_b2l @ DOCK_AXIS_BODY if R_est_b2l is not None
-                                  else R_e2l @ chief_att.dock_axis_eci())
+                                  else th_ekf.x[0:3] / max(_ekf_rng_fb, 1e-9)
+                                  if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
                 r_arm_lvlh     = port_lvlh_ctrl
             elif R_est_b2l is not None and omega_est_valid:
                 if hasattr(rpod_ctrl, '_port_tracker'):

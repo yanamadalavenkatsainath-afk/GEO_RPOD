@@ -1,357 +1,292 @@
-# GEO RPOD Flight Simulation
+# GEO RPOD Python Simulation
 
-High-fidelity Python simulation for GEO rendezvous, proximity operations, and docking (RPOD) of a 50 kg deputy spacecraft approaching a tumbling GEO chief.
+Python reference simulation for GEO rendezvous, proximity operations, and docking
+of a 50 kg servicing deputy approaching a tumbling GEO chief.
 
-The model is an end-to-end GNC reference environment: GEO relative dynamics, environmental disturbances, sensors, attitude estimation, relative navigation, ADCS, Lambert transfer, terminal docking-port targeting, lost-target handling, approach-cone/contact checks, soft/hard capture, and Monte Carlo robustness analysis.
+The current repository is an active engineering sandbox. The core Python stack
+models attitude dynamics, relative navigation, Lambert transfer, PROX_OPS,
+terminal docking-port approach, finite-body checks, soft/hard capture gates,
+Monte Carlo campaigns, and post-run visualization.
 
-This repository is the Python reference model. The embedded C flight-software/SIL implementation lives in the companion `Satellite_GNC` repository.
+> Status: research/prototype simulation. This is not flight-certified software.
 
-> Status: research/prototype GNC simulation. This is not flight-certified software.
+## Current Phase
 
-## Latest Monte Carlo Result
+The current development phase is integration tuning with high-fidelity toggles
+being enabled progressively. The immediate focus is terminal capture stability:
+PROX_OPS reaches terminal, but terminal guidance is being debugged around
+close-range reversal, port targeting, applied thruster acceleration, keep-out
+effects, and navigation velocity estimates.
 
-Reference campaign in this repository: `300` trials, `8` workers
+Current main-run feature state:
 
-Reference result: `299 / 300` docked, `99.7%` docking success
+| Feature | State |
+|---|---|
+| Physical thruster layout | On |
+| Finite-body collision checks | On |
+| Coupled contact dynamics | Off |
+| Body-mounted camera FOV gate | Off in `main.py` |
+| Keep-out avoidance | On |
+| Spin sync | On |
+| Terminal handoff override | `MAIN_TERMINAL_M = 10.0 m` |
+| Terminal nav filter | `alpha=0.25`, `beta=0.02`, `vmax=0.05 m/s`, `gate=0.25 m` |
 
-Reference failure outcome:
+Monte Carlo currently has its own toggle set and should be treated as a campaign
+harness, not the source of truth for single-run tuning until `main.py` and
+`monte_carlo.py` are fully reconciled.
 
-- `ADCS_NOT_CONFIRMED`: `1`
+## Quick Start
 
-Current phase-testing campaign while contact, attitude, camera/FOV, thruster, and keep-out features are being integrated: `20` trials, `1` worker
+Use Python 3.11.
 
-Current phase-test result: `20 / 20` docked, `100.0%` docking success
-
-Current phase-test capture outcomes:
-
-- Soft capture: `20 / 20`
-- Hard strict capture: `20 / 20`
-- Soft certified: `20 / 20`
-- Capture timeout: `0 / 20`
-
-Stress-case pass rate:
-
-| Stress case | Docked | Trials | Pass rate |
-|---|---:|---:|---:|
-| Nominal | 6 | 6 | 100.0% |
-| Camera dropout | 2 | 2 | 100.0% |
-| Gyro bias | 6 | 6 | 100.0% |
-| High pose noise | 3 | 3 | 100.0% |
-| Range dropout | 1 | 1 | 100.0% |
-| Weak thruster | 2 | 2 | 100.0% |
-
-Performance summary:
-
-| Metric | Mean | Std | 5th % | Median | 95th % |
-|---|---:|---:|---:|---:|---:|
-| Total delta-V (m/s) | 3.104 | 1.108 | 2.023 | 2.838 | 5.415 |
-| PROX_OPS delta-V (m/s) | 0.652 | 0.033 | 0.624 | 0.640 | 0.678 |
-| TERMINAL delta-V (m/s) | 2.451 | 1.117 | 1.358 | 2.176 | 4.791 |
-| Time to dock (hr) | 2.302 | 1.355 | 1.556 | 1.913 | 2.979 |
-| Chief tumble (deg/s) | 0.161 | 0.053 | 0.061 | 0.180 | 0.236 |
-| Final port range (m) | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
-| Final port relative speed (m/s) | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
-
-Propellant estimate at `Isp = 220 s` hydrazine:
-
-| Metric | Propellant |
-|---|---:|
-| Mean | 71.8 g |
-| 95th percentile | 125.3 g |
-| Worst case | 130.6 g |
-
-Correlation checks:
-
-- Total delta-V vs chief tumble rate: `+0.309`
-- Total delta-V vs time-to-dock: `+0.027`
-
-Latest generated artifacts:
-
-```text
-monte_carlo_results.npz
-monte_carlo_summary.txt
-monte_carlo_plots.png
+```powershell
+py -3.11 -m pip install -r Requirements.txt
 ```
 
-## Key Figures
+Run one end-to-end simulation:
 
-### Monte Carlo Performance
-
-![GEO RPOD Monte Carlo](monte_carlo_plots.png)
-
-The Monte Carlo plot summarizes delta-V distribution, docking time distribution, stress-case pass rates, outcome counts, mission-duration sensitivity, and final docking-gate margins.
-
-### ADCS / Mode Timeline
-
-![ADCS overview](Figure_1.png)
-
-The ADCS plot shows angular-rate convergence, disturbance torques, eclipse function, reaction-wheel momentum, MEKF pointing error, and FSW mode progression.
-
-### RPOD Trajectory
-
-![RPOD trajectory](Figure_2.png)
-
-The RPOD plot shows LVLH relative motion, truth-vs-EKF position channels, log-range closure, cumulative delta-V, and the final close-approach trajectory into the docking port.
-
-## Mission Scenario
-
-| Item | Value |
-|---|---:|
-| Chief orbit | GEO, `a = 42164 km`, `e = 0.0003`, `i = 0.8 deg` |
-| Chief longitude | `342.0 deg E` |
-| Deputy mass | `50 kg` |
-| Deputy thrust | `1 N` |
-| Deputy max acceleration | `20 mm/s^2` |
-| Initial standoff | `1000 m` trailing |
-| Inner ADCS step | `0.01 s` |
-| RPOD outer-loop step | `0.1 s` |
-| Terminal handoff | `5 m` |
-| Soft-capture port gate | `0.30 m`, `0.05 m/s` |
-| Hard-capture latch gate | `0.08 m`, `0.010 m/s`, held for `5 s` |
-| Docking cone half-angle | `15 deg` |
-| Docking attitude-alignment gate | `10 deg` |
-| Formation-hold EKF settle | `300 s` |
-
-## Architecture
-
-```text
-main.py
-  |
-  +-- environment/
-  |     GEO orbit, CW dynamics, SRP, drag, magnetic field,
-  |     gravity gradient, sun model, chief tumble
-  |
-  +-- plant/
-  |     deputy spacecraft rigid-body attitude dynamics
-  |
-  +-- sensors/
-  |     gyro, magnetometer, sun sensor, star tracker,
-  |     ranging/bearing sensor, camera/PnP-style port sensor
-  |
-  +-- estimation/
-  |     QUEST, MEKF, TH-EKF, chief pose / port tracking
-  |
-  +-- control/
-  |     Lambert transfer, RPOD phase controller, ADCS controller
-  |
-  +-- fsw/
-        high-level mode manager and mission phase logic
+```powershell
+py -3.11 main.py
 ```
 
-## Flight Sequence
+Run a Monte Carlo campaign:
+
+```powershell
+py -3.11 monte_carlo.py --trials 20 --workers 8 --seed 42
+```
+
+Run the post-run visualizer after `main.py` writes telemetry:
+
+```powershell
+py -3.11 visualiser.py
+```
+
+Save visual outputs:
+
+```powershell
+py -3.11 visualiser.py --save visualiser_dashboard.png --animate --save-animation visualiser_replay.gif
+```
+
+Analyze a single-run telemetry file:
+
+```powershell
+py -3.11 tools\analyze_rpod_telemetry.py
+```
+
+Analyze Monte Carlo results:
+
+```powershell
+py -3.11 tools\analyze_mc_results.py
+```
+
+## Main Files
+
+| Path | Purpose |
+|---|---|
+| `main.py` | End-to-end single-run mission simulation and telemetry export |
+| `monte_carlo.py` | Parallel Monte Carlo campaign runner and summary generation |
+| `visualiser.py` | Post-run dashboard, close-range replay, and Earth-orbit replay |
+| `control/lambert_controller.py` | RPOD state machine, Lambert, PROX_OPS, terminal guidance, lost-target handling |
+| `control/attitude_controller.py` | Reaction-wheel attitude controller |
+| `control/keepout_planner.py` | Keep-out-zone acceleration scaffold |
+| `control/spin_sync_controller.py` | Deputy/chief rate matching scaffold |
+| `plant/spacecraft.py` | Deputy rigid-body attitude plant |
+| `plant/thruster_layout.py` | Physical thruster allocation model |
+| `plant/finite_body.py` | Box-body clearance/collision checks |
+| `plant/contact_dynamics.py` | Soft-capture/contact surrogate |
+| `chief_attitude.py` | Tumbling chief and body-fixed docking port |
+| `chief_pose_estimator.py` | Estimated chief pose/rate chain |
+| `estimation/th_ekf.py` | Relative translation EKF |
+| `estimation/mekf.py` | Attitude MEKF |
+| `estimation/terminal_nav_filter.py` | Terminal alpha-beta relative navigation filter |
+| `estimation/port_tracker.py` | Gated close-range port tracker |
+| `sensors/` | Gyro, sun, magnetometer, star tracker, ranging, camera/FOV sensors |
+| `environment/` | GEO orbit, CW dynamics, SRP, drag, magnetic field, gravity gradient, sun model |
+| `fsw/mode_manager.py` | High-level ADCS mode manager |
+| `tools/` | Analysis/report helper scripts |
+
+## Mission Flow
+
+The simulation starts with attitude acquisition, then enables RPOD after ADCS and
+navigation are ready.
 
 ```text
 DETUMBLE
   -> SUN_ACQUISITION
   -> FINE_POINTING
   -> FORMATION_HOLD
-  -> LAMBERT
-  -> PROX_OPS
+  -> LAMBERT / PROX_OPS
   -> TERMINAL
   -> SOFT_CAPTURE
   -> DOCKING
 ```
 
-Major behaviors:
+In the Python implementation, RPOD modes are handled by
+`control/lambert_controller.py` and the top-level phase glue in `main.py`.
 
-- B-dot detumbling reduces initial body rates.
-- QUEST seeds the attitude estimate.
-- MEKF maintains fine pointing using gyro/vector measurements.
-- TH-EKF estimates relative position and velocity.
-- Lambert guidance moves from standoff toward close approach.
-- PROX_OPS uses continuous square-root-law closure.
-- TERMINAL targets the docking port, not just the chief center of mass.
-- SOFT_CAPTURE applies a simple compliant contact response at the port.
-- DOCKING is confirmed only after the hard-capture range/speed gate remains true for the hold time.
+## Current Scenario
 
-## Main Components
+| Item | Current value |
+|---|---:|
+| Chief orbit | GEO, `a = 42164 km`, `e = 0.0003`, `i = 0.8 deg` |
+| Chief longitude | `342 deg E` |
+| Deputy mass | `50 kg` |
+| Deputy thrust | `1 N` |
+| Max ideal acceleration | `20 mm/s^2` |
+| Initial standoff | `1000 m` trailing |
+| Inner ADCS step | `0.01 s` |
+| RPOD outer-loop step | `0.1 s` |
+| Main terminal handoff | `10 m` |
+| Soft-capture gate | `0.30 m`, `0.05 m/s` |
+| Hard-capture gate | `0.08 m`, `0.010 m/s`, held for `5 s` |
+| Soft-capture entry align gate | `30 deg` |
+| Hard docking align gate | `10 deg` |
 
-### Attitude Dynamics And ADCS
-
-The deputy attitude model includes rigid-body rotational dynamics, reaction wheels, magnetorquers, environmental disturbances, and closed-loop pointing control.
-
-Tracked ADCS outputs include:
-
-- angular rate
-- wheel momentum
-- disturbance torques
-- MEKF pointing error
-- FSW mode history
-
-### Relative Dynamics
-
-Relative motion is propagated in LVLH around a GEO chief. The simulation includes mission-relevant GEO perturbation terms such as differential solar radiation pressure and disturbance torques.
-
-### Navigation
-
-Navigation is split into:
-
-- MEKF for attitude and gyro-bias estimation
-- TH-EKF for relative orbit estimation
-- chief pose estimation for docking-port geometry
-- terminal close-range port measurement filtering
-
-Terminal logic uses close-range port measurements when available to reduce late-stage estimator lag and to track the rotating chief docking interface.
-
-### RPOD Guidance
-
-The RPOD controller includes:
-
-- formation hold
-- Lambert transfer
-- PROX_OPS approach
-- TERMINAL docking-port closure
-- lost-target hold/recovery
-- soft-capture contact response
-- hard-capture / docking confirmation
-
-The terminal controller uses a speed-limited range law and a docking-port target derived from chief pose. The current tuning reduces terminal hover waste while keeping final relative speed inside the docking gate. Close-range docking is evaluated against the port frame, not the chief center of mass.
-
-Terminal capture uses four checks:
-
-- port range and port-relative velocity
-- finite chief-body clearance and docking-port aperture
-- approach cone relative to the docking-port axis
-- deputy docking-axis attitude alignment
-
-When the soft-capture gate is met, the simulation applies a damped contact response and transitions to `SOFT_CAPTURE`. The run is declared docked only after the hard-capture gate is held for the configured dwell time.
-
-### Chief Attitude And Docking Port
-
-The chief is modeled as a tumbling target with a body-fixed docking port:
+Chief docking geometry:
 
 ```text
 DOCK_PORT_BODY = [0, 0, 0.5] m
 DOCK_AXIS_BODY = [0, 0, 1]
 ```
 
-The simulation estimates and tracks the port in LVLH during terminal approach. This is one of the key differences between a simple translational rendezvous model and a servicing-relevant 6-DOF RPOD model.
+## Guidance And Navigation
 
-The current model is "6-DOF aware" rather than a full mechanical docking simulator: both spacecraft attitudes and the chief body-fixed docking port are represented, and docking checks use body-frame geometry, approach cone, and alignment. The contact mechanics are intentionally lightweight so the simulation remains suitable for fast Monte Carlo tuning.
+The simulation separates plant truth, sensor generation, estimation, and flight
+software inputs:
 
-## Monte Carlo
+- Plant truth propagates the deputy/chief physical states.
+- Sensors generate noisy measurements from truth.
+- MEKF estimates deputy attitude.
+- TH-EKF estimates relative translation.
+- Chief pose estimation provides docking-port axis/rate information.
+- RPOD guidance receives estimated state, not the truth state.
 
-Run the Monte Carlo campaign:
+Truth is still used for simulation-only scoring, contact/collision checks,
+telemetry error calculations, and sensor measurement generation.
 
-```bat
-python monte_carlo.py --trials 300 --workers 8
+## Terminal Debugging
+
+The current code includes extra terminal debug prints to isolate the close-range
+failure mode.
+
+Useful log lines:
+
+```text
+[TERMDBG ...]
 ```
 
-Outputs:
+Shows terminal guidance intent:
+
+- selected target: port, COM fallback, or sanity fallback
+- velocity along the target line
+- desired velocity along the target line
+- lateral velocity
+- acceleration along the target line
+
+```text
+[PLANTDBG ...]
+```
+
+Shows guidance-versus-plant execution:
+
+- COM and port range
+- COM/port closing velocity
+- commanded versus applied acceleration
+- keep-out contribution
+- physical thruster allocation error
+- navigation position/velocity error
+
+When debugging terminal failure, capture the logs around the first point where
+range reaches roughly `0.3-1.0 m` and then starts increasing again.
+
+## Outputs
+
+Single run outputs:
+
+```text
+rpod_telemetry.npz
+rpod_telemetry_plots.png
+Figure_1.png
+Figure_2.png
+```
+
+Monte Carlo outputs:
 
 ```text
 monte_carlo_results.npz
 monte_carlo_summary.txt
 monte_carlo_plots.png
+mc_results/
 ```
 
-The current Monte Carlo includes nominal and stressed runs:
-
-- camera dropout
-- gyro bias
-- high pose noise
-- range dropout
-- slow detumble
-- weak thruster
-
-The reference 300-run campaign remains the headline robustness result. The current 20-run campaign is phase testing while soft-capture/contact, attitude, camera/FOV, thruster, and keep-out features are being integrated; it reached `20 / 20` docking success with `20 / 20` hard strict captures and no capture timeouts. A larger 100- or 300-run campaign should be regenerated after this integration baseline is frozen.
-
-## Single-Run Simulation
-
-Run the nominal mission:
-
-```bat
-python main.py
-```
-
-Expected outputs:
-
-- console mission timeline
-- docking confirmation if successful
-- ADCS summary figure
-- RPOD trajectory figure
-
-## Requirements
-
-Install Python dependencies:
-
-```bat
-pip install -r Requirements.txt
-```
-
-Core dependencies include:
-
-- `numpy`
-- `scipy`
-- `matplotlib`
-
-The model is developed and exercised on Windows. The Python code is otherwise standard scientific Python.
-
-## Validation Philosophy
-
-This repository is the algorithmic reference for:
-
-- mission feasibility
-- guidance-law tuning
-- estimator behavior
-- docking-port terminal approach
-- Monte Carlo performance
-- embedded C parity and SIL comparison
-
-The companion C implementation should be treated as the embedded flight-software candidate. This Python repository remains the higher-fidelity simulation and analysis environment.
-
-## Current Limitations
-
-This is an engineering simulation, not a certified flight dynamics tool.
-
-Known limitations:
-
-- Contact dynamics are simplified; the model includes soft-capture damping and a hard-capture dwell gate, not detailed latch, ring, petal, or structural dynamics.
-- Docking-port pose is modeled through simulated chief attitude and pose estimation, not a full optical image-processing stack.
-- GEO environmental models are suitable for GNC trade studies, not final mission operations.
-- Thermal, power, communications, plume impingement, and flexible-body dynamics are out of scope.
-- The Monte Carlo campaign covers important stress cases but is not yet a full mission assurance campaign.
-- FDIR is represented at the mode/guidance level; a formal fault tree and FMECA package would still be required for a flight review.
-
-## Next Engineering Steps
-
-Before presenting this as flight-ready GNC software, the next review items are:
-
-1. Version the Monte Carlo configuration with each results file.
-2. Add explicit abort/retreat behavior after prolonged terminal target loss or failed docking-gate convergence.
-3. Expand FDIR/FMECA tables with hazard severity, detection logic, response, and verification test for each fault.
-4. Add a higher-fidelity docking contact model if hardware capture-ring geometry becomes available.
-5. Cross-check Python results against the C SIL after every major guidance or estimator change.
-
-## Relationship To Embedded C Repo
-
-The Python simulation is the reference model. The C flight-software repository implements the embedded/SIL side:
+Visualizer outputs are optional and depend on CLI arguments:
 
 ```text
-Satellite_GNC/
-  src_c/
-  sim_python/
-  tests/
+visualiser_dashboard.png
+visualiser_replay.gif
 ```
 
-The C repo mirrors the key RPOD, TH-EKF, MEKF, ADCS, terminal filtering, port tracking, and mode-manager logic and is verified through C unit tests plus Python closed-loop SIL.
+Generated telemetry, plots, and replay artifacts should generally not be
+committed unless they are intentionally being archived as a result baseline.
 
-## Version Control Notes
+## Monte Carlo CLI
 
-Recommended to commit:
+```powershell
+py -3.11 monte_carlo.py --trials 300 --workers 8 --seed 42 --stress-mode mixed
+```
 
-- source code
-- requirements
-- README
-- `monte_carlo_summary.txt`
-- selected review figures such as `monte_carlo_plots.png`, `Figure_1.png`, and `Figure_2.png`
+Arguments:
 
-Recommended to avoid committing by default:
+| Argument | Meaning |
+|---|---|
+| `--trials` | Number of trials |
+| `--workers` | Parallel worker processes |
+| `--seed` | Master seed |
+| `--outdir` | Output directory |
+| `--stress-mode` | `mixed`, `nominal`, or `sweep` |
 
-- large telemetry CSVs
-- `__pycache__/`
-- temporary plots
-- large raw Monte Carlo archives unless they are part of a tagged result release
+Current stress cases include nominal and degraded runs such as camera dropout,
+gyro bias, high pose noise, range dropout, slow detumble, and weak thruster.
+
+## Development Notes
+
+Recommended workflow:
+
+1. Tune and inspect one run through `main.py`.
+2. Review `TERMDBG` / `PLANTDBG` around terminal reversal.
+3. Run `tools\analyze_rpod_telemetry.py`.
+4. Once a single run is stable, run a 20-trial Monte Carlo.
+5. Only then scale to 100 or 300 trials.
+
+Known active work:
+
+- Reconcile duplicated logic between `main.py` and `monte_carlo.py`.
+- Stabilize terminal port targeting with physical thrusters enabled.
+- Decide when keep-out avoidance should be enabled during terminal tuning.
+- Finish estimate-only FSW cleanup by removing remaining truth-assisted seed/reset paths.
+- Add replay by seed/trial for failed Monte Carlo cases.
+- Add unit/regression tests for contact, thruster allocation, docking geometry, camera dropout, gyro bias, and weak-thruster cases.
+
+## Suggested Git Hygiene
+
+Commit source/config/documentation changes:
+
+```text
+*.py
+README.md
+Requirements.txt
+```
+
+Avoid committing generated artifacts unless preserving a named baseline:
+
+```text
+rpod_telemetry.npz
+*_plots.png
+visualiser_*.png
+*.gif
+monte_carlo_results.npz
+mc_results/
+```
 
 ## Author
 

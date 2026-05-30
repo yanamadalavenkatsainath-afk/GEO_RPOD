@@ -719,45 +719,40 @@ while t < T_SIM_MAX and not docked:
                 tau_rw  = np.zeros(3)
             else:
                 q_cmd = q_ref
+                _R_b2l_att = chief_pose_est.R_body2lvlh
+                # Fallback when pose estimator not converged: point dock axis
+                # toward the estimated chief position (EKF-based, no truth).
+                _ekf_rng_att = float(np.linalg.norm(th_ekf.x[0:3]))
+                _chief_dir_eci = (R_e2l.T @ (th_ekf.x[0:3] / max(_ekf_rng_att, 1e-9))
+                                  if _ekf_rng_att > 0.5 else None)
                 if rpod_ctrl.mode == RPODMode.TERMINAL:
-                    _R_b2l_att = chief_pose_est.R_body2lvlh
                     if _R_b2l_att is not None:
                         q_cmd = q_ref_align_axis(
                             mekf.q, DEP_DOCK_AXIS_BODY,
                             -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
-                    else:
-                        # Pose estimator not yet converged — fall back to truth dock axis.
-                        # This is the same as the pre-refactor behaviour; replaced once
-                        # chief_pose_est accumulates enough PnP frames.
+                    elif _chief_dir_eci is not None:
                         q_cmd = q_ref_align_axis(
-                            mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                            mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                 elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                     # Track the current dock axis continuously — do NOT freeze at capture.
-                    # Frozen q_cmd_at_soft_capture lets the chief rotate away while the
-                    # deputy holds a stale target, causing alignment to oscillate with
-                    # the chief's spin period and never converge to <10°.
-                    _R_b2l_att = chief_pose_est.R_body2lvlh
                     if _R_b2l_att is not None:
                         q_cmd = q_ref_align_axis(
                             mekf.q, DEP_DOCK_AXIS_BODY,
                             -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
-                    else:
+                    elif _chief_dir_eci is not None:
                         q_cmd = q_ref_align_axis(
-                            mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                            mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                 elif (rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.LOST_TARGET)
                       and phase2_active
                       and float(np.linalg.norm(th_ekf.x[0:3])) < CLOSE_PROX_NAV_RANGE_M):
                     # Pre-align dock axis to chief port while still in close PROX_OPS.
-                    # At 5mm/s approach speed the deputy has 3000s to complete any flip
-                    # before TERMINAL entry — prevents the 131° cold-flip that loses camera.
-                    _R_b2l_att = chief_pose_est.R_body2lvlh
                     if _R_b2l_att is not None:
                         q_cmd = q_ref_align_axis(
                             mekf.q, DEP_DOCK_AXIS_BODY,
                             -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
-                    else:
+                    elif _chief_dir_eci is not None:
                         q_cmd = q_ref_align_axis(
-                            mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                            mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                 # else: nadir pointing in FORMATION_HOLD — gimbaled camera handles tracking.
                 omega_for_ctrl = omega_est
                 if ENABLE_SPIN_SYNC and rpod_ctrl.mode in (RPODMode.TERMINAL,
@@ -766,7 +761,7 @@ while t < T_SIM_MAX and not docked:
                     if _R_b2l_sync is not None:
                         omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
                     else:
-                        omega_chief_lvlh = R_e2l @ chief_att.omega_eci()
+                        omega_chief_lvlh = np.zeros(3)
                     omega_sync_body = spin_sync.compute_rate_command(
                         omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
                     omega_for_ctrl = omega_est - omega_sync_body
@@ -956,13 +951,11 @@ while t < T_SIM_MAX and not docked:
             if hasattr(rpod_ctrl, '_port_tracker'):
                 rpod_ctrl._port_tracker.update(
                     np.zeros(3), DT_OUTER, measurement_valid=False)
-            # Pose estimator not converged — fall back to truth port geometry,
-            # consistent with the attitude fallback that already uses chief_att.dock_axis_eci().
-            _port_eci_true  = chief_att.dock_port_eci(chi_pos_m_prev)
-            port_lvlh_ctrl  = R_e2l @ (_port_eci_true - chi_pos_m_prev)
-            _dock_ax_eci    = chief_att.dock_axis_eci()
-            port_axis_lvlh  = R_e2l @ (_dock_ax_eci / max(np.linalg.norm(_dock_ax_eci), 1e-12))
-            r_arm_lvlh      = port_lvlh_ctrl
+            port_lvlh_ctrl = np.zeros(3)
+            _ekf_rng_fb    = float(np.linalg.norm(th_ekf.x[0:3]))
+            port_axis_lvlh = (th_ekf.x[0:3] / _ekf_rng_fb
+                              if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
+            r_arm_lvlh     = np.zeros(3)
 
         port_vel_lvlh = np.cross(omega_est_lvlh, r_arm_lvlh)
         # Append port velocity to guidance state for terminal feedforward

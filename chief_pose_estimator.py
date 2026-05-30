@@ -172,10 +172,10 @@ class ChiefPoseEstimator:
 
         # ── Close-range coast: skip EKF update, refresh port geometry ─
         if true_range < 2.0:
-            # Update rotation matrix from truth so port position stays
-            # current, but do NOT feed the noisy close-range measurement
-            # into the EKF — omega coasts from last valid estimate.
-            self._last_R_b2l = _rot_matrix(q_chief)
+            # Use EKF's propagated attitude as the best available estimate.
+            # The EKF integrates the coasted omega, giving a smooth, noise-free
+            # orientation without any truth dependency.
+            self._last_R_b2l = _rot_matrix(self._q)
             if self._update_count >= 10:
                 self._valid = True
             return self._omega.copy(), self._valid
