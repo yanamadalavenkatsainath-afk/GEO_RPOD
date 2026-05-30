@@ -1379,8 +1379,6 @@ while t < T_SIM_MAX and not docked:
             rpod_ctrl._set_mode(RPODMode.SOFT_CAPTURE, t)
             hard_capture_hold_s = 0.0
             soft_capture_entry_t = t
-            q_cmd_at_soft_capture = q_ref_align_axis(
-                mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
             soft_capture_align_entry_deg = align_geom["align_deg"]
             soft_capture_align_min_deg = align_geom["align_deg"]
             soft_capture_last_log_t = -np.inf

@@ -667,8 +667,14 @@ def run_trial(trial_id,
                 else:
                     q_cmd = q_ref
                     if rpod_ctrl.mode == RPODMode.TERMINAL:
-                        q_cmd = q_ref_align_axis(
-                            mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
+                        _R_b2l_att = chief_pose_est.R_body2lvlh
+                        if _R_b2l_att is not None:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY,
+                                -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                        else:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
                     elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                         _R_b2l_att = chief_pose_est.R_body2lvlh
                         if _R_b2l_att is not None:
@@ -836,7 +842,8 @@ def run_trial(trial_id,
                         innovation_gate_m=PORT_TRACK_GATE_M)
                 port_lvlh_ctrl, _ = rpod_ctrl._port_tracker.update(
                     port_meas, DT_OUTER, measurement_valid=True)
-                port_axis_lvlh = R_e2l @ chief_att.dock_axis_eci()
+                port_axis_lvlh = (R_est_b2l @ DOCK_AXIS_BODY if R_est_b2l is not None
+                                  else R_e2l @ chief_att.dock_axis_eci())
                 r_arm_lvlh     = port_lvlh_ctrl
             elif R_est_b2l is not None and omega_est_valid:
                 if hasattr(rpod_ctrl, '_port_tracker'):
@@ -1084,8 +1091,6 @@ def run_trial(trial_id,
                     soft_capture_t = t
                     soft_capture_align_entry_deg = align_geom["align_deg"]
                     soft_capture_align_min_deg = align_geom["align_deg"]
-                    q_cmd_at_soft_capture = q_ref_align_axis(
-                        mekf.q, DEP_DOCK_AXIS_BODY, -chief_att.dock_axis_eci())
 
             soft_capture_stable = (port_range < SOFT_CAPTURE_RANGE_M
                                    and port_vrel < SOFT_CAPTURE_LATCH_VREL_MS
