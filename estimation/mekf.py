@@ -25,7 +25,7 @@ class MEKF:
         # P_init: 0.1° attitude uncertainty (star tracker acquired)
         #         0.5 deg/hr bias uncertainty (Sensonor STIM300 class)
         att_init_rad = np.radians(0.1)             # 0.1° initial pointing uncertainty
-        bias_init_rads = np.radians(0.5) / 3600.0  # 0.5 deg/hr bias uncertainty
+        bias_init_rads = np.radians(0.5) / 3600.0  # 0.5 deg/hr bias uncertainty (Sensonor STIM300 class)
         self.P = np.eye(6) * att_init_rad**2
         self.P[3:6, 3:6] = np.eye(3) * bias_init_rads**2
 
