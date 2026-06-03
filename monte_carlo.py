@@ -72,79 +72,13 @@ from control.keepout_planner              import KeepoutAvoidancePlanner
 from control.spin_sync_controller         import SpinSyncController
 from fsw.mode_manager                     import ModeManager, Mode
 from utils.quaternion                     import quat_error, rot_matrix
+from utils.docking_metrics                import docking_alignment_metrics, docking_geometry_metrics
+from fsw.capture_gate                     import evaluate_capture, CaptureGateIn
+from sim_config import *
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-# =====================================================================
-#  FIXED MISSION CONFIG  (identical to main.py)
-# =====================================================================
-CHIEF_A_KM      = 42164.0
-CHIEF_E         = 0.0003
-CHIEF_I_DEG     = 0.8
-CHIEF_RAAN_DEG  = 0.0
-CHIEF_OMEGA_DEG = 0.0
-DEP_MASS_KG     = 50.0
-DEP_THRUST_N    = 1.0
-DEP_CR          = 1.5
-DEP_AM          = 0.00720
-CHI_CR          = 1.5
-CHI_AM          = 0.015
-FORMATION_OFFSET_M = np.array([0.0, -1000.0, 0.0])
-DT_OUTER        = 0.1
-DT_INNER        = 0.01
-N_INNER         = int(DT_OUTER / DT_INNER)
-T_SIM_MAX       = 80_000.0
-ADCS_STABLE_DEG = 1.0
-ADCS_STABLE_SUST= 100
-FORM_HOLD_SETTLE_S = 300.0
-DOCK_RANGE_M    = 0.30
-DOCK_VREL_MS    = 0.05
-SOFT_CAPTURE_RANGE_M = DOCK_RANGE_M
-SOFT_CAPTURE_VREL_MS = DOCK_VREL_MS
-HARD_CAPTURE_RANGE_M = 0.08
-HARD_CAPTURE_VREL_MS = 0.010
-HARD_CAPTURE_HOLD_S  = 4.0
-SOFT_CAPTURE_HOLD_S  = 5.0
-SOFT_CAPTURE_LATCH_VREL_MS = 0.030
-SOFT_CAPTURE_MAX_HOLD_S = 1200.0
-CHIEF_BODY_HALF_EXTENTS_M = np.array([0.80, 0.80, 0.50])
-DOCK_PORT_APERTURE_M = 0.15
-DOCK_CONE_HALF_ANGLE_DEG = 15.0
-DOCK_CONE_MIN_RANGE_M = 0.05
-DOCK_FACE_TOL_M = 0.05
-DOCK_ALIGN_MAX_DEG = 12.0
-SOFT_CAPTURE_CORE_ALIGN_MAX_DEG = 20.0
-SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 30.0
-SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE = 1.0
-SOFT_CAPTURE_RESTITUTION = 0.10
-SOFT_CAPTURE_TANGENTIAL_DAMPING = 0.30
-ENABLE_PHYSICAL_THRUSTER_LAYOUT = False
-THRUSTER_MAX_FORCE_N = 0.25
-ENABLE_FINITE_BODY_COLLISION = False
-DEPUTY_BODY_HALF_EXTENTS_M = np.array([0.30, 0.30, 0.40])
-ENABLE_COUPLED_CONTACT_DYNAMICS = True
-ENABLE_BODY_MOUNTED_CAMERA_FOV = True
-ENABLE_KEEP_OUT_AVOIDANCE = True
-ENABLE_SPIN_SYNC = True
-CHIEF_MASS_KG = 3000.0
-SIGMA_V_DOPPLER = 0.005
-TERM_NAV_ALPHA   = 0.25
-TERM_NAV_BETA    = 0.02
-TERM_NAV_VMAX_MS = 0.05
-TERM_NAV_GATE_M  = 0.25
-PORT_TRACK_ALPHA  = 0.40
-PORT_TRACK_GATE_M = 0.25
-CLOSE_PROX_NAV_RANGE_M = 20.0
-ECLIPSE_NU_MIN  = 0.1
-DOCK_PORT_BODY  = np.array([0.0, 0.0, 0.5])
-DOCK_AXIS_BODY  = np.array([0.0, 0.0, 1.0])
-DEP_DOCK_AXIS_BODY = np.array([0.0, 0.0, 1.0])
-MU_GEO          = 3.986004418e14
-N_GEO           = np.sqrt(MU_GEO / (CHIEF_A_KM * 1e3)**3)
-I_SC            = np.diag([4.167, 4.167, 3.000])
-MAIN_TERMINAL_M = 10.0   # raised from 5m: CW orbit-trap at ~6m prevented reaching 5m
 
 MC_STRESS_CASES = (
     "nominal",
@@ -291,60 +225,6 @@ def q_ref_align_axis(q_current, body_axis, desired_axis_eci):
     return quat_from_rot_matrix(R_delta @ R_current)
 
 
-def docking_alignment_metrics(R_dep_body_to_lvlh, port_axis_lvlh):
-    dep_axis = R_dep_body_to_lvlh @ DEP_DOCK_AXIS_BODY
-    dep_axis /= max(np.linalg.norm(dep_axis), 1e-12)
-    desired_axis = -port_axis_lvlh
-    desired_axis /= max(np.linalg.norm(desired_axis), 1e-12)
-    align_deg = float(np.degrees(np.arccos(
-        np.clip(np.dot(dep_axis, desired_axis), -1.0, 1.0))))
-    return {
-        "ok": bool(align_deg <= DOCK_ALIGN_MAX_DEG),
-        "align_deg": align_deg,
-    }
-
-
-def docking_geometry_metrics(dep_lvlh, R_body_to_lvlh):
-    axis_body = DOCK_AXIS_BODY / max(np.linalg.norm(DOCK_AXIS_BODY), 1e-12)
-    dep_body = R_body_to_lvlh.T @ dep_lvlh
-    port_to_dep_body = dep_body - DOCK_PORT_BODY
-    port_range = float(np.linalg.norm(port_to_dep_body))
-    axial = float(np.dot(port_to_dep_body, axis_body))
-    lateral_vec = port_to_dep_body - axial * axis_body
-    lateral = float(np.linalg.norm(lateral_vec))
-
-    inside_body = bool(np.all(np.abs(dep_body) < CHIEF_BODY_HALF_EXTENTS_M))
-    on_dock_face = dep_body[2] > CHIEF_BODY_HALF_EXTENTS_M[2] - DOCK_FACE_TOL_M
-    in_aperture = lateral <= DOCK_PORT_APERTURE_M
-    body_clear = (not inside_body) or (on_dock_face and in_aperture)
-    capture_core = port_range <= DOCK_CONE_MIN_RANGE_M and in_aperture
-
-    if port_range <= 1e-9:
-        cone_angle_deg = 0.0
-    else:
-        cos_ang = np.clip(axial / port_range, -1.0, 1.0)
-        cone_angle_deg = float(np.degrees(np.arccos(cos_ang)))
-
-    cone_ok = capture_core or (axial > 0.0
-                               and cone_angle_deg <= DOCK_CONE_HALF_ANGLE_DEG)
-    cone_error_deg = max(0.0, cone_angle_deg - DOCK_CONE_HALF_ANGLE_DEG)
-    if capture_core:
-        cone_error_deg = 0.0
-
-    return {
-        "ok": bool(body_clear and cone_ok and in_aperture),
-        "body_clear": bool(body_clear),
-        "cone_ok": bool(cone_ok),
-        "in_aperture": bool(in_aperture),
-        "capture_core": bool(capture_core),
-        "inside_body": inside_body,
-        "lateral_m": lateral,
-        "axial_m": axial,
-        "cone_angle_deg": cone_angle_deg,
-        "cone_error_deg": cone_error_deg,
-    }
-
-
 def propagate_full_force(pos, vel, dt_total, t_abs, Cr, Am, substep=60.0):
     J2 = 1.08263e-3;  RE = 6.3781e6
     AU = 1.495978707e11;  P0 = 4.56e-6
@@ -472,7 +352,7 @@ def run_trial(trial_id,
         restitution=SOFT_CAPTURE_RESTITUTION,
         tangential_damping=SOFT_CAPTURE_TANGENTIAL_DAMPING,
         capture_vrel_ms=SOFT_CAPTURE_VREL_MS)
-    thruster_layout = ThrusterLayout.box_16(
+    thruster_layout = ThrusterLayout.box_24(  # box_16 had no ±Z; dock axis is body-Z → 10% alloc efficiency
         half_extents_m=(0.30, 0.30, 0.40),
         max_force_n=THRUSTER_MAX_FORCE_N)
     body_pair = FiniteBodyPair(
@@ -1056,23 +936,34 @@ def run_trial(trial_id,
                 R_chief_to_world=R_body_to_lvlh_d,
                 deputy_com_world=true_cw_pos,
                 R_deputy_to_world=R_dep_body_to_lvlh_d)
+            # Use dock_geom["body_clear"] — matches main.py.
+            # body_clear=True when deputy COM is above the dock face even if
+            # lower body corners penetrate the chief box (valid during final
+            # approach through the aperture). raw finite_body["collision"] is
+            # too conservative and causes false blocks.
             finite_body_ok = ((not ENABLE_FINITE_BODY_COLLISION)
-                              or not finite_body["collision"])
-            soft_core_ready = (dock_geom["capture_core"]
-                               and align_geom["align_deg"] <= SOFT_CAPTURE_CORE_ALIGN_MAX_DEG)
-            # Match main.py: soft capture is the compliant contact latch.
-            # Strict cone/alignment certification is diagnostic here; do not
-            # let it block a translationally clean port capture.
-            soft_capture_ready = (port_range < SOFT_CAPTURE_RANGE_M
-                                  and port_vrel < SOFT_CAPTURE_VREL_MS
-                                  and finite_body_ok
-                                  and align_geom.get("align_deg", 0.0)
-                                  < SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG)
-            hard_capture_ready = (port_range < HARD_CAPTURE_RANGE_M
-                                  and port_vrel < HARD_CAPTURE_VREL_MS
-                                  and dock_geom["ok"]
-                                  and finite_body_ok
-                                  and align_geom["ok"])
+                              or dock_geom["body_clear"])
+            _cg = evaluate_capture(CaptureGateIn(
+                port_range_m   = port_range,
+                port_vrel_ms   = port_vrel,
+                align_deg      = (attitude_align_deg_cmd if attitude_align_deg_cmd is not None
+                                  else float('nan')),
+                body_clear     = finite_body_ok,
+                capture_core   = dock_geom["capture_core"],
+                geometry_ok    = dock_geom["ok"],
+                align_ok       = align_geom["ok"],
+                soft_capture_range_m             = SOFT_CAPTURE_RANGE_M,
+                soft_capture_vrel_ms             = SOFT_CAPTURE_VREL_MS,
+                soft_capture_entry_align_max_deg = SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG,
+                soft_capture_latch_vrel_ms       = SOFT_CAPTURE_LATCH_VREL_MS,
+                soft_capture_core_align_max_deg  = SOFT_CAPTURE_CORE_ALIGN_MAX_DEG,
+                hard_capture_range_m             = HARD_CAPTURE_RANGE_M,
+                hard_capture_vrel_ms             = HARD_CAPTURE_VREL_MS,
+                dock_align_max_deg               = DOCK_ALIGN_MAX_DEG,
+            ))
+            soft_core_ready    = _cg.soft_core_ready
+            soft_capture_ready = _cg.soft_capture_ready
+            hard_capture_ready = _cg.hard_capture_ready
 
             if rpod_ctrl.mode == RPODMode.TERMINAL and soft_capture_ready:
                 if port_range > 1e-6:
@@ -1116,15 +1007,11 @@ def run_trial(trial_id,
                     soft_capture_align_entry_deg = align_geom["align_deg"]
                     soft_capture_align_min_deg = align_geom["align_deg"]
 
-            soft_capture_stable = (port_range < SOFT_CAPTURE_RANGE_M
-                                   and port_vrel < SOFT_CAPTURE_LATCH_VREL_MS
-                                   and finite_body_ok)
+            soft_capture_stable    = _cg.soft_capture_stable
+            soft_capture_certified = _cg.soft_capture_certified
             if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                 soft_capture_align_min_deg = min(soft_capture_align_min_deg,
                                                  align_geom["align_deg"])
-            soft_capture_certified = (soft_capture_stable
-                                      and soft_core_ready
-                                      and align_geom["align_deg"] <= DOCK_ALIGN_MAX_DEG)
             capture_hold_ready = (rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
                                   and (hard_capture_ready or soft_capture_certified))
             last_capture_diag = {

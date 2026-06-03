@@ -17,8 +17,17 @@ telemetry.csv
 *.csv
 *.log
 rpod_telemetry.npz
+rpod_telemetry_plots.png
+Figure_*.png
+monte_carlo_results.npz
+monte_carlo_summary.txt
+monte_carlo_plots.png
+mc_results/
 visualiser_dashboard.png
 visualiser_replay.gif
+visualiser_*.png
+*.gif
+.pytest_cache/
 
 # Local Monte Carlo debug runs
 _mc*/
@@ -34,6 +43,7 @@ control/nmc_guidance.py
 *.ipynb
 
 # IDE
+.claude/
 .vscode/
 .idea/
 *.sublime-project

@@ -4,6 +4,13 @@ GEO Proximity Operations Controller — Lambert + Continuous PD
 Sequence:
   FORMATION_HOLD → LAMBERT (burn-1 + coast + burn-2) → PROX_OPS → TERMINAL → DOCKING
 
+Portability note
+----------------
+* _prox_ops() and _terminal() are thin wrappers around the pure kernels in
+  fsw/rpod_guidance.py.  Port those pure functions to C, not this class.
+* Lines tagged [TRUTH] are sim-only (EKF resets from truth state) and must
+  NOT be ported.
+
 Key design decisions
 --------------------
 * EKF/navigation state is used for mode transitions and guidance.
@@ -31,6 +38,8 @@ Fixes applied
 
 import numpy as np
 from enum import Enum, auto
+from fsw.rpod_guidance import prox_ops_accel, terminal_accel
+from spec.rpod_state import TerminalState
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lambert_solver import LambertSolver
@@ -115,6 +124,9 @@ class GEORPODController:
 
         # Replan counter — used for diagnostics
         self._lam_replan_count = 0
+
+        # Terminal guidance sub-state (explicit struct — maps to C TerminalState)
+        self._term_state = TerminalState()
 
     # ─────────────────────────────────────────────────────────────────
     # Public API
@@ -536,73 +548,28 @@ class GEORPODController:
         return accel
 
     def _prox_ops(self, state, truth_range, t, port_lvlh=None, port_axis_lvlh=None):
-        """
-        Close from FAR_FIELD_M to TERMINAL_M.
-
-        truth_range is the navigation/EKF range passed in from compute().
-
-        On PROX_OPS → TERMINAL transition, range is recomputed from
-        state[:3] at that exact moment to avoid stale caller value.
-        """
-        # ── Transition check — use truth_range from caller ────────────
+        """Thin wrapper — delegates to fsw/rpod_guidance.py:prox_ops_accel()."""
         if truth_range < TERMINAL_M:
             print(f"  PROX_OPS → TERMINAL  truth_range={truth_range:.4f}m")
             self._set_mode(RPODMode.TERMINAL, t)
-            if hasattr(self, '_term_entry_v'):
-                del self._term_entry_v   # force re-init of entry brake
             return self._terminal(state, t, port_lvlh=port_lvlh,
                                   port_axis_lvlh=port_axis_lvlh)
-
-        # Deadband — docked/very close, just hold
         if truth_range < 0.20:
             return np.zeros(3)
 
-        pos = state[:3]
-        vel = state[3:6]
+        accel = prox_ops_accel(state[:3], state[3:6], self.accel_max)
 
-        # ── EKF range drives both speed and direction (consistent) ────
-        import math
-        rng_ekf = float(np.linalg.norm(pos))
-        if rng_ekf < 1e-3:
-            pos_hat = np.array([0., -1., 0.])
-        else:
-            pos_hat = pos / rng_ekf
-
-        # ── Desired closing speed: sqrt law from EKF range ────────────
-        k_sqrt  = 0.200 / math.sqrt(500.0)
-        v_close = k_sqrt * math.sqrt(max(rng_ekf, 0.1))
-        v_close = min(v_close, 0.200)
-        if rng_ekf < 10.0:
-            v_close = min(v_close, 0.005)
-
-        # ── Velocity controller — no feedforward ─────────────────────
-        # The hardcoded SRP feedforward was wrong in sign AND direction.
-        # Chief Am=0.015 vs deputy Am=0.0072 — chief is pushed harder,
-        # so differential SRP actually helps closure, not hurts it.
-        # Direction rotates with the sun; any constant is mostly wrong.
-        # With 20mm/s^2 authority vs 53nm/s^2 disturbance (ratio 377000:1)
-        # the velocity error controller rejects it trivially.
-        vel_des  = -pos_hat * v_close
-        vel_err  = vel - vel_des
-        accel    = -vel_err / PROX_TAU
-
-        mag = np.linalg.norm(accel)
-        if mag > self.accel_max:
-            accel *= self.accel_max / mag
-
-        # ── Verbose diagnostics every 100s ───────────────────────────
+        # ── Diagnostics (sim only — not ported) ──────────────────────
         t_slot = int(round(t / 100.0))
         if not hasattr(self, '_last_diag_t') or t_slot != self._last_diag_t:
             self._last_diag_t = t_slot
-            v_closing_actual  = -np.dot(pos_hat, vel)
-            accel_before_clip = np.linalg.norm(-vel_err / PROX_TAU)
-            clipped           = accel_before_clip > self.accel_max
+            rng_ekf = float(np.linalg.norm(state[:3]))
+            pos_hat = state[:3] / max(rng_ekf, 1e-3)
+            v_closing_actual = -float(np.dot(pos_hat, state[3:6]))
             print(f"  [PROX t={t:.0f}s]"
                   f"  rng_truth={truth_range:.1f}m  rng_ekf={rng_ekf:.1f}m"
-                  f"  v_des={v_close*1e3:.2f}mm/s  v_act={v_closing_actual*1e3:.2f}mm/s"
-                  f"  vel=[{vel[0]*1e3:.2f},{vel[1]*1e3:.2f},{vel[2]*1e3:.2f}]mm/s"
-                  f"  |accel|={np.linalg.norm(accel)*1e6:.1f}µm/s²"
-                  f"  {'CLIPPED' if clipped else 'ok'}")
+                  f"  v_act={v_closing_actual*1e3:.2f}mm/s"
+                  f"  |accel|={np.linalg.norm(accel)*1e6:.1f}µm/s²")
 
         return accel
 
@@ -612,151 +579,41 @@ class GEORPODController:
 
     def _terminal(self, state, t, port_lvlh=None, port_axis_lvlh=None,
                   attitude_align_deg=None):
-        """
-        Terminal guidance: direct port targeting with speed law.
+        """Thin wrapper — delegates to fsw/rpod_guidance.py:terminal_accel()."""
+        DT_DIAG = 25.0
 
-        Strategy
-        --------
-        Target the docking PORT directly (not CoM).
-        Port position = port_lvlh (passed from main loop each step).
-        Speed law: v_des = K_SPEED * port_range, capped at V_MAX_MS.
-        Inside DOCK_RANGE_M: cap speed at V_CAPTURE_MS, but keep closing
-        through estimator noise until the truth-side dock gate terminates.
-
-        Entry brake: if arriving with |v| > 30mm/s, hard-brake first.
-
-        Debug prints every DT_DIAG seconds showing:
-          com_range, port_range, target (CoM or PORT), v_des, v_actual,
-          |vel|, |accel|, pos_lvlh — everything needed to diagnose issues.
-        """
-        V_MAX_MS     = 0.025   # m/s  25mm/s terminal max
-        V_CAPTURE_MS = 0.0015  # m/s  1.5mm/s inside capture sphere
-        DOCK_RANGE_M = 0.30    # m    capture zone
-        DOCK_DONE_M  = 0.20    # m    docking complete
-        import math
-        K_SQRT       = V_MAX_MS / math.sqrt(max(TERMINAL_M, 0.1))
-        DT_DIAG      = 25.0    # s    diagnostic print interval
-
-        pos = state[0:3]
-        vel = state[3:6]
-
-        com_range  = float(np.linalg.norm(pos))
-
-        # ── TAU gain scheduling: overdamped below 0.3m ───────────────
-        if com_range < 0.30:
-            TAU = 10.0
-        elif com_range < 0.60:
-            TAU = 8.0
-        else:
-            TAU = 6.0
-
-        # ── EKF spike guard ───────────────────────────────────────────
-        # port_lvlh = EKF_pos + ~0.5m body offset. When EKF spikes to
-        # 5-27m, port_lvlh points to a phantom and guidance chases it
-        # at full thrust. In TERMINAL (CoM <0.8m) the port is physically
-        # at most ~1.5m from the deputy. If the candidate port is further
-        # than 2m, fall back to CoM (origin) — safe because CoM closure
-        # brings deputy within capture distance of the actual port.
-        _PORT_SANITY_M = 2.0
-        if port_lvlh is not None and np.linalg.norm(port_lvlh) > 1e-6:
-            _cand_range = float(np.linalg.norm(port_lvlh - pos))
-            port = port_lvlh if _cand_range < _PORT_SANITY_M else np.zeros(3)
-            port_source = "PORT" if _cand_range < _PORT_SANITY_M else "COM_SANITY"
-        else:
-            port = np.zeros(3)
-            port_source = "COM_NO_PORT"
-        port_range = float(np.linalg.norm(port - pos))
-
-        # ── Entry velocity brake — resets each TERMINAL entry ─────────
-        # Use _mode_entry_t to detect fresh entry (not just first call).
-        _entry_key = int(getattr(self, '_mode_entry_t', -1))
-        if not hasattr(self, '_term_entry_key') or self._term_entry_key != _entry_key:
-            self._term_entry_key = _entry_key
-            self._term_entry_v   = np.linalg.norm(vel)
-            self._term_braking   = self._term_entry_v > 2 * V_MAX_MS  # brake only if >2×V_MAX (50mm/s)
-            self._term_diag_t    = -999.0
-            # ── Covariance reset at TERMINAL entry (Point 3) ──────────
-            # Zero off-diagonal P terms so filter forgets 500m approach history.
-            # This is the "estimator reset at 1m mark" from the GNC advice.
+        # ── [TRUTH] EKF covariance reset at TERMINAL entry ───────────
+        # Zeroes position-velocity cross terms so the filter forgets the
+        # 500m approach history. Sim-only: uses truth-seeded filter ref.
+        # DO NOT PORT to C FSW.
+        if self._term_state.entry_key != int(self._mode_entry_t):
             if hasattr(self, '_th_ekf_ref'):
                 ekf = self._th_ekf_ref
-                ekf.P[0:3, 3:6] = 0.0
-                ekf.P[3:6, 0:3] = 0.0
-            print(f"  [TERM t={t:.0f}s]  ENTRY  |v|={self._term_entry_v*1e3:.1f}mm/s  "
-                  f"com_range={com_range:.3f}m  port_range={port_range:.3f}m  "
-                  f"port_lvlh={port}")
+                ekf.P[0:3, 3:6] = 0.0   # [TRUTH]
+                ekf.P[3:6, 0:3] = 0.0   # [TRUTH]
 
-        if self._term_braking:
-            accel = -vel / 1.0
-            mag   = np.linalg.norm(accel)
-            if mag > self.accel_max:
-                accel *= self.accel_max / mag
-            if np.linalg.norm(vel) < 0.010:
-                self._term_braking = False
-                print(f"  [TERM t={t:.0f}s]  BRAKE_DONE  "
-                      f"|v|={np.linalg.norm(vel)*1e3:.1f}mm/s  "
-                      f"com_range={com_range:.3f}m  port_range={port_range:.3f}m")
-            else:
-                t_slot = int(t / DT_DIAG)
-                if t_slot != self._term_diag_t:
-                    self._term_diag_t = t_slot
-                    print(f"  [TERM t={t:.0f}s]  BRAKING  "
-                          f"|v|={np.linalg.norm(vel)*1e3:.1f}mm/s  "
-                          f"com={com_range:.3f}m  port={port_range:.3f}m  "
-                          f"|accel|={np.linalg.norm(accel)*1e6:.1f}µm/s2")
-            return accel
+        accel = terminal_accel(
+            pos          = state[0:3],
+            vel          = state[3:6],
+            port_lvlh    = port_lvlh,
+            accel_max    = self.accel_max,
+            mode_entry_t = self._mode_entry_t,
+            state        = self._term_state,
+        )
 
-        # ── Target port directly ──────────────────────────────────────
-        # port_lvlh is the pose-estimated dock-port location from main.py.
-        # Drive straight to port. Speed law on com_range (monotonic).
-        # When port_range < DOCK_RANGE_M → creep at capture speed to docking.
-        if port_range > 0.001:
-            tgt_hat   = (port - pos) / port_range
-            tgt_range = port_range
-        else:
-            # No port info — close on CoM
-            tgt_hat   = -pos / max(com_range, 1e-6)
-            tgt_range = com_range
-
-        v_des_mag = min(K_SQRT * math.sqrt(max(com_range, 0.001)), V_MAX_MS)
-        if tgt_range < DOCK_RANGE_M:
-            v_des_mag = min(v_des_mag, V_CAPTURE_MS)
-
-        if attitude_align_deg is None or not np.isfinite(attitude_align_deg):
-            align_deg = float("nan")
-        else:
-            align_deg = float(attitude_align_deg)
-        align_scale = 1.0
-
-        vel_des = tgt_hat * v_des_mag
-
-        port_hat = tgt_hat
-
-        accel = (vel_des - vel) / TAU
-        mag   = np.linalg.norm(accel)
-        if mag > self.accel_max:
-            accel *= self.accel_max / mag
-
-        # ── Diagnostic every DT_DIAG seconds ──────────────────────
+        # ── Diagnostics (sim only — not ported) ──────────────────────
         t_slot = int(t / DT_DIAG)
-        if t_slot != self._term_diag_t:
+        if not hasattr(self, '_term_diag_t') or t_slot != self._term_diag_t:
             self._term_diag_t = t_slot
-            v_cl_port = float(np.dot(port_hat if port_range > 0.001
-                                     else np.zeros(3), vel))
-            v_des_along = float(np.dot(port_hat, vel_des))
-            v_err_along = float(np.dot(port_hat, vel_des - vel))
-            accel_along = float(np.dot(port_hat, accel))
-            vel_lat = vel - port_hat * float(np.dot(port_hat, vel))
-            print(f"  [TERMDBG t={t:.0f}s] target={port_source} "
-                  f"v_along={v_cl_port*1e3:.2f}mm/s "
-                  f"v_des_along={v_des_along*1e3:.2f}mm/s "
-                  f"v_err={v_err_along*1e3:.2f}mm/s "
-                  f"v_lat={np.linalg.norm(vel_lat)*1e3:.2f}mm/s "
-                  f"a_along={accel_along*1e6:.1f}um/s2")
+            com_range  = float(np.linalg.norm(state[0:3]))
+            port_range = float(np.linalg.norm(
+                (port_lvlh if port_lvlh is not None else np.zeros(3)) - state[0:3]))
+            align_deg  = (float(attitude_align_deg)
+                          if attitude_align_deg is not None
+                          and np.isfinite(attitude_align_deg) else float("nan"))
             print(f"  [TERM t={t:.0f}s]  "
                   f"com={com_range:.4f}m  port={port_range:.4f}m  "
-                  f"v_des={v_des_mag*1e3:.3f}mm/s  align={align_deg:.1f}deg  "
-                  f"scale={align_scale:.2f}  "
+                  f"align={align_deg:.1f}deg  braking={self._term_state.braking}  "
                   f"|accel|={np.linalg.norm(accel)*1e6:.1f}µm/s2")
 
         return accel
