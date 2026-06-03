@@ -152,8 +152,8 @@ ENABLE_PHYSICAL_THRUSTER_LAYOUT = True
 THRUSTER_MAX_FORCE_N = 0.25
 ENABLE_FINITE_BODY_COLLISION = True
 DEPUTY_BODY_HALF_EXTENTS_M = np.array([0.30, 0.30, 0.40])
-ENABLE_COUPLED_CONTACT_DYNAMICS = False
-ENABLE_BODY_MOUNTED_CAMERA_FOV = False   # disabled: dock-axis alignment anti-aligns camera when chief dock faces deputy
+ENABLE_COUPLED_CONTACT_DYNAMICS = True
+ENABLE_BODY_MOUNTED_CAMERA_FOV = True
 ENABLE_KEEP_OUT_AVOIDANCE = True
 ENABLE_SPIN_SYNC = True
 CHIEF_MASS_KG = 3000.0
@@ -451,7 +451,7 @@ body_pair = FiniteBodyPair(
     deputy_body=BoxBody(DEPUTY_BODY_HALF_EXTENTS_M, name="deputy"))
 body_camera = GimbaledTrackingCamera(
     center_body=DEP_DOCK_AXIS_BODY,
-    gimbal_range_deg=110.0,
+    gimbal_range_deg=150.0,
     max_range_m=5000.0)
 keepout_planner = KeepoutAvoidancePlanner(
     zones=KeepoutAvoidancePlanner.default_appendage_zones())
@@ -519,6 +519,7 @@ capture_timeout_detail = ""
 ekf_coast_active = False    # True while on a Lambert coast arc
 th_ekf_pos_prev  = np.zeros(3)  # EKF position from previous step for Doppler
 thruster_torque_body_pending = np.zeros(3)
+latch_engaged    = False         # True once soft-capture latch confirms contact
 _prev_rpod_mode  = None          # tracks mode transitions for EKF reseeding
 
 # Telemetry
@@ -757,14 +758,21 @@ while t < T_SIM_MAX and not docked:
                 omega_for_ctrl = omega_est
                 if ENABLE_SPIN_SYNC and rpod_ctrl.mode in (RPODMode.TERMINAL,
                                                             RPODMode.SOFT_CAPTURE):
-                    _R_b2l_sync = chief_pose_est.R_body2lvlh
-                    if _R_b2l_sync is not None:
-                        omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
-                    else:
-                        omega_chief_lvlh = np.zeros(3)
-                    omega_sync_body = spin_sync.compute_rate_command(
-                        omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
-                    omega_for_ctrl = omega_est - omega_sync_body
+                    # Gate spin sync in SOFT_CAPTURE: if alignment has diverged
+                    # past 75° the geometry is unfavorable and spin sync actively
+                    # opposes convergence — fall back to pure attitude tracking.
+                    _spin_sync_ok = (rpod_ctrl.mode != RPODMode.SOFT_CAPTURE
+                                     or attitude_align_deg_cmd is None
+                                     or attitude_align_deg_cmd < 30.0)
+                    if _spin_sync_ok:
+                        _R_b2l_sync = chief_pose_est.R_body2lvlh
+                        if _R_b2l_sync is not None:
+                            omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
+                        else:
+                            omega_chief_lvlh = np.zeros(3)
+                        omega_sync_body = spin_sync.compute_rate_command(
+                            omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
+                        omega_for_ctrl = omega_est - omega_sync_body
                 tau_rw, _ = att_ctrl.compute(mekf.q, omega_for_ctrl, q_cmd)
                 if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                     tau_rw *= SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE
@@ -988,6 +996,9 @@ while t < T_SIM_MAX and not docked:
             cam_lost=cam_sensor.is_lost,
             port_axis_lvlh=port_axis_lvlh,
             attitude_align_deg=attitude_align_deg_cmd)
+        if latch_engaged:
+            accel_cmd  = np.zeros(3)
+            impulse_dv = None
         accel_guidance_cmd = accel_cmd.copy()
         keepout_accel_dbg = np.zeros(3)
         if ENABLE_KEEP_OUT_AVOIDANCE:
@@ -1184,7 +1195,8 @@ while t < T_SIM_MAX and not docked:
             cam_view = body_camera.visibility(
                 target_from_deputy_world=-true_cw_pos,
                 R_body_to_world=R_dep_body_to_lvlh_nav)
-            if ENABLE_BODY_MOUNTED_CAMERA_FOV and not cam_view["visible"]:
+            if (ENABLE_BODY_MOUNTED_CAMERA_FOV and _in_terminal
+                    and not cam_view["visible"]):
                 z_cam, R_cam = None, cam_sensor._noise_cov(np.linalg.norm(true_cw_pos))
                 cam_sensor._mark(False)
             else:
@@ -1281,8 +1293,7 @@ while t < T_SIM_MAX and not docked:
             port_lvlh_dock)
         dep_to_port    = true_cw_pos - port_lvlh_dock
         rel_vel_port   = true_cw_vel - port_vel_dock
-        if (rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
-                and not ENABLE_COUPLED_CONTACT_DYNAMICS):
+        if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
             latch_pos_dv_lvlh, latch_dv_lvlh, _ = contact_model.ideal_latch(
                 dep_to_port, rel_vel_port, DEP_MASS_KG)
             dep_pos_eci += R_e2l.T @ latch_pos_dv_lvlh
@@ -1361,14 +1372,21 @@ while t < T_SIM_MAX and not docked:
                     R_chief_body_to_world=R_body_to_lvlh_dock)
                 sc.omega += contact.deputy_delta_omega
                 chief_att.omega += contact.chief_delta_omega
+                # Latch engages if contact conditions met — zero translational
+                # relative velocity so the spacecraft doesn't bounce away.
+                if contact.captured:
+                    impact_dv_lvlh = -rel_vel_port
+                else:
+                    impact_dv_lvlh = contact.rel_vel_after - rel_vel_port
             else:
                 # Idealized baseline latch: remove all port-relative motion.
                 # Restitution/bounce is reserved for coupled contact dynamics.
                 _, _, contact = contact_model.ideal_latch(
                     dep_to_port, rel_vel_port, DEP_MASS_KG)
-            impact_dv_lvlh = contact.rel_vel_after - rel_vel_port
+                impact_dv_lvlh = contact.rel_vel_after - rel_vel_port
             dep_vel_eci += R_e2l.T @ impact_dv_lvlh
             true_cw_vel += impact_dv_lvlh
+            latch_engaged = contact.captured
             rpod_ctrl._set_mode(RPODMode.SOFT_CAPTURE, t)
             hard_capture_hold_s = 0.0
             soft_capture_entry_t = t

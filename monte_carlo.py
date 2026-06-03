@@ -55,7 +55,7 @@ from sensors.sun_sensor                   import SunSensor
 from sensors.star_tracker                 import StarTracker
 from sensors.ranging_sensor               import RangingBearingSensor
 from sensors.camera_sensor                import CameraSensor
-from sensors.body_camera                  import BodyMountedCamera
+from sensors.body_camera                  import GimbaledTrackingCamera
 from actuators.reaction_wheel             import ReactionWheel
 from actuators.magnetorquer               import Magnetorquer
 from actuators.bdot                       import BDotController
@@ -124,8 +124,8 @@ ENABLE_PHYSICAL_THRUSTER_LAYOUT = False
 THRUSTER_MAX_FORCE_N = 0.25
 ENABLE_FINITE_BODY_COLLISION = False
 DEPUTY_BODY_HALF_EXTENTS_M = np.array([0.30, 0.30, 0.40])
-ENABLE_COUPLED_CONTACT_DYNAMICS = False
-ENABLE_BODY_MOUNTED_CAMERA_FOV = False
+ENABLE_COUPLED_CONTACT_DYNAMICS = True
+ENABLE_BODY_MOUNTED_CAMERA_FOV = True
 ENABLE_KEEP_OUT_AVOIDANCE = True
 ENABLE_SPIN_SYNC = True
 CHIEF_MASS_KG = 3000.0
@@ -478,9 +478,9 @@ def run_trial(trial_id,
     body_pair = FiniteBodyPair(
         chief_body=BoxBody(CHIEF_BODY_HALF_EXTENTS_M, name="chief"),
         deputy_body=BoxBody(DEPUTY_BODY_HALF_EXTENTS_M, name="deputy"))
-    body_camera = BodyMountedCamera(
-        boresight_body=DEP_DOCK_AXIS_BODY,
-        fov_half_angle_deg=35.0,
+    body_camera = GimbaledTrackingCamera(
+        center_body=DEP_DOCK_AXIS_BODY,
+        gimbal_range_deg=150.0,
         max_range_m=5000.0)
     keepout_planner = KeepoutAvoidancePlanner(
         zones=KeepoutAvoidancePlanner.default_appendage_zones())
@@ -532,7 +532,8 @@ def run_trial(trial_id,
         "hard_strict": False,
     }
     th_ekf_pos_prev = np.zeros(3)
-    phase2_start_t = None
+    phase2_start_t  = None
+    latch_engaged   = False
     range_drop_ticks = 0
     camera_drop_ticks = 0
     max_nav_err_m = 0.0
@@ -699,14 +700,21 @@ def run_trial(trial_id,
                     omega_for_ctrl = omega_est
                     if ENABLE_SPIN_SYNC and rpod_ctrl.mode in (RPODMode.TERMINAL,
                                                                 RPODMode.SOFT_CAPTURE):
-                        _R_b2l_sync = chief_pose_est.R_body2lvlh
-                        if _R_b2l_sync is not None:
-                            omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
-                        else:
-                            omega_chief_lvlh = np.zeros(3)
-                        omega_sync_body = spin_sync.compute_rate_command(
-                            omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
-                        omega_for_ctrl = omega_est - omega_sync_body
+                        # Gate spin sync in SOFT_CAPTURE: if alignment has diverged
+                        # past 30° spin sync opposes convergence — fall back to pure
+                        # attitude tracking.
+                        _spin_sync_ok = (rpod_ctrl.mode != RPODMode.SOFT_CAPTURE
+                                         or attitude_align_deg_cmd is None
+                                         or attitude_align_deg_cmd < 30.0)
+                        if _spin_sync_ok:
+                            _R_b2l_sync = chief_pose_est.R_body2lvlh
+                            if _R_b2l_sync is not None:
+                                omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
+                            else:
+                                omega_chief_lvlh = np.zeros(3)
+                            omega_sync_body = spin_sync.compute_rate_command(
+                                omega_chief_lvlh, (R_e2l @ rot_matrix(mekf.q)).T)
+                            omega_for_ctrl = omega_est - omega_sync_body
                     tau_rw, _ = att_ctrl.compute(mekf.q, omega_for_ctrl, q_cmd)
                     if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                         tau_rw *= SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE
@@ -895,7 +903,10 @@ def run_trial(trial_id,
                 cam_lost=(cam_sensor.is_lost or camera_blocked),
                 port_axis_lvlh=port_axis_lvlh,
                 attitude_align_deg=attitude_align_deg_cmd)
-            if ENABLE_KEEP_OUT_AVOIDANCE:
+            if latch_engaged:
+                accel_cmd  = np.zeros(3)
+                impulse_dv = None
+            if ENABLE_KEEP_OUT_AVOIDANCE and not latch_engaged:
                 keepout = keepout_planner.compute(
                     true_cw_pos, R_e2l @ rot_matrix(chief_att.quaternion))
                 accel_cmd = accel_cmd + keepout["accel"]
@@ -982,9 +993,10 @@ def run_trial(trial_id,
                     target_from_deputy_world=-true_cw_pos,
                     R_body_to_world=R_dep_body_to_lvlh_nav)
                 if camera_blocked or (ENABLE_BODY_MOUNTED_CAMERA_FOV
+                                      and _in_term
                                       and not cam_view["visible"]):
                     z_cam, R_cam = None, None
-                    if ENABLE_BODY_MOUNTED_CAMERA_FOV and not cam_view["visible"]:
+                    if ENABLE_BODY_MOUNTED_CAMERA_FOV and _in_term and not cam_view["visible"]:
                         cam_sensor._mark(False)
                 else:
                     z_cam, R_cam = cam_sensor.measure(
@@ -1018,8 +1030,7 @@ def run_trial(trial_id,
             port_vel_d  = np.cross(omega_est_lvlh, port_lvlh_d)
             dep_to_port = true_cw_pos - port_lvlh_d
             rel_vel_p   = true_cw_vel - port_vel_d
-            if (rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
-                    and not ENABLE_COUPLED_CONTACT_DYNAMICS):
+            if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                 latch_pos_dv_lvlh, latch_dv_lvlh, _ = contact_model.ideal_latch(
                     dep_to_port, rel_vel_p, DEP_MASS_KG)
                 dep_pos_eci += R_e2l.T @ latch_pos_dv_lvlh
@@ -1082,14 +1093,21 @@ def run_trial(trial_id,
                         R_chief_body_to_world=R_body_to_lvlh_d)
                     sc.omega += contact.deputy_delta_omega
                     chief_att.omega += contact.chief_delta_omega
+                    # Latch engages if contact conditions met — zero translational
+                    # relative velocity so the spacecraft doesn't bounce away.
+                    if contact.captured:
+                        impact_dv_lvlh = -rel_vel_p
+                    else:
+                        impact_dv_lvlh = contact.rel_vel_after - rel_vel_p
                 else:
                     # Idealized baseline latch: remove all port-relative
                     # motion. Restitution belongs to coupled contact dynamics.
                     _, _, contact = contact_model.ideal_latch(
                         dep_to_port, rel_vel_p, DEP_MASS_KG)
-                impact_dv_lvlh = contact.rel_vel_after - rel_vel_p
+                    impact_dv_lvlh = contact.rel_vel_after - rel_vel_p
                 dep_vel_eci += R_e2l.T @ impact_dv_lvlh
                 true_cw_vel += impact_dv_lvlh
+                latch_engaged = contact.captured
                 rpod_ctrl._set_mode(RPODMode.SOFT_CAPTURE, t)
                 hard_capture_hold_s = 0.0
                 soft_capture_seen = True
