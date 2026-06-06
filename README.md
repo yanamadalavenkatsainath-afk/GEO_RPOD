@@ -1,106 +1,79 @@
-# GEO RPOD Python Reference Plant
+# GEO RPOD Python Reference Simulation
 
-Python reference plant and guidance sandbox for GEO rendezvous, proximity
-operations, and docking of a 50 kg servicing deputy approaching a tumbling GEO
-chief.
+Python reference plant, sensor simulation, Monte Carlo environment, and debug
+sandbox for GEO rendezvous, proximity operations, and docking of a 50 kg
+servicing deputy approaching a tumbling GEO chief.
 
-This repository is now organized as:
+The paired embedded C/SIL repository is:
 
-- a high-fidelity Python plant/reference simulation,
-- C-portable flight-software kernels under `fsw/`,
-- explicit C-struct-style state specs under `spec/`,
-- unit tests that protect the ported logic and plant helpers.
+```text
+C:\Users\Venkat\OneDrive\Desktop\appex\Satellite_GNC
+```
 
-> Status: engineering prototype / reference plant. This is not flight-certified
-> software, but the architecture is now set up for an embedded C port.
+> Status: engineering prototype / reference plant. This is not flight-certified.
 
 ## Current Baseline
 
-Latest Monte Carlo baseline recorded from `monte_carlo_summary.txt`:
+The current Python architecture uses a close-range dock-port/flash-lidar style
+sensor handover for terminal docking. The earlier monocular pose-only terminal
+failure mode was caused by estimator starvation: the translation loop reached
+the port, camera features left the usable field of view, pose aged out, and the
+attitude loop chased stale/ambiguous pose.
 
-| Metric | Result |
-|---|---:|
-| Trials | 20 |
-| Docking success | 19 / 20 (95.0%) |
-| Soft capture reached | 20 / 20 (100.0%) |
-| Hard strict certified | 19 / 20 (95.0%) |
-| Soft certified | 19 / 20 (95.0%) |
-| Capture timeout | 1 / 20 |
-| Dominant failure | `SOFT_ALIGN_TIMEOUT` |
-| Mean total DV | 3.737 m/s |
-| 95th percentile total DV | 5.382 m/s |
-| Worst docked DV | 10.861 m/s |
-| Mean propellant | 86.5 g |
-| 95th percentile propellant | 124.5 g |
+The current solution is:
 
-Stress-case pass rates from the same baseline:
+- keep camera/PnP useful at longer terminal ranges,
+- use the dock-port sensor at close range,
+- gate pose freshness before spin-sync/dock-axis control,
+- use soft capture at the 30 deg entry gate,
+- hard capture only after strict 10 deg alignment and 5 s hold.
 
-| Stress case | Pass rate |
-|---|---:|
-| nominal | 6 / 6 |
-| gyro_bias | 6 / 6 |
-| camera_dropout | 2 / 2 |
-| range_dropout | 1 / 1 |
-| weak_thruster | 2 / 2 |
-| high_pose_noise | 2 / 3 |
-
-Interpretation: the current product-level issue is no longer reaching contact.
-All trials reached soft capture. The remaining failure mode is a soft-capture
-attitude convergence timeout in one high-pose-noise-style case.
-
-## Test Status
-
-Current unit-test baseline supplied from local run:
+Latest reported Monte Carlo baseline:
 
 ```text
-python -m pytest tests/ -v
-48 passed
+Trials total        : 20
+Docking success     : 20 / 20 (100.0%)
+Soft capture seen   : 20 / 20
+Hard strict final   : 20 / 20
+Soft certified      : 20 / 20
+Capture timeouts    : 0 / 20
+Mean total DV       : 1.491 m/s
+95th percentile DV  : 1.932 m/s
+Mean time to dock   : 1.776 hr
+Final align mean    : 7.33 deg
+Final align max     : 9.21 deg
 ```
 
-Covered areas:
+Stress cases in that run:
 
-- contact dynamics,
-- docking geometry metrics,
-- capture-gate classification,
-- RPOD guidance kernels,
-- RPOD mode-transition sanity,
-- physical thruster allocation.
+```text
+nominal          6 / 6
+gyro_bias        6 / 6
+high_pose_noise  3 / 3
+camera_dropout   2 / 2
+range_dropout    1 / 1
+weak_thruster    2 / 2
+```
 
 ## Architecture
 
 Core layout:
 
-| Path | Purpose |
-|---|---|
-| `main.py` | Single-run closed-loop simulation using the Python plant |
-| `monte_carlo.py` | Monte Carlo campaign runner |
-| `sim_config.py` | Shared mission/config constants for `main.py` and MC |
-| `spec/rpod_state.py` | C-struct-like guidance state definitions |
-| `fsw/rpod_guidance.py` | Pure C-portable PROX/TERMINAL guidance kernels |
-| `fsw/capture_gate.py` | Pure C-portable capture classification |
-| `fsw/mode_manager.py` | ADCS mode manager |
-| `control/lambert_controller.py` | Python RPOD controller wrapper and Lambert logic |
-| `utils/docking_metrics.py` | Shared docking geometry/alignment helpers |
-| `plant/spacecraft.py` | Rigid-body deputy attitude plant |
-| `plant/thruster_layout.py` | Physical bounded thruster allocation |
-| `plant/finite_body.py` | Coarse finite-body collision/clearance checks |
-| `plant/contact_dynamics.py` | Soft-capture/contact impulse surrogate |
-| `estimation/` | MEKF, TH-EKF, port tracker, terminal nav filter |
-| `sensors/` | Sensor models and camera/FOV logic |
-| `environment/` | GEO orbit, CW dynamics, gravity gradient, SRP, drag, sun, magnetic field |
-| `visualiser.py` | Post-run visualization and replay |
+```text
+main.py                    single-run closed-loop simulation
+monte_carlo.py             Monte Carlo campaign runner
+sim_config.py              mission, sensor, guidance, and capture constants
+chief_pose_estimator.py    chief attitude/omega estimator
+control/                  RPOD, Lambert, spin-sync, guidance controllers
+estimation/               MEKF, TH-EKF, terminal nav, port tracker
+sensors/                  gyro, range, camera, dock-port/flash-lidar models
+plant/                    deputy rigid body, finite body, contact dynamics
+environment/              GEO orbit, CW dynamics, gravity gradient, SRP, sun, B-field
+tools/                    telemetry and MC analysis scripts
+tests/                    Python unit/regression tests
+```
 
-The intended embedded flow is:
-
-1. Keep Python as the truth plant and Monte Carlo environment.
-2. Port only pure kernels from `fsw/` and explicit structs from `spec/`.
-3. Validate C against Python with golden-vector tests.
-4. Run the C FSW inside the Python plant for closed-loop verification.
-
-Do not port `main.py` directly. It contains simulation orchestration, truth
-state, telemetry, plotting, and debug plumbing.
-
-## Mission Flow
+Mission flow:
 
 ```text
 DETUMBLE
@@ -113,28 +86,28 @@ DETUMBLE
   -> DOCKING
 ```
 
-RPOD guidance uses estimated navigation state. Plant truth is used for sensor
-generation, scoring, contact/collision checks, and telemetry analysis.
+The Python sim remains the truth plant and campaign environment. The C repo
+ports the flight-software kernels and runs them against this plant for SIL/HIL.
 
 ## Current Scenario
 
-| Item | Value |
-|---|---:|
-| Chief orbit | GEO, a = 42164 km, e = 0.0003, i = 0.8 deg |
-| Chief longitude | 342 deg E |
-| Deputy mass | 50 kg |
-| Deputy thrust | 1 N |
-| Max acceleration | 20 mm/s^2 |
-| Initial standoff | 1000 m trailing |
-| Inner ADCS step | 0.01 s |
-| RPOD outer-loop step | 0.1 s |
-| Main terminal handoff | 10 m |
-| Soft-capture gate | 0.30 m, 0.05 m/s |
-| Hard-capture gate | 0.08 m, 0.010 m/s, held 5 s |
-| Soft-capture entry align gate | 60 deg |
-| Hard docking align gate | 10 deg |
+```text
+Chief orbit                 GEO, a = 42164 km, e = 0.0003
+Deputy mass                 50 kg
+Deputy thrust               1 N
+Max acceleration            20 mm/s^2
+Initial standoff            ~1000 m trailing
+Inner ADCS step             0.01 s
+RPOD outer-loop step        0.1 s
+Terminal handoff            10 m
+Port sensor range           10 m
+Soft-capture gate           port < 0.30 m, vrel < 0.05 m/s, align < 30 deg
+Hard-capture gate           port < 0.08 m, vrel < 0.010 m/s, align < 10 deg
+Hard-capture hold           5 s
+Dock cone half angle        15 deg
+```
 
-Chief docking geometry:
+Docking geometry:
 
 ```text
 DOCK_PORT_BODY = [0, 0, 0.5] m
@@ -155,78 +128,116 @@ Run one simulation:
 python main.py
 ```
 
-Run a 20-trial Monte Carlo:
+Analyze the latest single-run telemetry:
+
+```powershell
+python tools\analyze_rpod_telemetry.py
+```
+
+Run Monte Carlo:
 
 ```powershell
 python monte_carlo.py --trials 20 --workers 8 --seed 42
+python tools\analyze_mc_results.py
 ```
 
 Run tests:
 
 ```powershell
-python -m pytest tests/ -v
+python -m pytest tests\ -v
 ```
 
-Run post-run visualizer:
+## Telemetry To Watch
 
-```powershell
-python visualiser.py
-```
+For terminal/debug work, the important telemetry is:
+
+- truth alignment and estimated alignment
+- truth-est alignment bias
+- pose-estimator status counts: `ACCEPTED`, `REJECTED`, `COAST`, `NO_VISIBLE`
+- visible point count and visible model indices
+- stub/feature visibility
+- pose age
+- reprojection RMS
+- port range and port relative velocity
+- soft-capture entry, best, and final alignment
+
+Healthy terminal behavior now looks like:
+
+- terminal truth align mostly below 30 deg,
+- close-range pose bias near single digits or lower,
+- port sensor valid through final approach,
+- soft capture enters below 30 deg,
+- hard capture latches below 10 deg after the hold.
+
+## Relationship To The C Port
+
+Do not port `main.py` directly. It is the simulation harness, not flight code.
+
+The C repo should port or mirror:
+
+- guidance kernels,
+- capture gates,
+- estimators,
+- mode manager,
+- packet ABI,
+- fault handling,
+- actuator output limits,
+- target/HIL communication.
+
+The Python repo should remain responsible for:
+
+- truth plant,
+- sensors and stress cases,
+- Monte Carlo campaigns,
+- plots and diagnostics,
+- reference behavior for C parity checks.
 
 ## Outputs
 
-Generated outputs are intentionally not part of the source baseline:
+Generated outputs are local artifacts:
 
 ```text
 rpod_telemetry.npz
 rpod_telemetry_plots.png
-Figure_1.png
-Figure_2.png
 monte_carlo_results.npz
 monte_carlo_summary.txt
 monte_carlo_plots.png
 mc_results/
+Figure_*.png
 ```
 
-Preserve important campaign results in this README or in a deliberate report,
-not by committing raw generated artifacts by accident.
+Preserve important campaign results in this README or a report, not by
+accidentally committing raw generated artifacts.
 
-## Development Roadmap
+## Near-Term Work
 
-Near-term:
+Python side:
 
-1. Add golden-vector tests for `fsw/rpod_guidance.py` and `fsw/capture_gate.py`.
-2. Add exact failed-trial replay to `monte_carlo.py`.
-3. Create C headers matching `spec/rpod_state.py`.
-4. Port `fsw/rpod_guidance.py` and `fsw/capture_gate.py` to embedded C.
-5. Run Python-vs-C comparison tests.
-6. Run C FSW inside the Python plant for closed-loop verification.
+- run larger MC sets after any guidance or sensor-model change,
+- keep analysis scripts reporting pose freshness and port-sensor health,
+- add named baseline reports for important campaigns,
+- keep deterministic replay for failed or suspicious seeds.
 
-Product-readiness work:
+C/HIL side lives in `Satellite_GNC`:
 
-- clean CLI,
-- reproducible result folders,
-- archived named baseline configs,
-- campaign report generation,
-- demo replay/animation,
-- final 300-run campaign with all accepted toggles.
+- target compiler build,
+- MCU/flight-computer execution,
+- real jitter/WCET measurement,
+- real comms-link HIL with this Python plant.
 
 ## Git Hygiene
 
-Commit source, tests, config, specs, and docs:
+Commit source, tests, configuration, and documentation. Avoid committing:
 
 ```text
-*.py
-README.md
-Requirements.txt
-tests/
-fsw/
-spec/
-utils/
+__pycache__/
+.pytest_cache/
+rpod_telemetry*.npz
+monte_carlo_results*.npz
+*_plots.png
+Figure_*.png
+mc_results/
 ```
-
-Do not commit generated telemetry, plots, caches, or local result folders unless
-you are intentionally archiving a named baseline.
 
 ## Author
 
