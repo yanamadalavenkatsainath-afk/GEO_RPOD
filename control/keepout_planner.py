@@ -31,12 +31,26 @@ class KeepoutAvoidancePlanner:
         self.accel_max = float(accel_max)
 
     @staticmethod
+    def chief_appendage_zones(solar_array_half_span_m: float = 6.0):
+        """
+        IS-1002 class chief appendage keepout zones in chief body frame.
+
+        Solar arrays extend ±Y. Three spheres per arm model the swept volume
+        at root/mid/tip. Earth-facing antenna sits on the -Z face.
+        Dock port is on +Z — arrays do not interfere with final approach.
+        """
+        span = float(solar_array_half_span_m)
+        zones = []
+        for sign, tag in ((+1, "pos"), (-1, "neg")):
+            for frac, label in ((1/3, "root"), (2/3, "mid"), (1.0, "tip")):
+                zones.append(MovingKeepoutZone(
+                    [0.0, sign * frac * span, 0.0], 0.80, f"array_y_{tag}_{label}"))
+        zones.append(MovingKeepoutZone([0.0, 0.0, -0.70], 0.50, "earth_antenna"))
+        return zones
+
+    @staticmethod
     def default_appendage_zones():
-        return [
-            MovingKeepoutZone([1.20, 0.0, 0.0], 0.45, "solar_panel_plus_x"),
-            MovingKeepoutZone([-1.20, 0.0, 0.0], 0.45, "solar_panel_minus_x"),
-            MovingKeepoutZone([0.0, 1.10, 0.0], 0.35, "antenna_plus_y"),
-        ]
+        return KeepoutAvoidancePlanner.chief_appendage_zones()
 
     def compute(self, dep_lvlh, R_body2lvlh):
         dep_lvlh = np.asarray(dep_lvlh, dtype=float)

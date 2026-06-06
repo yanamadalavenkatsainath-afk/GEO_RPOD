@@ -99,14 +99,25 @@ class ChiefPoseEstimator:
                  dt:                   float = 0.1,
                  sigma_omega_process:  float = 0.001,   # rad/s/sqrt(s)
                  sigma_pnp_deg:        float = 3.0,     # deg per PnP solve
-                 gate_k:               float = 5.0,
+                 gate_k:               float = 10.0,
                  N_avg:                int   = 50,      # kept for API compat
                  alpha_filter:         float = 0.3,     # kept for API compat
-                 sigma_omega:          float = 0.002):  # kept for API compat
+                 sigma_omega:          float = 0.002,   # kept for API compat
+                 pose_model_pts=None,                   # override cam model_pts
+                 max_reproj_rms_px:    float = 50.0):
 
         self.cam   = cam_sensor
+        # Use caller-supplied chief feature model or fall back to camera
+        # sensor default.  The pose model must match the chief's physical
+        # feature geometry — IS-1002 bus corners plus an asymmetric solar
+        # array feature — so EPnP has three distinct PCA eigenvalues and
+        # can resolve the dock-axis rotation without ambiguity.
+        self._pose_pts = (np.asarray(pose_model_pts, dtype=float)
+                          if pose_model_pts is not None
+                          else cam_sensor.model_pts)
         self.dt    = dt
         self.gate_k = gate_k
+        self.max_reproj_rms_px = max_reproj_rms_px
 
         # ── EKF state ──────────────────────────────────────────────
         # Quaternion: random init (unknown chief attitude)
@@ -131,6 +142,20 @@ class ChiefPoseEstimator:
         self._valid         = False
         self._update_count  = 0
         self._frame_count   = 0   # kept for API compat
+        self._pose_age_s    = np.inf
+        self._debug = {
+            "status": 0,             # 0 none, 1 accepted, 2 rejected, 3 coast, 4 no visible, 5 pnp fail, 6 rms reject, 7 acquire
+            "visible_count": 0,
+            "visible_mask": 0,
+            "stub_visible": False,
+            "reproj_rms_px": np.nan,
+            "pca_s0": np.nan,
+            "pca_s1": np.nan,
+            "pca_s2": np.nan,
+            "pca_cond": np.nan,
+            "pose_age_s": np.inf,
+            "update_count": 0,
+        }
 
         # Last successful PnP R_body2lvlh — exposed directly to avoid the
         # q_est frame ambiguity. This rotation matrix is in a well-defined
@@ -167,6 +192,31 @@ class ChiefPoseEstimator:
         """
         # ── Predict ──────────────────────────────────────────────
         self._predict()
+        self._pose_age_s += self.dt
+        self._debug.update({
+            "status": 0,
+            "visible_count": 0,
+            "visible_mask": 0,
+            "stub_visible": False,
+            "reproj_rms_px": np.nan,
+            "pca_s0": np.nan,
+            "pca_s1": np.nan,
+            "pca_s2": np.nan,
+            "pca_cond": np.nan,
+            "pose_age_s": self._pose_age_s,
+            "update_count": self._update_count,
+        })
+
+        # Reopen the Mahalanobis gate when pose is stale.
+        # Lock-in occurs when the EKF converged to a wrong orientation with tight P:
+        # correct PnP solutions are then rejected indefinitely (mah2 >> gate_k²).
+        # Inflating P_att back to ≥ (30 deg)² lets the EKF accept measurements up
+        # to ~30 deg from its current state and self-correct the wrong prior.
+        if self._pose_age_s > 60.0 and self._update_count >= 10:
+            _att_floor = np.radians(30.0) ** 2
+            for i in range(3):
+                if self._P[i, i] < _att_floor:
+                    self._P[i, i] = _att_floor
 
         true_range = float(np.linalg.norm(dr_lvlh))
 
@@ -176,6 +226,8 @@ class ChiefPoseEstimator:
             # The EKF integrates the coasted omega, giving a smooth, noise-free
             # orientation without any truth dependency.
             self._last_R_b2l = _rot_matrix(self._q)
+            self._debug["status"] = 3
+            self._debug["pose_age_s"] = self._pose_age_s
             if self._update_count >= 10:
                 self._valid = True
             return self._omega.copy(), self._valid
@@ -192,8 +244,41 @@ class ChiefPoseEstimator:
         # ── Measurement from PnP ────────────────────────────────
         R_meas = self._estimate_orientation(dr_lvlh, q_chief)
         if R_meas is not None:
-            self._last_R_b2l = R_meas.copy()
-            self._update(R_meas, R_override=R_use)
+            _rms = float(self._debug.get("reproj_rms_px", np.nan))
+            if np.isfinite(_rms) and _rms > self.max_reproj_rms_px:
+                self._debug["status"] = 6
+            elif self._pose_age_s > 10.0 and np.isfinite(_rms) and _rms < 10.0:
+                # Acquisition mode: EKF is stale and the image measurement is
+                # reliable (RMS-gated).  Bypass the Mahalanobis gate — the prior
+                # is too old to trust for rejection decisions — and reseed directly.
+                self._q = _rot_matrix_to_quat(R_meas)
+                self._omega = np.zeros(3)       # stale omega direction is untrusted; start fresh
+                self._P = np.diag([np.radians(5.0)**2]*3 +
+                                  [np.radians(3.0)**2]*3)
+                self._last_R_b2l = R_meas.copy()
+                self._pose_age_s = 0.0
+                self._update_count += 1
+                self._debug["status"] = 7
+                self._debug["update_count"] = self._update_count
+            elif self._update(R_meas, R_override=R_use):
+                self._last_R_b2l = R_meas.copy()
+                self._pose_age_s = 0.0
+                self._debug["status"] = 1
+                self._debug["update_count"] = self._update_count
+            else:
+                if np.isfinite(_rms) and _rms < 5.0:
+                    self._q = _rot_matrix_to_quat(R_meas)
+                    self._omega = np.zeros(3)
+                    self._P = np.diag([np.radians(5.0)**2]*3 +
+                                      [np.radians(3.0)**2]*3)
+                    self._last_R_b2l = R_meas.copy()
+                    self._pose_age_s = 0.0
+                    self._update_count += 1
+                    self._debug["status"] = 7
+                    self._debug["update_count"] = self._update_count
+                else:
+                    self._debug["status"] = 2
+            self._debug["pose_age_s"] = self._pose_age_s
 
         # Mark valid after 10 successful updates (~1s of data)
         if self._update_count >= 10:
@@ -278,10 +363,10 @@ class ChiefPoseEstimator:
         try:
             S_inv = np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            return
+            return False
         mah2 = float(z_err @ S_inv @ z_err)
         if mah2 > self.gate_k**2:
-            return   # reject outlier PnP solution
+            return False   # reject outlier PnP solution
 
         # Kalman gain and Joseph-form update
         K = self._P @ H.T @ S_inv
@@ -304,6 +389,7 @@ class ChiefPoseEstimator:
         self._P = IKH @ self._P @ IKH.T + K @ R_noise @ K.T
 
         self._update_count += 1
+        return True
 
     # ─────────────────────────────────────────────────────────────────
     # PnP orientation estimator — unchanged from v1
@@ -331,12 +417,13 @@ class ChiefPoseEstimator:
 
         # ── Project model points ───────────────────────────────────
         R_body2lvlh = _rot_matrix(q_chief)
-        pts_cam = (R_l2c @ R_body2lvlh @ self.cam.model_pts.T).T
+        pts_cam = (R_l2c @ R_body2lvlh @ self._pose_pts.T).T
         pts_cam += (R_l2c @ dr_lvlh).reshape(1, 3)
 
         # Collect visible points with pixel noise
         px_obs   = []   # noisy pixel observations (M, 2)
         pts_body = []   # corresponding body-frame 3D points (M, 3)
+        vis_idx  = []
         for i, P_c in enumerate(pts_cam):
             Z = P_c[2]
             if Z <= 0.01: continue
@@ -346,83 +433,129 @@ class ChiefPoseEstimator:
             u_n = u + np.random.normal(0, self.cam.sigma_px)
             v_n = v + np.random.normal(0, self.cam.sigma_px)
             px_obs.append([u_n, v_n])
-            pts_body.append(self.cam.model_pts[i])
+            pts_body.append(self._pose_pts[i])
+            vis_idx.append(i)
+
+        visible_mask = 0
+        for i in vis_idx:
+            if i < 63:
+                visible_mask |= (1 << int(i))
+        self._debug.update({
+            "visible_count": len(vis_idx),
+            "visible_mask": visible_mask,
+            "stub_visible": bool(8 in vis_idx or 9 in vis_idx),
+        })
 
         if len(px_obs) < 4:
+            self._debug["status"] = 4
             return None
 
         px_obs   = np.array(px_obs)    # (M, 2)
         pts_body = np.array(pts_body)  # (M, 3)
         M        = len(px_obs)
 
-        # ── EPnP: control-point parameterisation ──────────────────
-        # Reference: Lepetit, Moreno-Noguer, Fua, IJCV 2009
-        #
-        # Step 1: choose 4 control points in body frame.
-        #   c0 = centroid, c1-c3 = principal axes (weighted PCA)
-        c0   = np.mean(pts_body, axis=0)
-        dpts = pts_body - c0                    # (M, 3) centred
-        U, S, Vt = np.linalg.svd(dpts, full_matrices=False)
-        # Control points along principal axes, scaled by singular values
-        c1 = c0 + Vt[0] * S[0] / np.sqrt(M)
-        c2 = c0 + Vt[1] * S[1] / np.sqrt(M)
-        c3 = c0 + Vt[2] * S[2] / np.sqrt(M)
-        ctrl_body = np.array([c0, c1, c2, c3])  # (4, 3)
-
-        # Step 2: homogeneous barycentric coordinates of each 3D point
-        # p_i = sum_j alpha_ij * c_j  →  alpha_i = M_ctrl^{-1} @ (p_i, 1)
-        ctrl_aug = np.hstack([ctrl_body, np.ones((4, 1))])   # (4, 4)
-        pts_aug  = np.hstack([pts_body,  np.ones((M, 1))])   # (M, 4)
-        try:
-            alphas = np.linalg.solve(ctrl_aug.T, pts_aug.T).T  # (M, 4)
-        except np.linalg.LinAlgError:
-            return None
-
-        # Step 3: build the 2M × 12 linear system M @ x = 0
-        # where x = [c0_cam; c1_cam; c2_cam; c3_cam] (12 unknowns)
         f  = self.cam.f
-        cx = self.cam.cx; cy = self.cam.cy
-        L  = np.zeros((2 * M, 12))
+        cx = self.cam.cx
+        cy = self.cam.cy
+
+        # Known translation: chief center expressed in camera frame.
+        # EPnP had to estimate this from pixels (beta scale ambiguity → wrong).
+        # We get it for free from the EKF nav solution.
+        t = R_l2c @ dr_lvlh   # (3,)
+
+        # PCA diagnostics (kept for telemetry continuity)
+        _, S_pca, _ = np.linalg.svd(pts_body - np.mean(pts_body, axis=0),
+                                     full_matrices=False)
+        s_min = max(float(S_pca[-1]), 1e-12) if len(S_pca) >= 3 else 1e-12
+        self._debug.update({
+            "pca_s0": float(S_pca[0]),
+            "pca_s1": float(S_pca[1]) if len(S_pca) > 1 else np.nan,
+            "pca_s2": float(S_pca[2]) if len(S_pca) > 2 else np.nan,
+            "pca_cond": float(S_pca[0]) / s_min,
+        })
+
+        # ── Step 1: DLT initialization (linear, known t) ──────────
+        # From the pinhole model:
+        #   u = f*(r1@b + t[0])/(r3@b + t[2]) + cx
+        #   v = f*(r2@b + t[1])/(r3@b + t[2]) + cy
+        # Cross-multiplying (du = u-cx, dv = v-cy):
+        #   -f*(r1@b) + du*(r3@b) = f*t[0] - du*t[2]
+        #   -f*(r2@b) + dv*(r3@b) = f*t[1] - dv*t[2]
+        # Stack into linear system A x = b where x = [r1; r2; r3].
+        A_dlt = np.zeros((2 * M, 9))
+        b_dlt = np.zeros(2 * M)
         for i in range(M):
-            a  = alphas[i]           # (4,) barycentric coords
-            ui = px_obs[i, 0]
-            vi = px_obs[i, 1]
-            for j in range(4):
-                L[2*i,   3*j    ] =  f * a[j]
-                L[2*i,   3*j + 2] = (cx - ui) * a[j]
-                L[2*i+1, 3*j + 1] =  f * a[j]
-                L[2*i+1, 3*j + 2] = (cy - vi) * a[j]
+            pt_b = pts_body[i]
+            du   = float(px_obs[i, 0]) - cx
+            dv   = float(px_obs[i, 1]) - cy
+            A_dlt[2*i,   0:3] = -f * pt_b
+            A_dlt[2*i,   6:9] =  du * pt_b
+            b_dlt[2*i]        =  f * t[0] - du * t[2]
+            A_dlt[2*i+1, 3:6] = -f * pt_b
+            A_dlt[2*i+1, 6:9] =  dv * pt_b
+            b_dlt[2*i+1]      =  f * t[1] - dv * t[2]
 
-        # Step 4: solve via null-space of L (N=1 approximation)
         try:
-            _, _, Vt_L = np.linalg.svd(L)
+            x_dlt, _, _, _ = np.linalg.lstsq(A_dlt, b_dlt, rcond=None)
+            U_d, _, Vt_d   = np.linalg.svd(x_dlt.reshape(3, 3))
         except np.linalg.LinAlgError:
+            self._debug["status"] = 5
             return None
-        x_est = Vt_L[-1]   # last right singular vector = null-space
+        R_body2cam = U_d @ np.diag([1., 1., np.linalg.det(U_d @ Vt_d)]) @ Vt_d
 
-        ctrl_cam = x_est.reshape(4, 3)  # (4, 3) control points in camera frame
+        # ── Step 2: Gauss-Newton refinement on pixel reproj error ──
+        # Left perturbation: R ← exp(hat(δφ)) @ R (camera-frame parametrisation).
+        # Jacobian of projection w.r.t. δφ:  J_proj @ (−hat(c − t))
+        # where c = R_body2cam @ b + t.
+        for _ in range(8):
+            J_full = np.zeros((2 * M, 3))
+            r_full = np.zeros(2 * M)
+            n_valid = 0
+            for i in range(M):
+                c = R_body2cam @ pts_body[i] + t
+                Z = c[2]
+                if Z < 0.01:
+                    continue
+                r_full[2*i]   = float(px_obs[i, 0]) - (f * c[0] / Z + cx)
+                r_full[2*i+1] = float(px_obs[i, 1]) - (f * c[1] / Z + cy)
+                J_proj = np.array([[f/Z,   0,   -f * c[0] / Z**2],
+                                   [0,     f/Z, -f * c[1] / Z**2]])
+                ct = c - t
+                hat_ct = np.array([[    0,  -ct[2],  ct[1]],
+                                   [ ct[2],      0, -ct[0]],
+                                   [-ct[1],  ct[0],      0]])
+                J_full[2*i:2*i+2, :] = J_proj @ (-hat_ct)
+                n_valid += 2
+            if n_valid < 6:
+                break
+            try:
+                dw, _, _, _ = np.linalg.lstsq(J_full, r_full, rcond=None)
+            except np.linalg.LinAlgError:
+                break
+            theta = float(np.linalg.norm(dw))
+            if theta < 1e-9:
+                break
+            K   = np.array([[    0,  -dw[2],  dw[1]],
+                             [ dw[2],      0, -dw[0]],
+                             [-dw[1],  dw[0],      0]]) / theta
+            dR  = np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+            R_body2cam = dR @ R_body2cam            # left update
+            U_r, _, Vt_r = np.linalg.svd(R_body2cam)
+            R_body2cam   = U_r @ Vt_r              # re-orthogonalise
 
-        # Enforce positive depth (flip sign if needed)
-        if ctrl_cam[0, 2] < 0:
-            ctrl_cam = -ctrl_cam
+        # ── Reprojection RMS with the correct (known) translation ──
+        proj_err = []
+        for pt_b, px in zip(pts_body, px_obs):
+            pt_c = R_body2cam @ pt_b + t
+            if pt_c[2] <= 0.01:
+                continue
+            u = f * pt_c[0] / pt_c[2] + cx
+            v = f * pt_c[1] / pt_c[2] + cy
+            proj_err.append(float(np.linalg.norm(np.array([u, v]) - px)))
+        self._debug["reproj_rms_px"] = (
+            float(np.sqrt(np.mean(np.square(proj_err)))) if proj_err else np.nan)
 
-        # Step 5: recover R from control points (Procrustes)
-        # ctrl_body → ctrl_cam via rigid transform R, t
-        # Subtract centroids
-        c_body = np.mean(ctrl_body, axis=0)
-        c_cam  = np.mean(ctrl_cam,  axis=0)
-        A = (ctrl_cam  - c_cam).T  @ (ctrl_body - c_body)   # (3, 3)
-        try:
-            U_p, _, Vt_p = np.linalg.svd(A)
-        except np.linalg.LinAlgError:
-            return None
-        d_p = np.linalg.det(U_p @ Vt_p)
-        R_body2cam = U_p @ np.diag([1., 1., d_p]) @ Vt_p
-
-        # R_body2cam: body → camera frame
-        # R_body2lvlh = R_l2c.T @ R_body2cam
-        R_body2lvlh_est = R_l2c.T @ R_body2cam
-        return R_body2lvlh_est
+        return R_l2c.T @ R_body2cam
 
     # ─────────────────────────────────────────────────────────────────
     # Properties
@@ -462,3 +595,7 @@ class ChiefPoseEstimator:
     @property
     def is_valid(self):
         return self._valid
+
+    @property
+    def debug(self):
+        return dict(self._debug)

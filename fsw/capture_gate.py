@@ -79,11 +79,14 @@ def evaluate_capture(i: CaptureGateIn) -> CaptureGateOut:
         and i.align_ok
     )
 
-    # Soft core: inside capture sphere with attitude good enough for latch.
+    # Soft core: inside capture sphere AND attitude certified.
+    # Uses align_ok (MEKF attitude vs registered dock axis) NOT align_deg
+    # (filtered pose estimator). The pose estimator is degenerate at <0.5m
+    # range; MEKF attitude + known dock geometry is the right certification
+    # metric at close range. align_deg is only for the entry gate above.
     soft_core_ready = (
         i.capture_core
-        and align_known
-        and i.align_deg <= i.soft_capture_core_align_max_deg
+        and i.align_ok
     )
 
     # Stable: port-relative motion below latch certification speed.
@@ -93,12 +96,10 @@ def evaluate_capture(i: CaptureGateIn) -> CaptureGateOut:
         and i.body_clear
     )
 
-    # Certified: all three conditions for autonomous hard latch.
+    # Certified: stable + in core + well-aligned (all via align_ok).
     soft_capture_certified = (
         soft_capture_stable
         and soft_core_ready
-        and align_known
-        and i.align_deg <= i.dock_align_max_deg
     )
 
     return CaptureGateOut(

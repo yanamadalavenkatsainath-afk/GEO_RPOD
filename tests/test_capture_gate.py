@@ -73,12 +73,13 @@ class TestSoftCore:
     def test_blocked_when_not_in_capture_core(self):
         assert not evaluate_capture(_inp(capture_core=False)).soft_core_ready
 
-    def test_blocked_when_align_deg_nan(self):
-        # NaN align_deg → can't certify alignment → soft_core not ready
-        assert not evaluate_capture(_inp(align_deg=float('nan'))).soft_core_ready
+    def test_blocked_when_align_ok_false(self):
+        # soft_core uses align_ok (MEKF vs registered dock axis), not align_deg
+        assert not evaluate_capture(_inp(align_ok=False)).soft_core_ready
 
-    def test_blocked_when_core_align_exceeded(self):
-        assert not evaluate_capture(_inp(align_deg=21.0)).soft_core_ready
+    def test_nan_align_deg_does_not_block_core(self):
+        # NaN filtered estimate is irrelevant — core uses align_ok
+        assert evaluate_capture(_inp(align_deg=float('nan'))).soft_core_ready
 
 
 class TestSoftCaptureStable:

@@ -29,6 +29,7 @@ I_SC         = np.diag([4.167, 4.167, 3.000])   # kg·m²
 CHI_CR        = 1.5
 CHI_AM        = 0.015
 CHIEF_MASS_KG = 3000.0
+CHIEF_SOLAR_ARRAY_HALF_SPAN_M = 6.0   # IS-1002 class: ~12m tip-to-tip arrays
 
 # ── Formation hold ────────────────────────────────────────────────────
 FORMATION_OFFSET_M = np.array([0.0, -1000.0, 0.0])   # 1 km trailing (LVLH -y)
@@ -69,7 +70,7 @@ SOFT_CAPTURE_HOLD_S             = 5.0
 SOFT_CAPTURE_LATCH_VREL_MS      = 0.030
 SOFT_CAPTURE_MAX_HOLD_S         = 1200.0  # need ~870s from 76.8° entry (sin rate model)
 SOFT_CAPTURE_CORE_ALIGN_MAX_DEG = 20.0
-SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 60.0  # raised from 30°: pose-spike blocked 26cm near-miss
+SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG = 30.0  # entry gate uses MEKF alignment (reliable) — 30° is correct
 SOFT_CAPTURE_ATTITUDE_TORQUE_SCALE = 1.0  # restored: 0.4 couldn't despin 0.5 Nms residual
 SOFT_CAPTURE_ATTITUDE_LOG_S     = 30.0
 SOFT_CAPTURE_RESTITUTION        = 0.10
@@ -85,6 +86,7 @@ ENABLE_SPIN_SYNC                = True
 
 # ── Thruster / deputy body ────────────────────────────────────────────
 THRUSTER_MAX_FORCE_N       = 0.25
+THRUSTER_CANT_DEG          = 35.26   # isometric corner-pod cant angle
 DEPUTY_BODY_HALF_EXTENTS_M = np.array([0.30, 0.30, 0.40])
 
 # ── Navigation / estimation ───────────────────────────────────────────
@@ -101,6 +103,42 @@ CLOSE_PROX_NAV_RANGE_M = 20.0   # m  dock-axis pre-alignment activates below thi
 # Raised from 5 m: CW orbit-trap at ~6 m prevented reaching 5 m when
 # the deputy had to navigate around the port in full 3D.
 MAIN_TERMINAL_M = 10.0
+
+# ── Spin sync health gate ─────────────────────────────────────────────
+SPIN_SYNC_MAX_OMEGA_RAD_S = np.radians(1.0)  # reject omega estimates > 1 deg/s
+
+# ── Chief pose estimator model points ────────────────────────────────
+# 3D feature model of the IS-1002 chief used by ChiefPoseEstimator EPnP.
+# Points are in the chief body frame [m].
+#
+# Body: 8 corners of the IS-1002 bus (half-extents [0.8, 0.8, 0.5]).
+# The bus has a square cross-section → equal X and Y PCA eigenvalues →
+# EPnP dock-axis rotation is poorly conditioned, producing the ~60 deg
+# orientation bias seen in telemetry.
+#
+# Solar stubs: ±X array root fittings at [±1.5, 0, 0].  IS-1002 carries
+# two symmetric wings; both roots improve PROX_OPS PCA conditioning and
+# give the EKF two robust off-axis landmarks.  Visible at range > ~4 m.
+# Dock marker: [0, 0.4, 0.5] is a retroreflective patch offset +0.4 m in Y
+# on the dock face.  Breaks the 4-fold Z symmetry so EPnP can resolve
+# dock-axis roll at TERMINAL range (2–4 m) where the solar stubs are
+# outside the camera FOV.
+CHIEF_POSE_MODEL_PTS = np.array([
+    [ 0.80,  0.80,  0.50], [ 0.80, -0.80,  0.50],
+    [-0.80,  0.80,  0.50], [-0.80, -0.80,  0.50],
+    [ 0.80,  0.80, -0.50], [ 0.80, -0.80, -0.50],
+    [-0.80,  0.80, -0.50], [-0.80, -0.80, -0.50],
+    [ 1.50,  0.00,  0.00],   # +X solar array root fitting
+    [-1.50,  0.00,  0.00],   # -X solar array root fitting (IS-1002 has two wings)
+    [ 0.00,  0.40,  0.50],   # dock-face marker (+Y offset, breaks 4-fold Z symmetry at close range)
+], dtype=float)
+
+# ── Phase timeouts ────────────────────────────────────────────────────
+PROX_OPS_MAX_S   = 50_000.0
+TERMINAL_MAX_S   = 20_000.0
+
+# ── Hard capture hysteresis ───────────────────────────────────────────
+HARD_CAPTURE_GRACE_S = 1.0   # brief misalignment allowed without resetting hold
 
 # ── Environment ───────────────────────────────────────────────────────
 ECLIPSE_NU_MIN = 0.1

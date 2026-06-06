@@ -95,6 +95,70 @@ class ThrusterLayout:
         dirs = np.array([e[1] for e in entries], dtype=float)
         return cls(pos, dirs, max_force_n)
 
+    @classmethod
+    def quad_16(cls, half_extents_m=(0.30, 0.30, 0.40), cant_deg=15.0, max_force_n=0.25):
+        """
+        Standard 16-thruster quad-cluster RCS (Apollo/Dragon style).
+
+        Four clusters of four nozzles placed 90° apart at the body midplane
+        (±X and ±Y faces, z=0). Each nozzle fires tangentially (±Y for ±X-face
+        clusters, ±X for ±Y-face clusters) and is canted cant_deg toward ±Z so
+        the docking axis gets force authority without dedicated axial thrusters.
+
+        Z-axis authority: 8 × sin(cant_deg) × max_force_n per direction.
+        Plume toward chief (+Z): only aft-canted nozzles (dz<0); use chief_mask
+        to block these during final approach.
+        """
+        hx, hy, _ = map(float, half_extents_m)
+        c = float(np.cos(np.radians(cant_deg)))
+        s = float(np.sin(np.radians(cant_deg)))
+        entries = []
+        for px in (+hx, -hx):
+            for dy, dz in [(+c, +s), (+c, -s), (-c, +s), (-c, -s)]:
+                entries.append(([px, 0.0, 0.0], [0.0, dy, dz]))
+        for py in (+hy, -hy):
+            for dx, dz in [(+c, +s), (+c, -s), (-c, +s), (-c, -s)]:
+                entries.append(([0.0, py, 0.0], [dx, 0.0, dz]))
+        pos  = np.array([e[0] for e in entries], dtype=float)
+        dirs = np.array([e[1] for e in entries], dtype=float)
+        return cls(pos, dirs, max_force_n)
+
+    @classmethod
+    def corner_pod_16(cls, half_extents_m=(0.30, 0.30, 0.40), cant_deg=35.26, max_force_n=0.25):
+        """
+        Isometric 16-thruster corner-pod layout (Apollo/Dragon-derived).
+
+        Four pods at body midplane corners (±hx, ±hy, 0). Each pod has four
+        thrusters: ±X and ±Y lateral directions each canted cant_deg toward
+        ±Z. At the isometric angle (35.26°): Z authority = 8 sin(θ) F_max,
+        lateral = 4 cos(θ) F_max — balanced 6-DoF with no dedicated axial
+        thrusters.
+        """
+        hx, hy, _ = map(float, half_extents_m)
+        c = float(np.cos(np.radians(cant_deg)))
+        s = float(np.sin(np.radians(cant_deg)))
+        entries = []
+        for sx in (+1, -1):
+            for sy in (+1, -1):
+                pos = [sx * hx, sy * hy, 0.0]
+                for dx, dz in [(+c, +s), (+c, -s), (-c, +s), (-c, -s)]:
+                    entries.append((pos, [dx * abs(sx), 0.0, dz]))
+                for dy, dz in [(+c, +s), (+c, -s), (-c, +s), (-c, -s)]:
+                    entries.append((pos, [0.0, dy * abs(sy), dz]))
+        # 4 pods × 8 thrusters = 32 total; keep only the canonical 4 per pod
+        # (±X cant ±Z, ±Y cant ±Z) → 4 × 4 = 16
+        entries = []
+        for sx in (+1, -1):
+            for sy in (+1, -1):
+                pos = [sx * hx, sy * hy, 0.0]
+                entries.append((pos, [sx * c, 0.0,  s]))
+                entries.append((pos, [sx * c, 0.0, -s]))
+                entries.append((pos, [0.0, sy * c,  s]))
+                entries.append((pos, [0.0, sy * c, -s]))
+        pos  = np.array([e[0] for e in entries], dtype=float)
+        dirs = np.array([e[1] for e in entries], dtype=float)
+        return cls(pos, dirs, max_force_n)
+
     def chief_mask(self, chief_dir_body, cone_half_deg=45.0):
         """
         Boolean mask of thrusters whose exhaust plume points toward the chief.

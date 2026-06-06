@@ -30,6 +30,8 @@ import sys, os, time, traceback, warnings
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 warnings.filterwarnings("ignore")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -71,14 +73,18 @@ from control.lambert_controller           import GEORPODController, RPODMode
 from control.keepout_planner              import KeepoutAvoidancePlanner
 from control.spin_sync_controller         import SpinSyncController
 from fsw.mode_manager                     import ModeManager, Mode
-from utils.quaternion                     import quat_error, rot_matrix
-from utils.docking_metrics                import docking_alignment_metrics, docking_geometry_metrics
 from fsw.capture_gate                     import evaluate_capture, CaptureGateIn
-from sim_config import *
+from sensors.dock_port_sensor             import DockPortSensor
+from utils.quaternion                     import quat_error, rot_matrix
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# =====================================================================
+#  MISSION CONFIG — single source of truth
+# =====================================================================
+from sim_config import *
 
 MC_STRESS_CASES = (
     "nominal",
@@ -225,6 +231,60 @@ def q_ref_align_axis(q_current, body_axis, desired_axis_eci):
     return quat_from_rot_matrix(R_delta @ R_current)
 
 
+def docking_alignment_metrics(R_dep_body_to_lvlh, port_axis_lvlh):
+    dep_axis = R_dep_body_to_lvlh @ DEP_DOCK_AXIS_BODY
+    dep_axis /= max(np.linalg.norm(dep_axis), 1e-12)
+    desired_axis = -port_axis_lvlh
+    desired_axis /= max(np.linalg.norm(desired_axis), 1e-12)
+    align_deg = float(np.degrees(np.arccos(
+        np.clip(np.dot(dep_axis, desired_axis), -1.0, 1.0))))
+    return {
+        "ok": bool(align_deg <= DOCK_ALIGN_MAX_DEG),
+        "align_deg": align_deg,
+    }
+
+
+def docking_geometry_metrics(dep_lvlh, R_body_to_lvlh):
+    axis_body = DOCK_AXIS_BODY / max(np.linalg.norm(DOCK_AXIS_BODY), 1e-12)
+    dep_body = R_body_to_lvlh.T @ dep_lvlh
+    port_to_dep_body = dep_body - DOCK_PORT_BODY
+    port_range = float(np.linalg.norm(port_to_dep_body))
+    axial = float(np.dot(port_to_dep_body, axis_body))
+    lateral_vec = port_to_dep_body - axial * axis_body
+    lateral = float(np.linalg.norm(lateral_vec))
+
+    inside_body = bool(np.all(np.abs(dep_body) < CHIEF_BODY_HALF_EXTENTS_M))
+    on_dock_face = dep_body[2] > CHIEF_BODY_HALF_EXTENTS_M[2] - DOCK_FACE_TOL_M
+    in_aperture = lateral <= DOCK_PORT_APERTURE_M
+    body_clear = (not inside_body) or (on_dock_face and in_aperture)
+    capture_core = port_range <= DOCK_CONE_MIN_RANGE_M and in_aperture
+
+    if port_range <= 1e-9:
+        cone_angle_deg = 0.0
+    else:
+        cos_ang = np.clip(axial / port_range, -1.0, 1.0)
+        cone_angle_deg = float(np.degrees(np.arccos(cos_ang)))
+
+    cone_ok = capture_core or (axial > 0.0
+                               and cone_angle_deg <= DOCK_CONE_HALF_ANGLE_DEG)
+    cone_error_deg = max(0.0, cone_angle_deg - DOCK_CONE_HALF_ANGLE_DEG)
+    if capture_core:
+        cone_error_deg = 0.0
+
+    return {
+        "ok": bool(body_clear and cone_ok and in_aperture),
+        "body_clear": bool(body_clear),
+        "cone_ok": bool(cone_ok),
+        "in_aperture": bool(in_aperture),
+        "capture_core": bool(capture_core),
+        "inside_body": inside_body,
+        "lateral_m": lateral,
+        "axial_m": axial,
+        "cone_angle_deg": cone_angle_deg,
+        "cone_error_deg": cone_error_deg,
+    }
+
+
 def propagate_full_force(pos, vel, dt_total, t_abs, Cr, Am, substep=60.0):
     J2 = 1.08263e-3;  RE = 6.3781e6
     AU = 1.495978707e11;  P0 = 4.56e-6
@@ -352,8 +412,9 @@ def run_trial(trial_id,
         restitution=SOFT_CAPTURE_RESTITUTION,
         tangential_damping=SOFT_CAPTURE_TANGENTIAL_DAMPING,
         capture_vrel_ms=SOFT_CAPTURE_VREL_MS)
-    thruster_layout = ThrusterLayout.box_24(  # box_16 had no ±Z; dock axis is body-Z → 10% alloc efficiency
-        half_extents_m=(0.30, 0.30, 0.40),
+    thruster_layout = ThrusterLayout.corner_pod_16(
+        half_extents_m=tuple(DEPUTY_BODY_HALF_EXTENTS_M),
+        cant_deg=THRUSTER_CANT_DEG,
         max_force_n=THRUSTER_MAX_FORCE_N)
     body_pair = FiniteBodyPair(
         chief_body=BoxBody(CHIEF_BODY_HALF_EXTENTS_M, name="chief"),
@@ -363,7 +424,7 @@ def run_trial(trial_id,
         gimbal_range_deg=150.0,
         max_range_m=5000.0)
     keepout_planner = KeepoutAvoidancePlanner(
-        zones=KeepoutAvoidancePlanner.default_appendage_zones())
+        zones=KeepoutAvoidancePlanner.chief_appendage_zones(CHIEF_SOLAR_ARRAY_HALF_SPAN_M))
     spin_sync = SpinSyncController()
 
     # ── Chief attitude (varied tumble) ───────────────────────────────
@@ -374,7 +435,8 @@ def run_trial(trial_id,
         enable_gg_torque=True)
     chief_pose_est = ChiefPoseEstimator(
         cam_sensor=cam_sensor, dt=DT_OUTER,
-        N_avg=50, alpha_filter=0.3, sigma_omega=0.002)
+        N_avg=50, alpha_filter=0.3, sigma_omega=0.002,
+        pose_model_pts=CHIEF_POSE_MODEL_PTS)
 
     fsw = ModeManager()
     cw  = CWDynamics(chief_orbit_radius_km=CHIEF_A_KM)
@@ -432,6 +494,12 @@ def run_trial(trial_id,
     dv_at_term_start  = 0.0
     t_prox_start      = None
     t_term_start      = None
+    dock_port_sensor    = DockPortSensor(alpha=PORT_TRACK_ALPHA,
+                                         innovation_gate_m=PORT_TRACK_GATE_M)
+    _R_b2l_sync         = None   # flip-filtered R for spin sync
+    _pose_bias_samples  = []    # (truth_align, est_align) pairs during soft capture
+    hard_capture_grace_s = 0.0  # hysteresis: brief misalignment doesn't reset hold
+    _prev_rpod_mode     = None  # tracks mode transitions for EKF velocity reseed
 
     # ── Main loop ────────────────────────────────────────────────────
     while t < T_SIM_MAX and not docked:
@@ -548,46 +616,67 @@ def run_trial(trial_id,
                 else:
                     q_cmd = q_ref
                     _R_b2l_att = chief_pose_est.R_body2lvlh
+                    _pose_age_ok = float(chief_pose_est.debug.get('pose_age_s', np.inf)) < 60.0
                     _ekf_rng_att = float(np.linalg.norm(th_ekf.x[0:3]))
                     _chief_dir_eci = (R_e2l.T @ (th_ekf.x[0:3] / max(_ekf_rng_att, 1e-9))
                                       if _ekf_rng_att > 0.5 else None)
+                    _dp_est  = dock_port_sensor.estimate
+                    _dp_norm = float(np.linalg.norm(_dp_est))
+                    _dp_axis_eci = -(R_e2l.T @ (_dp_est / max(_dp_norm, 1e-9)))
+
                     if rpod_ctrl.mode == RPODMode.TERMINAL:
-                        if _R_b2l_att is not None:
+                        if _R_b2l_att is not None and _pose_age_ok:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                        elif dock_port_sensor.is_valid:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, _dp_axis_eci)
                         elif _chief_dir_eci is not None:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                     elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
-                        if _R_b2l_att is not None:
+                        if _R_b2l_att is not None and _pose_age_ok:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                        elif dock_port_sensor.is_valid:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, _dp_axis_eci)
                         elif _chief_dir_eci is not None:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                     elif (rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.LOST_TARGET)
                           and phase2_active
                           and float(np.linalg.norm(th_ekf.x[0:3])) < CLOSE_PROX_NAV_RANGE_M):
-                        if _R_b2l_att is not None:
+                        if _R_b2l_att is not None and _pose_age_ok:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
+                        elif dock_port_sensor.is_valid:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, _dp_axis_eci)
                         elif _chief_dir_eci is not None:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                     omega_for_ctrl = omega_est
                     if ENABLE_SPIN_SYNC and rpod_ctrl.mode in (RPODMode.TERMINAL,
                                                                 RPODMode.SOFT_CAPTURE):
-                        # Gate spin sync in SOFT_CAPTURE: if alignment has diverged
-                        # past 30° spin sync opposes convergence — fall back to pure
-                        # attitude tracking.
-                        _spin_sync_ok = (rpod_ctrl.mode != RPODMode.SOFT_CAPTURE
-                                         or attitude_align_deg_cmd is None
-                                         or attitude_align_deg_cmd < 30.0)
+                        _omega_mag = float(np.linalg.norm(chief_pose_est.omega_estimate))
+                        _spin_sync_ok = (chief_pose_est.is_valid
+                                         and _omega_mag < SPIN_SYNC_MAX_OMEGA_RAD_S
+                                         and _pose_age_ok)
                         if _spin_sync_ok:
-                            _R_b2l_sync = chief_pose_est.R_body2lvlh
+                            _R_candidate = chief_pose_est.R_body2lvlh
+                            if _R_candidate is not None:
+                                if _R_b2l_sync is None:
+                                    _R_b2l_sync = _R_candidate
+                                else:
+                                    _R_delta = _R_b2l_sync.T @ _R_candidate
+                                    _cos_a = float(np.clip(
+                                        (np.trace(_R_delta) - 1.0) / 2.0, -1.0, 1.0))
+                                    if np.degrees(np.arccos(_cos_a)) < 2.0:
+                                        _R_b2l_sync = _R_candidate
                             if _R_b2l_sync is not None:
                                 omega_chief_lvlh = _R_b2l_sync @ chief_pose_est.omega_estimate
                             else:
@@ -680,8 +769,8 @@ def run_trial(trial_id,
                         th_ekf.update(z_w, R_w, gate_k=50.0)
                 ekf_lvlh = np.concatenate([th_ekf.position, th_ekf.velocity])
                 rdv_started = True
-                rpod_ctrl.standoff = max(50.0, abs(true_cw_pos[1]))
-                rpod_ctrl.start_rendezvous(t, truth_range=cw.range_m)
+                rpod_ctrl.standoff = max(50.0, abs(ekf_lvlh[1]))
+                rpod_ctrl.start_rendezvous(t, truth_range=float(np.linalg.norm(ekf_lvlh[:3])))
                 dv_at_prox_start = cw.dv_total
                 t_prox_start     = t
 
@@ -715,43 +804,41 @@ def run_trial(trial_id,
             omega_est_lvlh = (R_e2l @ omega_est_body
                               if omega_est_valid else np.zeros(3))
 
-            # Port position
+            # Port position.  This models the independent close-range
+            # dock-port flash-lidar/port tracker, not the body camera, so
+            # camera dropout/blockage stress must not disable it.
             R_est_b2l = chief_pose_est.R_body2lvlh
             _nav_range_for_port = float(np.linalg.norm(th_ekf.x[0:3]))
-            _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)
-                                    and _nav_range_for_port < 5.0
-                                    and not cam_sensor.is_lost
-                                    and not camera_blocked)
+            _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE,
+                                                        RPODMode.PROX_OPS)
+                                    and _nav_range_for_port < 10.0)
             if _direct_port_visible:
-                port_eci_meas = chief_att.dock_port_eci(chi_pos_m_prev)
-                port_lvlh_true = R_e2l @ (port_eci_meas - chi_pos_m_prev)
-                port_sigma_m = (max(0.01, 0.002 * _nav_range_for_port)
-                                * profile["port_noise_scale"])
-                port_meas = port_lvlh_true + rng.normal(0.0, port_sigma_m, 3)
-                if not hasattr(rpod_ctrl, '_port_tracker'):
-                    rpod_ctrl._port_tracker = PortTracker(
-                        alpha=PORT_TRACK_ALPHA,
-                        innovation_gate_m=PORT_TRACK_GATE_M)
-                port_lvlh_ctrl, _ = rpod_ctrl._port_tracker.update(
-                    port_meas, DT_OUTER, measurement_valid=True)
-                _ekf_rng_fb    = float(np.linalg.norm(th_ekf.x[0:3]))
-                port_axis_lvlh = (R_est_b2l @ DOCK_AXIS_BODY if R_est_b2l is not None
-                                  else th_ekf.x[0:3] / max(_ekf_rng_fb, 1e-9)
-                                  if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
+                port_lvlh_true = R_e2l @ (chief_att.dock_port_eci(chi_pos_m_prev) - chi_pos_m_prev)
+                port_lvlh_ctrl, _ = dock_port_sensor.update(
+                    port_lvlh_true, _nav_range_for_port, DT_OUTER,
+                    measurement_valid=True, rng=rng,
+                    noise_scale=profile["port_noise_scale"])
+                if R_est_b2l is not None and _pose_age_ok:
+                    port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
+                elif dock_port_sensor.is_valid:
+                    _dp = port_lvlh_ctrl
+                    port_axis_lvlh = _dp / max(float(np.linalg.norm(_dp)), 1e-9)
+                else:
+                    _ekf_rng_fb = float(np.linalg.norm(th_ekf.x[0:3]))
+                    port_axis_lvlh = (th_ekf.x[0:3] / max(_ekf_rng_fb, 1e-9)
+                                      if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
                 r_arm_lvlh     = port_lvlh_ctrl
-            elif R_est_b2l is not None and omega_est_valid:
-                if hasattr(rpod_ctrl, '_port_tracker'):
-                    rpod_ctrl._port_tracker.update(
-                        np.zeros(3), DT_OUTER, measurement_valid=False)
+            elif R_est_b2l is not None:
+                dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
                 port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
                 port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
                 r_arm_lvlh     = port_lvlh_ctrl
             else:
-                if hasattr(rpod_ctrl, '_port_tracker'):
-                    rpod_ctrl._port_tracker.update(
-                        np.zeros(3), DT_OUTER, measurement_valid=False)
+                dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
                 port_lvlh_ctrl = np.zeros(3)
-                port_axis_lvlh = np.zeros(3)
+                _ekf_rng_fb    = float(np.linalg.norm(th_ekf.x[0:3]))
+                port_axis_lvlh = (th_ekf.x[0:3] / _ekf_rng_fb
+                                  if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
                 r_arm_lvlh     = np.zeros(3)
 
             port_vel_lvlh = np.cross(omega_est_lvlh, r_arm_lvlh)
@@ -787,8 +874,10 @@ def run_trial(trial_id,
                 accel_cmd  = np.zeros(3)
                 impulse_dv = None
             if ENABLE_KEEP_OUT_AVOIDANCE and not latch_engaged:
-                keepout = keepout_planner.compute(
-                    true_cw_pos, R_e2l @ rot_matrix(chief_att.quaternion))
+                _keepout_R = chief_pose_est.R_body2lvlh
+                if _keepout_R is None:
+                    _keepout_R = np.eye(3)
+                keepout = keepout_planner.compute(guidance_pos, _keepout_R)
                 accel_cmd = accel_cmd + keepout["accel"]
 
             ekf_coast_active = (rpod_ctrl.mode == RPODMode.LAMBERT
@@ -841,6 +930,20 @@ def run_trial(trial_id,
             true_cw_vel = R_e2l @ (dep_vel_eci - chi_vel_ms)
             true_cw     = np.concatenate([true_cw_pos, true_cw_vel])
             cw.state    = true_cw
+
+            # EKF velocity reseed on TERMINAL → LOST_TARGET/PROX_OPS transition
+            _cur_rpod_mode = rpod_ctrl.mode
+            if (_cur_rpod_mode in (RPODMode.LOST_TARGET, RPODMode.PROX_OPS)
+                    and _prev_rpod_mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)):
+                v_dop_reseed, _ = rng_sensor.measure_doppler(
+                    dr_lvlh=true_cw_pos, dv_lvlh=true_cw_vel,
+                    pos_est_ekf=th_ekf.x[0:3], dt=DT_OUTER)
+                _ekf_rng_rs = float(np.linalg.norm(th_ekf.x[0:3]))
+                if _ekf_rng_rs > 0.01:
+                    _r_hat_rs = th_ekf.x[0:3] / _ekf_rng_rs
+                    _v_rad_rs = float(np.dot(v_dop_reseed, _r_hat_rs))
+                    th_ekf.x[3:6] = _v_rad_rs * _r_hat_rs
+            _prev_rpod_mode = _cur_rpod_mode
 
             # EKF predict + update
             truth_rng = np.linalg.norm(true_cw_pos)
@@ -936,18 +1039,13 @@ def run_trial(trial_id,
                 R_chief_to_world=R_body_to_lvlh_d,
                 deputy_com_world=true_cw_pos,
                 R_deputy_to_world=R_dep_body_to_lvlh_d)
-            # Use dock_geom["body_clear"] — matches main.py.
-            # body_clear=True when deputy COM is above the dock face even if
-            # lower body corners penetrate the chief box (valid during final
-            # approach through the aperture). raw finite_body["collision"] is
-            # too conservative and causes false blocks.
             finite_body_ok = ((not ENABLE_FINITE_BODY_COLLISION)
                               or dock_geom["body_clear"])
+            _align_deg = align_geom["align_deg"]
             _cg = evaluate_capture(CaptureGateIn(
                 port_range_m   = port_range,
                 port_vrel_ms   = port_vrel,
-                align_deg      = (attitude_align_deg_cmd if attitude_align_deg_cmd is not None
-                                  else float('nan')),
+                align_deg      = _align_deg if np.isfinite(_align_deg) else float('nan'),
                 body_clear     = finite_body_ok,
                 capture_core   = dock_geom["capture_core"],
                 geometry_ok    = dock_geom["ok"],
@@ -1012,6 +1110,9 @@ def run_trial(trial_id,
             if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                 soft_capture_align_min_deg = min(soft_capture_align_min_deg,
                                                  align_geom["align_deg"])
+                if attitude_align_deg_cmd is not None:
+                    _pose_bias_samples.append(
+                        (align_geom["align_deg"], attitude_align_deg_cmd))
             capture_hold_ready = (rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
                                   and (hard_capture_ready or soft_capture_certified))
             last_capture_diag = {
@@ -1029,10 +1130,16 @@ def run_trial(trial_id,
 
             if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE and capture_hold_ready:
                 hard_capture_hold_s += DT_OUTER
-                max_capture_hold_s = max(max_capture_hold_s,
-                                         hard_capture_hold_s)
+                hard_capture_grace_s = 0.0
+                max_capture_hold_s = max(max_capture_hold_s, hard_capture_hold_s)
+            elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE and hard_capture_hold_s > 0.0:
+                hard_capture_grace_s += DT_OUTER
+                if hard_capture_grace_s > HARD_CAPTURE_GRACE_S:
+                    hard_capture_hold_s = 0.0
+                    hard_capture_grace_s = 0.0
             else:
-                hard_capture_hold_s = 0.0
+                hard_capture_hold_s  = 0.0
+                hard_capture_grace_s = 0.0
 
             if (rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
                     and soft_capture_t is not None
@@ -1054,6 +1161,19 @@ def run_trial(trial_id,
                 docked = True
                 rpod_ctrl._set_mode(RPODMode.DOCKING, t)
                 break
+
+        if (t_term_start is not None
+                and rpod_ctrl.mode == RPODMode.TERMINAL
+                and (t - t_term_start) > TERMINAL_MAX_S):
+            capture_timeout = True
+            capture_timeout_detail = "TERMINAL_WATCHDOG"
+            break
+        if (t_prox_start is not None
+                and rpod_ctrl.mode == RPODMode.PROX_OPS
+                and (t - t_prox_start) > PROX_OPS_MAX_S):
+            capture_timeout = True
+            capture_timeout_detail = "PROX_OPS_WATCHDOG"
+            break
 
         t += DT_OUTER
 
@@ -1114,6 +1234,10 @@ def run_trial(trial_id,
         "final_soft_certified": bool(last_capture_diag.get("soft_certified", False)),
         "final_hard_strict": bool(last_capture_diag["hard_strict"]),
         "max_nav_err_m": max_nav_err_m,
+        "pose_bias_mean_deg": float(np.mean([e - t for t, e in _pose_bias_samples])
+                                    if _pose_bias_samples else np.nan),
+        "pose_bias_max_deg":  float(np.max([abs(e - t) for t, e in _pose_bias_samples])
+                                    if _pose_bias_samples else np.nan),
         "range_drop_s": range_drop_ticks * DT_OUTER,
         "camera_drop_s": camera_drop_ticks * DT_OUTER,
     }
@@ -1460,6 +1584,8 @@ def summarise(results, out_dir="."):
              final_soft_certified = np.array([r.get('final_soft_certified', False) for r in results]),
              final_hard_strict = np.array([r.get('final_hard_strict', False) for r in results]),
              max_nav_err_m = np.array([r.get('max_nav_err_m', np.nan) for r in results], dtype=float),
+             pose_bias_mean_deg = np.array([r.get('pose_bias_mean_deg', np.nan) for r in results], dtype=float),
+             pose_bias_max_deg  = np.array([r.get('pose_bias_max_deg', np.nan) for r in results], dtype=float),
              range_drop_s = np.array([r.get('range_drop_s', 0.0) for r in results], dtype=float),
              camera_drop_s = np.array([r.get('camera_drop_s', 0.0) for r in results], dtype=float))
     print(f"\n  Raw data saved: {out_npz}")
