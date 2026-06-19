@@ -60,3 +60,12 @@ desktop.ini
 dist/
 build/
 *.egg-info/
+
+# SPEED+ dataset (14GB+, downloaded separately) and trained pose model artifacts
+speedplusv2/
+pose_cnn/checkpoints/
+pose_cnn/*.pt
+pose_cnn/*.pth
+pose_cnn/runs/
+# 50k rendered images — too large for git
+pose_cnn/data/

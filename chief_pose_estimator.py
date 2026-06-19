@@ -557,6 +557,33 @@ class ChiefPoseEstimator:
 
         return R_l2c.T @ R_body2cam
 
+    def inject_cnn_measurement(self, q_cnn: np.ndarray, sigma_deg: float = 5.0):
+        """
+        Inject a CNN-derived orientation estimate into the EKF.
+
+        Called periodically from the flight loop when ENABLE_CNN_POSE_ESTIMATOR
+        is True.  The CNN renders the chief from the canonical bearing direction
+        ([0,-1,0] × range — same as the training distribution) and regresses
+        the body-frame quaternion directly.
+
+        Parameters
+        ----------
+        q_cnn     : (4,) normalized quaternion [w,x,y,z] from the pose CNN
+        sigma_deg : 1-sigma orientation uncertainty for this CNN measurement [deg]
+        """
+        q_cnn = np.asarray(q_cnn, dtype=float)
+        q_cnn /= max(np.linalg.norm(q_cnn), 1e-12)
+        R_cnn    = _rot_matrix(q_cnn)
+        R_noise  = np.eye(3) * np.radians(sigma_deg) ** 2
+
+        if self._update(R_cnn, R_override=R_noise):
+            self._last_R_b2l  = R_cnn.copy()
+            self._pose_age_s  = 0.0
+            self._update_count += 1
+            self._debug["status"]       = 1
+            self._debug["pose_age_s"]   = 0.0
+            self._debug["update_count"] = self._update_count
+
     # ─────────────────────────────────────────────────────────────────
     # Properties
     # ─────────────────────────────────────────────────────────────────

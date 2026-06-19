@@ -23,7 +23,7 @@ class UncooperativePoseSensor:
 
     def __init__(self,
                  sigma_pos_m=0.20,
-                 sigma_att_deg=6.0,
+                 sigma_att_deg=30.0,
                  min_quality=0.25,
                  max_range_m=250.0,
                  rng=None):

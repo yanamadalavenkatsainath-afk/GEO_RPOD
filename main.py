@@ -332,6 +332,44 @@ chief_pose_est = ChiefPoseEstimator(
     sigma_omega=0.002,
     pose_model_pts=CHIEF_POSE_MODEL_PTS)
 
+# ── CNN pose estimator (optional) ────────────────────────────────────
+_cnn_model      = None
+_cnn_transform  = None
+_cnn_device     = None
+_CNN_BEARING    = np.array([0., -1., 0.])   # canonical bearing == training bearing
+_CNN_DT         = np.inf                    # replaced below if enabled
+
+if ENABLE_CNN_POSE_ESTIMATOR:
+    try:
+        import torch as _torch
+        from torchvision import transforms as _tv_transforms
+        from PIL import Image as _PIL_Image
+        from pose_cnn.model import PoseRegressionNet as _PoseRegressionNet
+        from render.chief_renderer import render_chief as _render_chief_fn
+
+        _cnn_device = _torch.device('cuda' if _torch.cuda.is_available() else 'cpu')
+        _cnn_model = _PoseRegressionNet(pretrained=False).to(_cnn_device)
+        _ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             CNN_CHECKPOINT_PATH)
+        _cnn_model.load_state_dict(
+            _torch.load(_ckpt, map_location=_cnn_device, weights_only=True))
+        _cnn_model.eval()
+
+        _cnn_transform = _tv_transforms.Compose([
+            _tv_transforms.Resize((224, 224)),
+            _tv_transforms.ToTensor(),
+            _tv_transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
+            _tv_transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225]),
+        ])
+        _CNN_DT = 1.0 / max(CNN_POSE_UPDATE_HZ, 1e-3)
+        print(f"  CNN pose estimator loaded: {_ckpt}  [{_cnn_device}]")
+        print(f"  CNN update rate: {CNN_POSE_UPDATE_HZ:.1f} Hz  "
+              f"sigma: {CNN_POSE_SIGMA_DEG:.1f} deg")
+    except Exception as _e:
+        print(f"  [WARNING] CNN pose estimator could not load: {_e}")
+        _cnn_model = None
+
 # FSW mode manager
 fsw = ModeManager()
 
@@ -375,8 +413,9 @@ soft_capture_align_min_deg = np.inf
 soft_capture_last_log_t = -np.inf
 capture_timeout = False
 capture_timeout_detail = ""
-t_prox_start = None
-t_term_start = None
+t_prox_start  = None
+t_term_start  = None
+_cnn_last_t   = -np.inf     # time of last CNN pose update
 ekf_coast_active = False    # True while on a Lambert coast arc
 th_ekf_pos_prev  = np.zeros(3)  # EKF position from previous step for Doppler
 thruster_torque_body_pending = np.zeros(3)
@@ -602,9 +641,17 @@ while t < T_SIM_MAX and not docked:
                 _dp_est  = dock_port_sensor.estimate
                 _dp_norm = float(np.linalg.norm(_dp_est))
                 _dp_axis_eci = -(R_e2l.T @ (_dp_est / max(_dp_norm, 1e-9)))
+                _port_axis_direct_ok = (
+                    dock_port_sensor.is_valid
+                    and _dp_norm > 1e-6
+                    and rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)
+                )
 
                 if rpod_ctrl.mode == RPODMode.TERMINAL:
-                    if _R_b2l_att is not None and _pose_age_ok:
+                    if _port_axis_direct_ok:
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY, _dp_axis_eci)
+                    elif _R_b2l_att is not None and _pose_age_ok:
                         q_cmd = q_ref_align_axis(
                             mekf.q, DEP_DOCK_AXIS_BODY,
                             -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
@@ -616,7 +663,10 @@ while t < T_SIM_MAX and not docked:
                             mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                 elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                     # Track the current dock axis continuously — do NOT freeze at capture.
-                    if _R_b2l_att is not None and _pose_age_ok:
+                    if _port_axis_direct_ok:
+                        q_cmd = q_ref_align_axis(
+                            mekf.q, DEP_DOCK_AXIS_BODY, _dp_axis_eci)
+                    elif _R_b2l_att is not None and _pose_age_ok:
                         q_cmd = q_ref_align_axis(
                             mekf.q, DEP_DOCK_AXIS_BODY,
                             -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
@@ -820,6 +870,30 @@ while t < T_SIM_MAX and not docked:
             dr_lvlh=th_ekf.x[0:3],
             q_chief=chief_att.quaternion)   # EPnP camera model only
         omega_est_lvlh = R_e2l @ omega_est_body if omega_est_valid else np.zeros(3)
+
+        # ── CNN pose update (periodic, PROX_OPS/TERMINAL/SOFT_CAPTURE) ─
+        # Renders the chief from the canonical bearing direction (same as
+        # the training distribution) and injects the CNN orientation
+        # estimate as an additional EKF measurement.  Disabled by default.
+        if (_cnn_model is not None
+                and phase2_active
+                and rpod_ctrl.mode in (RPODMode.PROX_OPS,
+                                       RPODMode.TERMINAL,
+                                       RPODMode.SOFT_CAPTURE)
+                and t - _cnn_last_t >= _CNN_DT):
+            _rng_cnn = float(np.linalg.norm(th_ekf.x[0:3]))
+            if _rng_cnn > 1.5:
+                _sun_lvlh_cnn = R_e2l @ sun_I
+                _dr_canon     = _CNN_BEARING * _rng_cnn
+                _img_arr      = _render_chief_fn(_dr_canon, chief_att.quaternion,
+                                                 _sun_lvlh_cnn)
+                _img_pil      = _PIL_Image.fromarray(_img_arr)
+                _img_t        = _cnn_transform(_img_pil).unsqueeze(0).to(_cnn_device)
+                with _torch.no_grad():
+                    _, _q_cnn = _cnn_model(_img_t)
+                chief_pose_est.inject_cnn_measurement(
+                    _q_cnn.squeeze(0).cpu().numpy(), CNN_POSE_SIGMA_DEG)
+                _cnn_last_t = t
 
         # ── Port position for guidance ─────────────────────────────────
         # Use sensor-estimated port geometry for control. In close terminal,

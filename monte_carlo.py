@@ -623,9 +623,17 @@ def run_trial(trial_id,
                     _dp_est  = dock_port_sensor.estimate
                     _dp_norm = float(np.linalg.norm(_dp_est))
                     _dp_axis_eci = -(R_e2l.T @ (_dp_est / max(_dp_norm, 1e-9)))
+                    _port_axis_direct_ok = (
+                        dock_port_sensor.is_valid
+                        and _dp_norm > 1e-6
+                        and rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)
+                    )
 
                     if rpod_ctrl.mode == RPODMode.TERMINAL:
-                        if _R_b2l_att is not None and _pose_age_ok:
+                        if _port_axis_direct_ok:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, _dp_axis_eci)
+                        elif _R_b2l_att is not None and _pose_age_ok:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
@@ -636,7 +644,10 @@ def run_trial(trial_id,
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY, _chief_dir_eci)
                     elif rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
-                        if _R_b2l_att is not None and _pose_age_ok:
+                        if _port_axis_direct_ok:
+                            q_cmd = q_ref_align_axis(
+                                mekf.q, DEP_DOCK_AXIS_BODY, _dp_axis_eci)
+                        elif _R_b2l_att is not None and _pose_age_ok:
                             q_cmd = q_ref_align_axis(
                                 mekf.q, DEP_DOCK_AXIS_BODY,
                                 -(R_e2l.T @ (_R_b2l_att @ DOCK_AXIS_BODY)))
@@ -1376,11 +1387,12 @@ def _draw_stress_case(rng_master, stress_mode, trial_id):
     return str(rng_master.choice(MC_STRESS_CASES, p=MC_STRESS_WEIGHTS))
 
 
-def run_monte_carlo(n_trials=300, master_seed=42, n_workers=8,
-                    stress_mode="mixed"):
+def _generate_trial_params(n_trials, master_seed=42, stress_mode="mixed",
+                           start_trial=0):
     rng_master = np.random.default_rng(master_seed)
     trial_params = []
-    for i in range(n_trials):
+    stop_trial = start_trial + n_trials
+    for i in range(stop_trial):
         omega_mag = rng_master.uniform(0.05, 0.25)
         omega_dir = rng_master.standard_normal(3)
         omega_dir /= np.linalg.norm(omega_dir)
@@ -1392,11 +1404,22 @@ def run_monte_carlo(n_trials=300, master_seed=42, n_workers=8,
         sc_omega0 = sc_dir * sc_mag
         noise_seed = int(rng_master.integers(0, 2**31))
         stress_case = _draw_stress_case(rng_master, stress_mode, i)
-        trial_params.append((i, chief_omega0, chief_M0, sc_omega0,
-                             noise_seed, stress_case))
+        if i >= start_trial:
+            trial_params.append((i, chief_omega0, chief_M0, sc_omega0,
+                                 noise_seed, stress_case))
+    return trial_params
+
+
+def run_monte_carlo(n_trials=300, master_seed=42, n_workers=8,
+                    stress_mode="mixed", start_trial=0):
+    trial_params = _generate_trial_params(n_trials, master_seed=master_seed,
+                                          stress_mode=stress_mode,
+                                          start_trial=start_trial)
 
     print(f"\nRunning {n_trials} Monte Carlo trials with {n_workers} worker(s)...")
     print(f"Stress mode: {stress_mode}")
+    if start_trial:
+        print(f"Replay start trial: {start_trial}")
     print(f"{'Trial':>6} {'Docked':>7} {'DV(m/s)':>9} "
           f"{'T_dock(hr)':>11} {'Prox_DV':>9} {'Term_DV':>9} "
           f"{'Chief_w(d/s)':>13} {'M0(deg)':>8} {'Stress':>14}")
@@ -1705,12 +1728,20 @@ if __name__ == "__main__":
     parser.add_argument("--stress-mode", type=str, default="mixed",
                         choices=("mixed", "nominal", "sweep"),
                         help="Stress-case selection: mixed, nominal, or sweep")
+    parser.add_argument("--trial-index", type=int, default=None,
+                        help="Replay one deterministic trial index from the campaign")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
     t_wall_start = time.time()
-    results = run_monte_carlo(n_trials=args.trials, master_seed=args.seed,
-                              n_workers=args.workers,
-                              stress_mode=args.stress_mode)
+    if args.trial_index is not None:
+        results = run_monte_carlo(n_trials=1, master_seed=args.seed,
+                                  n_workers=1,
+                                  stress_mode=args.stress_mode,
+                                  start_trial=args.trial_index)
+    else:
+        results = run_monte_carlo(n_trials=args.trials, master_seed=args.seed,
+                                  n_workers=args.workers,
+                                  stress_mode=args.stress_mode)
     summarise(results, out_dir=args.outdir)
     print(f"\n  Total wall time: {(time.time()-t_wall_start)/60:.1f} min")

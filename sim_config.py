@@ -140,6 +140,14 @@ TERMINAL_MAX_S   = 20_000.0
 # ── Hard capture hysteresis ───────────────────────────────────────────
 HARD_CAPTURE_GRACE_S = 1.0   # brief misalignment allowed without resetting hold
 
+# ── CNN pose estimator ────────────────────────────────────────────────
+# Off by default — analytic DLT+GN path remains the baseline.
+# Enable to add CNN-based orientation measurements in PROX_OPS/TERMINAL.
+ENABLE_CNN_POSE_ESTIMATOR = True
+CNN_POSE_UPDATE_HZ        = 1.0    # inference rate (keep ≤1 Hz — rendering is slow)
+CNN_CHECKPOINT_PATH       = "pose_cnn/checkpoints/pose_net.pt"
+CNN_POSE_SIGMA_DEG        = 5.0    # orientation noise assigned to CNN measurements
+
 # ── Environment ───────────────────────────────────────────────────────
 ECLIPSE_NU_MIN = 0.1
 MU_GEO = 3.986004418e14
