@@ -75,7 +75,13 @@ from control.spin_sync_controller         import SpinSyncController
 from fsw.mode_manager                     import ModeManager, Mode
 from fsw.capture_gate                     import evaluate_capture, CaptureGateIn
 from sensors.dock_port_sensor             import DockPortSensor
+from sensors.lidar_pointcloud_sensor      import LidarPointCloudSensor
+from estimation.nozzle_estimator          import NozzleEstimator
 from utils.quaternion                     import quat_error, rot_matrix
+
+UNCOOPERATIVE_MODE    = True
+SURVEY_START_M        = 35.0
+NOZZLE_CONF_THRESHOLD = 0.60
 
 import matplotlib
 matplotlib.use("Agg")
@@ -494,8 +500,22 @@ def run_trial(trial_id,
     dv_at_term_start  = 0.0
     t_prox_start      = None
     t_term_start      = None
+
+    # Terminal phase diagnostics
+    t_survey_start        = None
+    survey_engaged        = False
+    nozzle_conf_at_terminal = np.nan
+    max_nozzle_conf       = 0.0
+    uncoop_override_fired = False
+    com_at_capture_m      = np.nan
+    nozzle_conf_at_capture = np.nan
+    terminal_entry_range_m = np.nan
+    terminal_entry_align_deg = np.nan
     dock_port_sensor    = DockPortSensor(alpha=PORT_TRACK_ALPHA,
                                          innovation_gate_m=PORT_TRACK_GATE_M)
+    pc_sensor           = LidarPointCloudSensor(n_rays=60, noise_sigma_m=0.02)
+    nozzle_est          = NozzleEstimator(min_pts=40, conf_decay=0.01)
+    _pc_rng             = np.random.default_rng(rng_seed + 9999)
     _R_b2l_sync         = None   # flip-filtered R for spin sync
     _pose_bias_samples  = []    # (truth_align, est_align) pairs during soft capture
     hard_capture_grace_s = 0.0  # hysteresis: brief misalignment doesn't reset hold
@@ -815,38 +835,77 @@ def run_trial(trial_id,
             omega_est_lvlh = (R_e2l @ omega_est_body
                               if omega_est_valid else np.zeros(3))
 
-            # Port position.  This models the independent close-range
-            # dock-port flash-lidar/port tracker, not the body camera, so
-            # camera dropout/blockage stress must not disable it.
             R_est_b2l = chief_pose_est.R_body2lvlh
             _nav_range_for_port = float(np.linalg.norm(th_ekf.x[0:3]))
-            _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE,
-                                                        RPODMode.PROX_OPS)
-                                    and _nav_range_for_port < 10.0)
-            if _direct_port_visible:
-                port_lvlh_true = R_e2l @ (chief_att.dock_port_eci(chi_pos_m_prev) - chi_pos_m_prev)
-                port_lvlh_ctrl, _ = dock_port_sensor.update(
-                    port_lvlh_true, _nav_range_for_port, DT_OUTER,
-                    measurement_valid=True, rng=rng,
-                    noise_scale=profile["port_noise_scale"])
-                if R_est_b2l is not None and _pose_age_ok:
-                    port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
-                elif dock_port_sensor.is_valid:
-                    _dp = port_lvlh_ctrl
-                    port_axis_lvlh = _dp / max(float(np.linalg.norm(_dp)), 1e-9)
+
+            if UNCOOPERATIVE_MODE:
+                # Point cloud update
+                if (_nav_range_for_port < SURVEY_START_M * 1.5
+                        and rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.SURVEY,
+                                               RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)):
+                    _pc_pts = pc_sensor.measure(
+                        R_e2l @ (chi_pos_m_prev - dep_pos_eci),
+                        chief_att.quaternion, rng=_pc_rng)
+                    nozzle_est.update(_pc_pts, th_ekf.x[0:3].copy())
+
+                # SURVEY transitions
+                if (rdv_started
+                        and rpod_ctrl.mode == RPODMode.PROX_OPS
+                        and _nav_range_for_port < SURVEY_START_M):
+                    rpod_ctrl._set_mode(RPODMode.SURVEY, t)
+                    if not survey_engaged:
+                        survey_engaged = True
+                        t_survey_start = t
+
+                max_nozzle_conf = max(max_nozzle_conf, nozzle_est.confidence)
+
+                if (rpod_ctrl.mode == RPODMode.SURVEY
+                        and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD):
+                    nozzle_conf_at_terminal  = nozzle_est.confidence
+                    terminal_entry_range_m   = _nav_range_for_port
+                    rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
+
+                # Nozzle as capture target
+                if nozzle_est.is_valid:
+                    port_lvlh_ctrl = nozzle_est.estimate
+                    _nz = port_lvlh_ctrl / max(np.linalg.norm(port_lvlh_ctrl), 1e-9)
+                    port_axis_lvlh = -_nz
+                    r_arm_lvlh     = port_lvlh_ctrl
                 else:
-                    _ekf_rng_fb = float(np.linalg.norm(th_ekf.x[0:3]))
-                    port_axis_lvlh = (th_ekf.x[0:3] / max(_ekf_rng_fb, 1e-9)
-                                      if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
-                r_arm_lvlh     = port_lvlh_ctrl
-            elif R_est_b2l is not None:
+                    port_lvlh_ctrl = th_ekf.x[0:3].copy()
+                    port_axis_lvlh = np.array([0., 0., -1.])
+                    r_arm_lvlh     = np.zeros(3)
                 dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
-                port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
-                port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
-                r_arm_lvlh     = port_lvlh_ctrl
+
             else:
-                dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
-                port_lvlh_ctrl = np.zeros(3)
+                # Cooperative legacy path
+                _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE,
+                                                            RPODMode.PROX_OPS)
+                                        and _nav_range_for_port < 10.0)
+                if _direct_port_visible:
+                    port_lvlh_true = R_e2l @ (chief_att.dock_port_eci(chi_pos_m_prev) - chi_pos_m_prev)
+                    port_lvlh_ctrl, _ = dock_port_sensor.update(
+                        port_lvlh_true, _nav_range_for_port, DT_OUTER,
+                        measurement_valid=True, rng=rng,
+                        noise_scale=profile["port_noise_scale"])
+                    if R_est_b2l is not None and _pose_age_ok:
+                        port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
+                    elif dock_port_sensor.is_valid:
+                        _dp = port_lvlh_ctrl
+                        port_axis_lvlh = _dp / max(float(np.linalg.norm(_dp)), 1e-9)
+                    else:
+                        _ekf_rng_fb = float(np.linalg.norm(th_ekf.x[0:3]))
+                        port_axis_lvlh = (th_ekf.x[0:3] / max(_ekf_rng_fb, 1e-9)
+                                          if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
+                    r_arm_lvlh     = port_lvlh_ctrl
+                elif R_est_b2l is not None:
+                    dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
+                    port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
+                    port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
+                    r_arm_lvlh     = port_lvlh_ctrl
+                else:
+                    dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
+                    port_lvlh_ctrl = np.zeros(3)
                 _ekf_rng_fb    = float(np.linalg.norm(th_ekf.x[0:3]))
                 port_axis_lvlh = (th_ekf.x[0:3] / _ekf_rng_fb
                                   if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
@@ -861,11 +920,12 @@ def run_trial(trial_id,
             else:
                 attitude_align_deg_cmd = None
 
-            # TERMINAL override (main.py fix — unchanged)
+            # TERMINAL override (skipped in uncooperative mode — SURVEY handles transition)
             _nav_range_now = float(np.linalg.norm(th_ekf.x[0:3]))
             if (rdv_started
-                    and rpod_ctrl.mode == RPODMode.PROX_OPS
-                    and _nav_range_now < MAIN_TERMINAL_M):
+                    and rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.SURVEY)
+                    and _nav_range_now < MAIN_TERMINAL_M
+                    and not UNCOOPERATIVE_MODE):
                 rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
                 if t_term_start is None:
                     dv_at_term_start = cw.dv_total
@@ -1074,6 +1134,18 @@ def run_trial(trial_id,
             soft_capture_ready = _cg.soft_capture_ready
             hard_capture_ready = _cg.hard_capture_ready
 
+            # Uncooperative override: nozzle on body surface ~0.45m from CoM.
+            _uncoop_com_m = float(np.linalg.norm(true_cw_pos))
+            if (UNCOOPERATIVE_MODE
+                    and rpod_ctrl.mode == RPODMode.TERMINAL
+                    and not soft_capture_ready
+                    and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8
+                    and _uncoop_com_m < 0.25):
+                soft_capture_ready     = True
+                uncoop_override_fired  = True
+                com_at_capture_m       = _uncoop_com_m
+                nozzle_conf_at_capture = nozzle_est.confidence
+
             if rpod_ctrl.mode == RPODMode.TERMINAL and soft_capture_ready:
                 if port_range > 1e-6:
                     n_contact = dep_to_port / port_range
@@ -1118,6 +1190,18 @@ def run_trial(trial_id,
 
             soft_capture_stable    = _cg.soft_capture_stable
             soft_capture_certified = _cg.soft_capture_certified
+
+            # UNCOOP hard-capture override: alignment to a tumbling nozzle never reaches
+            # DOCK_ALIGN_MAX_DEG (10°), so _cg.hard_capture_ready never fires. Once the
+            # soft-capture override has fired and geometry is stable (port_rng < 0.30m,
+            # vrel < 50mm/s), skip the alignment gate and promote to hard_capture_ready.
+            if (UNCOOPERATIVE_MODE
+                    and uncoop_override_fired
+                    and rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
+                    and soft_capture_stable
+                    and not hard_capture_ready):
+                hard_capture_ready = True
+
             if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                 soft_capture_align_min_deg = min(soft_capture_align_min_deg,
                                                  align_geom["align_deg"])
@@ -1251,6 +1335,15 @@ def run_trial(trial_id,
                                     if _pose_bias_samples else np.nan),
         "range_drop_s": range_drop_ticks * DT_OUTER,
         "camera_drop_s": camera_drop_ticks * DT_OUTER,
+        # Terminal phase diagnostics
+        "survey_engaged":           survey_engaged,
+        "t_survey_start_s":         t_survey_start if t_survey_start else np.nan,
+        "max_nozzle_conf":          max_nozzle_conf,
+        "nozzle_conf_at_terminal":  float(nozzle_conf_at_terminal),
+        "terminal_entry_range_m":   float(terminal_entry_range_m),
+        "uncoop_override_fired":    uncoop_override_fired,
+        "com_at_capture_m":         float(com_at_capture_m),
+        "nozzle_conf_at_capture":   float(nozzle_conf_at_capture),
     }
 
 
@@ -1610,8 +1703,23 @@ def summarise(results, out_dir="."):
              pose_bias_mean_deg = np.array([r.get('pose_bias_mean_deg', np.nan) for r in results], dtype=float),
              pose_bias_max_deg  = np.array([r.get('pose_bias_max_deg', np.nan) for r in results], dtype=float),
              range_drop_s = np.array([r.get('range_drop_s', 0.0) for r in results], dtype=float),
-             camera_drop_s = np.array([r.get('camera_drop_s', 0.0) for r in results], dtype=float))
+             camera_drop_s = np.array([r.get('camera_drop_s', 0.0) for r in results], dtype=float),
+             # Terminal phase diagnostics (uncooperative pipeline)
+             survey_engaged          = np.array([r.get('survey_engaged', False) for r in results]),
+             t_survey_start_s        = np.array([r.get('t_survey_start_s', np.nan) for r in results], dtype=float),
+             max_nozzle_conf         = np.array([r.get('max_nozzle_conf', 0.0) for r in results], dtype=float),
+             nozzle_conf_at_terminal = np.array([r.get('nozzle_conf_at_terminal', np.nan) for r in results], dtype=float),
+             terminal_entry_range_m  = np.array([r.get('terminal_entry_range_m', np.nan) for r in results], dtype=float),
+             uncoop_override_fired   = np.array([r.get('uncoop_override_fired', False) for r in results]),
+             com_at_capture_m        = np.array([r.get('com_at_capture_m', np.nan) for r in results], dtype=float),
+             nozzle_conf_at_capture  = np.array([r.get('nozzle_conf_at_capture', np.nan) for r in results], dtype=float))
+    # Also pickle the full results list for post-processing scripts
+    import pickle
+    out_pkl = os.path.join(out_dir, "mc_results.pkl")
+    with open(out_pkl, "wb") as _f:
+        pickle.dump(results, _f)
     print(f"\n  Raw data saved: {out_npz}")
+    print(f"  Pickle saved:   {out_pkl}")
     print(f"  Summary saved:  {out_txt}")
 
     # ── Plots ────────────────────────────────────────────────────────

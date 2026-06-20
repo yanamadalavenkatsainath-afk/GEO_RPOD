@@ -52,6 +52,15 @@ DOCK_PORT_BODY            = np.array([0.0, 0.0, 0.5])   # m in chief body frame
 DOCK_AXIS_BODY            = np.array([0.0, 0.0, 1.0])   # approach axis, chief body
 DEP_DOCK_AXIS_BODY        = np.array([0.0, 0.0, 1.0])   # approach axis, deputy body
 CHIEF_BODY_HALF_EXTENTS_M = np.array([0.80, 0.80, 0.50])
+
+# ── LAE nozzle truth geometry (−Z face, anti-nadir) ──────────────────
+# Used ONLY by sensor simulation and renderer — GNC never reads these.
+# IS-1002 class bipropellant LAE: ~400N thrust, ~0.35m bell diameter.
+LAE_NOZZLE_BASE_RADIUS_M = 0.28   # radius where nozzle meets -Z face
+LAE_NOZZLE_EXIT_RADIUS_M = 0.16   # radius at nozzle exit (narrower tip)
+LAE_NOZZLE_LENGTH_M      = 0.30   # protrusion below -Z face
+LAE_NOZZLE_N_SEG         = 10     # polygon segments for frustum approximation
+
 DOCK_PORT_APERTURE_M      = 0.15
 DOCK_CONE_HALF_ANGLE_DEG  = 15.0
 DOCK_CONE_MIN_RANGE_M     = 0.05
@@ -143,7 +152,7 @@ HARD_CAPTURE_GRACE_S = 1.0   # brief misalignment allowed without resetting hold
 # ── CNN pose estimator ────────────────────────────────────────────────
 # Off by default — analytic DLT+GN path remains the baseline.
 # Enable to add CNN-based orientation measurements in PROX_OPS/TERMINAL.
-ENABLE_CNN_POSE_ESTIMATOR = True
+ENABLE_CNN_POSE_ESTIMATOR = False
 CNN_POSE_UPDATE_HZ        = 1.0    # inference rate (keep ≤1 Hz — rendering is slow)
 CNN_CHECKPOINT_PATH       = "pose_cnn/checkpoints/pose_net.pt"
 CNN_POSE_SIGMA_DEG        = 5.0    # orientation noise assigned to CNN measurements

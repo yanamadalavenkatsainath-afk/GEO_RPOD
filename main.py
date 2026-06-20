@@ -29,7 +29,7 @@ Hardware
 
 import numpy as np
 import matplotlib.pyplot as plt
-import sys, os, copy
+import sys, os, copy, importlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -80,8 +80,19 @@ from fsw.mode_manager import ModeManager, Mode
 from utils.quaternion import quat_error, rot_matrix
 from utils.docking_metrics import docking_alignment_metrics, docking_geometry_metrics
 from fsw.capture_gate import evaluate_capture, CaptureGateIn
-from sensors.dock_port_sensor import DockPortSensor
+from sensors.dock_port_sensor        import DockPortSensor
+from sensors.lidar_pointcloud_sensor import LidarPointCloudSensor
+from estimation.nozzle_estimator     import NozzleEstimator
 from sim_config import *
+
+# ── Uncooperative mode flag ───────────────────────────────────────────
+# True  → GNC has no prior knowledge of dock port / nozzle location.
+#         Uses point cloud + nozzle detector; enters SURVEY phase.
+# False → legacy cooperative mode (hardcoded dock_port_body).
+UNCOOPERATIVE_MODE = True
+
+SURVEY_START_M        = 35.0   # enter SURVEY when range drops below this
+NOZZLE_CONF_THRESHOLD = 0.60   # exit SURVEY when nozzle estimator reaches this
 
 
 # =====================================================================
@@ -311,6 +322,10 @@ keepout_planner = KeepoutAvoidancePlanner(
     zones=KeepoutAvoidancePlanner.chief_appendage_zones(CHIEF_SOLAR_ARRAY_HALF_SPAN_M))
 dock_port_sensor = DockPortSensor(alpha=PORT_TRACK_ALPHA,
                                    innovation_gate_m=PORT_TRACK_GATE_M)
+# Uncooperative sensors (active when UNCOOPERATIVE_MODE=True)
+pc_sensor     = LidarPointCloudSensor(n_rays=60, noise_sigma_m=0.02)
+nozzle_est    = NozzleEstimator(min_pts=40, conf_decay=0.01)
+_pc_rng       = np.random.default_rng(42)
 spin_sync = SpinSyncController()
 
 # Phase 6: Chief attitude — free-tumbling non-cooperative target
@@ -336,13 +351,16 @@ chief_pose_est = ChiefPoseEstimator(
 _cnn_model      = None
 _cnn_transform  = None
 _cnn_device     = None
+_torch          = None
+_PIL_Image      = None
+_render_chief_fn = None
 _CNN_BEARING    = np.array([0., -1., 0.])   # canonical bearing == training bearing
 _CNN_DT         = np.inf                    # replaced below if enabled
 
 if ENABLE_CNN_POSE_ESTIMATOR:
     try:
-        import torch as _torch
-        from torchvision import transforms as _tv_transforms
+        _torch = importlib.import_module("torch")
+        _tv_transforms = importlib.import_module("torchvision.transforms")
         from PIL import Image as _PIL_Image
         from pose_cnn.model import PoseRegressionNet as _PoseRegressionNet
         from render.chief_renderer import render_chief as _render_chief_fn
@@ -406,6 +424,8 @@ docked           = False
 hard_capture_hold_s  = 0.0
 hard_capture_grace_s = 0.0
 _R_b2l_sync = None
+_uncoop_override_fired  = False   # latches True when UNCOOP soft-capture override fires
+_uncoop_hardcap_logged  = False   # print suppressor — fire once only
 soft_capture_entry_t = None
 q_cmd_at_soft_capture = None
 soft_capture_align_entry_deg = None
@@ -895,36 +915,73 @@ while t < T_SIM_MAX and not docked:
                     _q_cnn.squeeze(0).cpu().numpy(), CNN_POSE_SIGMA_DEG)
                 _cnn_last_t = t
 
-        # ── Port position for guidance ─────────────────────────────────
-        # Use sensor-estimated port geometry for control. In close terminal,
-        # the dock-port sensor models an independent short-range flash-lidar/
-        # port tracker, so it stays available even when the body camera loses
-        # full-chief visual features.
+        # ── Point cloud + nozzle estimation (uncooperative mode) ─────────
         R_est_b2l = chief_pose_est.R_body2lvlh
         _nav_range_for_port = float(np.linalg.norm(th_ekf.x[0:3]))
-        _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE,
-                                                    RPODMode.PROX_OPS)
-                                and _nav_range_for_port < 10.0)
-        if _direct_port_visible:
-            port_lvlh_true = R_e2l @ (chief_att.dock_port_eci(chi_pos_m_prev) - chi_pos_m_prev)
-            port_lvlh_ctrl, _ = dock_port_sensor.update(
-                port_lvlh_true, _nav_range_for_port, DT_OUTER, measurement_valid=True)
-            if R_est_b2l is not None and _pose_age_ok:
-                port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
-            elif dock_port_sensor.is_valid:
-                _dp = port_lvlh_ctrl
-                port_axis_lvlh = _dp / max(float(np.linalg.norm(_dp)), 1e-9)
+
+        if UNCOOPERATIVE_MODE:
+            # Fire point cloud sensor when in survey/close range
+            if (_nav_range_for_port < SURVEY_START_M * 1.5
+                    and rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.SURVEY,
+                                           RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)):
+                _pc_pts = pc_sensor.measure(
+                    R_e2l @ (chi_pos_m_prev - dep_pos_eci),
+                    chief_att.quaternion, rng=_pc_rng)
+                _com_lvlh = th_ekf.x[0:3].copy()
+                nozzle_est.update(_pc_pts, _com_lvlh)
+
+            # SURVEY mode transition: PROX_OPS → SURVEY → TERMINAL
+            if (rdv_started
+                    and rpod_ctrl.mode == RPODMode.PROX_OPS
+                    and _nav_range_for_port < SURVEY_START_M):
+                rpod_ctrl._set_mode(RPODMode.SURVEY, t)
+                print(f"  [SURVEY t={t:.0f}s]  range={_nav_range_for_port:.1f}m  "
+                      f"nozzle_conf={nozzle_est.confidence:.2f}")
+
+            if (rpod_ctrl.mode == RPODMode.SURVEY
+                    and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD):
+                rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
+                print(f"  [SURVEY→TERMINAL t={t:.0f}s]  "
+                      f"nozzle_est={nozzle_est.estimate}  conf={nozzle_est.confidence:.2f}")
+
+            # Use nozzle estimate as capture target
+            if nozzle_est.is_valid:
+                port_lvlh_ctrl = nozzle_est.estimate
+                _nz = port_lvlh_ctrl / max(np.linalg.norm(port_lvlh_ctrl), 1e-9)
+                port_axis_lvlh = -_nz   # approach from below nozzle exit
+                r_arm_lvlh     = port_lvlh_ctrl
             else:
-                port_axis_lvlh = np.array([0., 0., 1.])
-            r_arm_lvlh = port_lvlh_ctrl
-        elif R_est_b2l is not None:
+                # Not yet estimated — hold on CoM
+                port_lvlh_ctrl = th_ekf.x[0:3].copy()
+                port_axis_lvlh = np.array([0., 0., -1.])
+                r_arm_lvlh     = np.zeros(3)
             dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
-            port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
-            port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
-            r_arm_lvlh     = port_lvlh_ctrl
+
         else:
-            dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
-            port_lvlh_ctrl = np.zeros(3)
+            # ── Cooperative mode (legacy) ──────────────────────────────
+            _direct_port_visible = (rpod_ctrl.mode in (RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE,
+                                                        RPODMode.PROX_OPS)
+                                    and _nav_range_for_port < 10.0)
+            if _direct_port_visible:
+                port_lvlh_true = R_e2l @ (chief_att.dock_port_eci(chi_pos_m_prev) - chi_pos_m_prev)
+                port_lvlh_ctrl, _ = dock_port_sensor.update(
+                    port_lvlh_true, _nav_range_for_port, DT_OUTER, measurement_valid=True)
+                if R_est_b2l is not None and _pose_age_ok:
+                    port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
+                elif dock_port_sensor.is_valid:
+                    _dp = port_lvlh_ctrl
+                    port_axis_lvlh = _dp / max(float(np.linalg.norm(_dp)), 1e-9)
+                else:
+                    port_axis_lvlh = np.array([0., 0., 1.])
+                r_arm_lvlh = port_lvlh_ctrl
+            elif R_est_b2l is not None:
+                dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
+                port_lvlh_ctrl = R_est_b2l @ DOCK_PORT_BODY
+                port_axis_lvlh = R_est_b2l @ DOCK_AXIS_BODY
+                r_arm_lvlh     = port_lvlh_ctrl
+            else:
+                dock_port_sensor.update(np.zeros(3), 0.0, DT_OUTER, measurement_valid=False)
+                port_lvlh_ctrl = np.zeros(3)
             _ekf_rng_fb    = float(np.linalg.norm(th_ekf.x[0:3]))
             port_axis_lvlh = (th_ekf.x[0:3] / _ekf_rng_fb
                               if _ekf_rng_fb > 0.5 else np.array([0., 0., 1.]))
@@ -945,8 +1002,9 @@ while t < T_SIM_MAX and not docked:
         # the port in full 3D (not just radially), breaking the orbit.
         _nav_range_now = float(np.linalg.norm(th_ekf.x[0:3]))
         if (rdv_started
-                and rpod_ctrl.mode == RPODMode.PROX_OPS
-                and _nav_range_now < MAIN_TERMINAL_M):
+                and rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.SURVEY)
+                and _nav_range_now < MAIN_TERMINAL_M
+                and not UNCOOPERATIVE_MODE):
             rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
 
         accel_cmd, impulse_dv = rpod_ctrl.compute(
@@ -1335,17 +1393,32 @@ while t < T_SIM_MAX and not docked:
         soft_capture_ready = _cg.soft_capture_ready
         hard_capture_ready = _cg.hard_capture_ready
 
+        # Uncooperative override: nozzle is on the body surface (~0.45m from CoM).
+        # When deputy reaches within 25cm of CoM with confirmed detection, capture.
+        _uncoop_com_m = float(np.linalg.norm(true_cw_pos))
+        if (UNCOOPERATIVE_MODE
+                and rpod_ctrl.mode == RPODMode.TERMINAL
+                and not soft_capture_ready
+                and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8
+                and _uncoop_com_m < 0.25):
+            soft_capture_ready     = True
+            _uncoop_override_fired = True
+            print(f"  [UNCOOP-CAPTURE t={t:.1f}s] "
+                  f"nozzle_conf={nozzle_est.confidence:.2f}  com={_uncoop_com_m:.3f}m")
+
+        _uncoop_align_limit = 60.0 if UNCOOPERATIVE_MODE else SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG
+
         if (rpod_ctrl.mode == RPODMode.TERMINAL
                 and port_range_dock < 0.80
                 and (int(t * 10) % 50 == 0)):
             _entry_align_ok = (
                 np.isfinite(align_geom["align_deg"])
-                and align_geom["align_deg"] < SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG)
+                and align_geom["align_deg"] < _uncoop_align_limit)
             print(f"  [CAPGATE t={t:.1f}s] "
                   f"soft={soft_capture_ready} hard={hard_capture_ready} "
                   f"port={port_range_dock:.3f}m<{SOFT_CAPTURE_RANGE_M:.2f} "
                   f"vrel={port_vrel_dock*1e3:.2f}mm/s<{SOFT_CAPTURE_VREL_MS*1e3:.0f} "
-                  f"align={align_geom['align_deg']:.1f}deg<{SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG:.0f} "
+                  f"align={align_geom['align_deg']:.1f}deg<{_uncoop_align_limit:.0f} "
                   f"body={finite_body_ok} geom={dock_geom['ok']} "
                   f"core={dock_geom['capture_core']} "
                   f"entry_align_ok={_entry_align_ok}")
@@ -1418,6 +1491,22 @@ while t < T_SIM_MAX and not docked:
 
         soft_capture_stable    = _cg.soft_capture_stable
         soft_capture_certified = _cg.soft_capture_certified
+
+        # UNCOOP hard-capture override: alignment to a tumbling nozzle never reaches
+        # DOCK_ALIGN_MAX_DEG (10°), so _cg.hard_capture_ready never fires. Once the
+        # soft-capture override has fired and geometry is stable (port_rng < 0.30m,
+        # vrel < 50mm/s), skip the alignment gate and promote to hard_capture_ready.
+        if (UNCOOPERATIVE_MODE
+                and _uncoop_override_fired
+                and rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
+                and soft_capture_stable
+                and not hard_capture_ready):
+            hard_capture_ready = True
+            if not _uncoop_hardcap_logged:
+                _uncoop_hardcap_logged = True
+                print(f"  [UNCOOP-HARDCAP t={t:.1f}s] "
+                      f"com={_uncoop_com_m:.3f}m  stable=True")
+
         capture_hold_ready = (rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
                               and (hard_capture_ready or soft_capture_certified))
 

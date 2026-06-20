@@ -13,8 +13,8 @@ def _ctrl():
 # ── Enum integrity ────────────────────────────────────────────────────
 
 class TestRPODModeEnum:
-    EXPECTED = {"FORMATION_HOLD", "LAMBERT", "PROX_OPS", "TERMINAL",
-                "SOFT_CAPTURE", "DOCKING", "LOST_TARGET"}
+    EXPECTED = {"FORMATION_HOLD", "LAMBERT", "PROX_OPS", "SURVEY",
+                "TERMINAL", "SOFT_CAPTURE", "DOCKING", "LOST_TARGET"}
 
     def test_all_modes_present(self):
         assert {m.name for m in RPODMode} == self.EXPECTED
