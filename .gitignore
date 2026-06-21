@@ -12,28 +12,28 @@ env/
 .env/
 .venv/
 
-# Output / generated files
-telemetry.csv
+# Output / generated files — large, reproducible, not tracked
 *.csv
 *.log
+*.gif
 rpod_telemetry.npz
 rpod_telemetry_plots.png
+rpod_telemetry_analysis.png
 Figure_*.png
 monte_carlo_results.npz
 monte_carlo_summary.txt
 monte_carlo_plots.png
+monte_carlo_results/
 mc_results/
+mc_results.pkl
+ca_results.png
 visualiser_dashboard.png
 visualiser_replay.gif
 visualiser_*.png
-*.gif
 .pytest_cache/
 
 # Local Monte Carlo debug runs
 _mc*/
-
-# Local analysis/report helper scripts not intended for product pushes
-tools/
 
 # Experimental scratch guidance module
 control/nmc_guidance.py

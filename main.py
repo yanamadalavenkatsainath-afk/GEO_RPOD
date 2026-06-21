@@ -27,11 +27,31 @@ Hardware
   Reaction wheel: Bradford WSAT class, h_max = 4.0 N·m·s
 """
 
+import argparse
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 import sys, os, copy, importlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ── CLI ─────────────────────────────────────────────────────────────────
+# Parse before any simulation code runs so flags are available throughout.
+_parser = argparse.ArgumentParser(
+    description="GEO Jetpack RPOD Simulation (non-cooperative engine-bell grapple)")
+_parser.add_argument("--no-plot",      action="store_true",
+                     help="Skip interactive plt.show() at end (headless/CI mode)")
+_parser.add_argument("--cooperative",  action="store_true",
+                     help="Use cooperative dock-port mode instead of non-cooperative")
+_parser.add_argument("--seed",         type=int, default=42,
+                     help="RNG seed (default: 42)")
+_parser.add_argument("--out-dir",      type=str,
+                     default=os.path.dirname(os.path.abspath(__file__)),
+                     help="Directory for telemetry and plot outputs")
+_ARGS = _parser.parse_args()
+
+if _ARGS.no_plot:
+    matplotlib.use("Agg")
 
 # ── Plant & environment ─────────────────────────────────────────────
 from plant.spacecraft                     import Spacecraft
@@ -89,7 +109,7 @@ from sim_config import *
 # True  → GNC has no prior knowledge of dock port / nozzle location.
 #         Uses point cloud + nozzle detector; enters SURVEY phase.
 # False → legacy cooperative mode (hardcoded dock_port_body).
-UNCOOPERATIVE_MODE = True
+UNCOOPERATIVE_MODE = not _ARGS.cooperative
 
 SURVEY_START_M        = 35.0   # enter SURVEY when range drops below this
 NOZZLE_CONF_THRESHOLD = 0.60   # confidence threshold for stability gate
@@ -1974,7 +1994,9 @@ if tel['rn_t']:
         soft_capture_range_m     = np.float64(SOFT_CAPTURE_RANGE_M),
         dock_cone_half_angle_deg = np.float64(DOCK_CONE_HALF_ANGLE_DEG),
         chief_body_half_extents_m= CHIEF_BODY_HALF_EXTENTS_M,
+        uncooperative_mode       = np.bool_(UNCOOPERATIVE_MODE),
     )
     print("  rpod_telemetry.npz written")
 
-plt.show()
+if not _ARGS.no_plot:
+    plt.show()
