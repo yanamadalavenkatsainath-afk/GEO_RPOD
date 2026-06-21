@@ -11,6 +11,13 @@ Orientation observability improvements over the original renderer:
   - Distinct solar-panel front (dark cell side) vs back (bright substrate)
   - Phong specular highlight so the bright spot moves with sun angle
 
+False-positive geometry (ADR hardening — Item 3):
+  - Ka-band antenna bracket ring on +Y face (r=0.20 m): visible from most
+    orbital geometries; creates a competing RANSAC circle fit at a different
+    face and radius from the LAE nozzle to stress the FP discriminator.
+  - Solar array deployment hinge drums at ±X array roots (r=0.12 m):
+    structural drive housings at the bus/panel junction.
+
 No OpenGL/pyrender dependency -- the geometry is ~30 triangles, so a pure
 NumPy z-buffered rasterizer is simpler and avoids driver/context issues under
 multiprocessing (Monte Carlo runs many worker processes in parallel).
@@ -30,18 +37,19 @@ _MRK           = 0.15   # retroreflector half-size [m]
 
 # Per-face bus albedos break cubic symmetry even before retroreflectors
 _ALBEDO = {
-    "bus_pz":       0.65,   # +Z top face (dock face, lightest)
-    "bus_mz":       0.35,   # -Z bottom face (darkest)
-    "bus_px":       0.58,   # +X face
-    "bus_mx":       0.48,   # -X face
-    "bus_py":       0.62,   # +Y face
-    "bus_my":       0.42,   # -Y face (darkest side face)
-    "panel_front":  0.20,   # dark solar cell side
-    "panel_back":   0.65,   # bright white substrate
-    "marker":        0.95,   # dock-face retroreflector (existing)
-    "retro":         0.98,   # asymmetric retroreflectors (new)
+    "bus_pz":        0.65,   # +Z top face (dock face, lightest)
+    "bus_mz":        0.35,   # -Z bottom face (darkest)
+    "bus_px":        0.58,   # +X face
+    "bus_mx":        0.48,   # -X face
+    "bus_py":        0.62,   # +Y face
+    "bus_my":        0.42,   # -Y face (darkest side face)
+    "panel_front":   0.20,   # dark solar cell side
+    "panel_back":    0.65,   # bright white substrate
+    "marker":        0.95,   # dock-face retroreflector
+    "retro":         0.98,   # asymmetric retroreflectors
     "nozzle_side":   0.08,   # LAE nozzle bell — dark graphite/carbon
     "nozzle_throat": 0.03,   # nozzle throat interior — near-black cavity
+    "equip_housing": 0.45,   # equipment housings: antenna brackets, hinge drums
 }
 _SPECULAR = {
     "bus_pz":        0.10,
@@ -56,6 +64,7 @@ _SPECULAR = {
     "retro":         0.95,
     "nozzle_side":   0.30,   # slight metallic sheen on nozzle bell
     "nozzle_throat": 0.00,   # cavity absorbs everything
+    "equip_housing": 0.25,   # mild metallic sheen
 }
 _SHININESS = 32.0
 
@@ -66,8 +75,19 @@ def _quad(p00, p10, p01, p11):
            np.array([[0,1,2],[1,3,2]])
 
 
-def _build_mesh():
-    """Returns (vertices[N,3], triangles[M,3] int idx, face_materials[M] str)."""
+def _build_mesh(nozzle_r_base=None, nozzle_r_exit=None, nozzle_length=None):
+    """
+    Returns (vertices[N,3], triangles[M,3] int idx, face_materials[M] str).
+
+    Nozzle geometry can be overridden for per-trial variation testing (Item 7):
+      nozzle_r_base  — base radius [m]  (default: LAE_NOZZLE_BASE_RADIUS_M)
+      nozzle_r_exit  — exit radius [m]  (default: LAE_NOZZLE_EXIT_RADIUS_M)
+      nozzle_length  — protrusion [m]   (default: LAE_NOZZLE_LENGTH_M)
+    """
+    _nzl_r_base = LAE_NOZZLE_BASE_RADIUS_M if nozzle_r_base is None else nozzle_r_base
+    _nzl_r_exit = LAE_NOZZLE_EXIT_RADIUS_M if nozzle_r_exit is None else nozzle_r_exit
+    _nzl_length = LAE_NOZZLE_LENGTH_M      if nozzle_length is None else nozzle_length
+
     all_v_list, all_t_list, all_m = [], [], []
 
     def add(v_block, t_local, material, n_times=1):
@@ -133,28 +153,23 @@ def _build_mesh():
     all_m.extend(["marker", "marker"])
 
     # ── Asymmetric retroreflectors (one unique pattern per face) ──────────
-    # +X face: 1 retro at (HX, +0.30, +0.20)
     retros = [
         ("retro", np.array([
             [_HX, 0.30-dm, 0.20-dm], [_HX, 0.30+dm, 0.20-dm],
             [_HX, 0.30-dm, 0.20+dm], [_HX, 0.30+dm, 0.20+dm],
         ], dtype=float)),
-        # -X face upper retro
         ("retro", np.array([
             [-_HX, -0.20-dm,  0.25-dm], [-_HX, -0.20+dm,  0.25-dm],
             [-_HX, -0.20-dm,  0.25+dm], [-_HX, -0.20+dm,  0.25+dm],
         ], dtype=float)),
-        # -X face lower retro (two retros on -X → unique vs +X with one)
         ("retro", np.array([
             [-_HX, -0.20-dm, -0.25-dm], [-_HX, -0.20+dm, -0.25-dm],
             [-_HX, -0.20-dm, -0.25+dm], [-_HX, -0.20+dm, -0.25+dm],
         ], dtype=float)),
-        # +Y face: 1 retro offset toward -X/-Z
         ("retro", np.array([
             [-0.40-dm, _HY, -0.15-dm], [-0.40+dm, _HY, -0.15-dm],
             [-0.40-dm, _HY, -0.15+dm], [-0.40+dm, _HY, -0.15+dm],
         ], dtype=float)),
-        # -Y face: none → visually different from +Y
     ]
     for mat, rv in retros:
         base_r = sum(len(v) for v in all_v_list)
@@ -166,10 +181,10 @@ def _build_mesh():
     # Dark graphite bell protrudes below the bus; detectable as a concave
     # circular feature in the point cloud without any geometry prior.
     n      = LAE_NOZZLE_N_SEG
-    r_base = LAE_NOZZLE_BASE_RADIUS_M
-    r_exit = LAE_NOZZLE_EXIT_RADIUS_M
-    z_base = -_HZ                          # flush with -Z bus face
-    z_exit = -_HZ - LAE_NOZZLE_LENGTH_M   # tip protruding below
+    r_base = _nzl_r_base
+    r_exit = _nzl_r_exit
+    z_base = -_HZ
+    z_exit = -_HZ - _nzl_length
 
     angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
     base_ring = np.column_stack([r_base * np.cos(angles),
@@ -178,7 +193,7 @@ def _build_mesh():
     exit_ring = np.column_stack([r_exit * np.cos(angles),
                                   r_exit * np.sin(angles),
                                   np.full(n, z_exit)])
-    exit_cap  = np.array([[0.0, 0.0, z_exit]])   # throat centre
+    exit_cap  = np.array([[0.0, 0.0, z_exit]])
 
     nozzle_verts = np.vstack([base_ring, exit_ring, exit_cap])
     base_n = sum(len(v) for v in all_v_list)
@@ -187,17 +202,68 @@ def _build_mesh():
     nozzle_tris, nozzle_mats = [], []
     for i in range(n):
         j = (i + 1) % n
-        # Side quads (2 triangles each)
         nozzle_tris.append([base_n+i,     base_n+j,     base_n+n+i])
         nozzle_mats.append("nozzle_side")
         nozzle_tris.append([base_n+j,     base_n+n+j,   base_n+n+i])
         nozzle_mats.append("nozzle_side")
-        # Throat cap fan
         nozzle_tris.append([base_n+2*n,   base_n+n+i,   base_n+n+j])
         nozzle_mats.append("nozzle_throat")
 
     all_t_list.append(np.array(nozzle_tris))
     all_m.extend(nozzle_mats)
+
+    # ── Ka-band antenna bracket ring on +Y face (Item 3) ─────────────
+    # Cylinder of r=0.20 m protrudes 7 cm outward from +Y face, centred at
+    # (0, +HY, 0).  Provides a competing RANSAC circle fit at r≈0.20 m on a
+    # different face/axis than the LAE bell to stress false-positive scoring.
+    _n_ant = 10;  _r_ant = 0.20;  _l_ant = 0.07
+    _ant_ang = np.linspace(0, 2*np.pi, _n_ant, endpoint=False)
+    ant_base_v = np.column_stack([_r_ant * np.cos(_ant_ang),
+                                   np.full(_n_ant, _HY),
+                                   _r_ant * np.sin(_ant_ang)])
+    ant_exit_v = np.column_stack([_r_ant * np.cos(_ant_ang),
+                                   np.full(_n_ant, _HY + _l_ant),
+                                   _r_ant * np.sin(_ant_ang)])
+    ant_cap_v  = np.array([[0.0, _HY + _l_ant, 0.0]])
+    base_ant   = sum(len(v) for v in all_v_list)
+    all_v_list.append(np.vstack([ant_base_v, ant_exit_v, ant_cap_v]))
+    ant_tris, ant_mats = [], []
+    for i in range(_n_ant):
+        j = (i + 1) % _n_ant
+        ant_tris += [[base_ant+i,            base_ant+j,              base_ant+_n_ant+i],
+                     [base_ant+j,            base_ant+_n_ant+j,       base_ant+_n_ant+i]]
+        ant_mats += ["equip_housing", "equip_housing"]
+        ant_tris.append([base_ant+2*_n_ant,  base_ant+_n_ant+i,  base_ant+_n_ant+j])
+        ant_mats.append("equip_housing")
+    all_t_list.append(np.array(ant_tris))
+    all_m.extend(ant_mats)
+
+    # ── Solar array deployment hinge drums at ±X roots (Item 3) ──────
+    # Short cylinders of r=0.12 m at (±1.50, 0, 0), axis along ±X.
+    # Represent structural drive housings at the bus/panel junction and add
+    # ring-shaped lidar returns on the ±X faces.
+    _n_hng = 8;  _r_hng = 0.12;  _l_hng = 0.08
+    _hng_ang = np.linspace(0, 2*np.pi, _n_hng, endpoint=False)
+    for _sgn, _ax_x in [(+1, _ARRAY_ROOT_X), (-1, -_ARRAY_ROOT_X)]:
+        hng_base_v = np.column_stack([np.full(_n_hng, _ax_x),
+                                       _r_hng * np.cos(_hng_ang),
+                                       _r_hng * np.sin(_hng_ang)])
+        hng_exit_v = np.column_stack([np.full(_n_hng, _ax_x + _sgn * _l_hng),
+                                       _r_hng * np.cos(_hng_ang),
+                                       _r_hng * np.sin(_hng_ang)])
+        hng_cap_v  = np.array([[_ax_x + _sgn * _l_hng, 0.0, 0.0]])
+        base_hng   = sum(len(v) for v in all_v_list)
+        all_v_list.append(np.vstack([hng_base_v, hng_exit_v, hng_cap_v]))
+        hng_tris, hng_mats = [], []
+        for i in range(_n_hng):
+            j = (i + 1) % _n_hng
+            hng_tris += [[base_hng+i,            base_hng+j,              base_hng+_n_hng+i],
+                         [base_hng+j,            base_hng+_n_hng+j,       base_hng+_n_hng+i]]
+            hng_mats += ["equip_housing", "equip_housing"]
+            hng_tris.append([base_hng+2*_n_hng,  base_hng+_n_hng+i,  base_hng+_n_hng+j])
+            hng_mats.append("equip_housing")
+        all_t_list.append(np.array(hng_tris))
+        all_m.extend(hng_mats)
 
     all_verts = np.vstack(all_v_list)
     all_tris  = np.vstack(all_t_list)
@@ -214,6 +280,13 @@ def _fix_outward_winding(verts, tris):
         if np.dot(normal, centroid) < 0:
             fixed[idx] = [i, k, j]
     return fixed
+
+
+def build_mesh(nozzle_r_base=None, nozzle_r_exit=None, nozzle_length=None):
+    """Build chief mesh with optional nozzle geometry overrides for variation testing."""
+    return _build_mesh(nozzle_r_base=nozzle_r_base,
+                       nozzle_r_exit=nozzle_r_exit,
+                       nozzle_length=nozzle_length)
 
 
 _VERTS_BODY, _TRIS, _MATERIALS = _build_mesh()
@@ -319,9 +392,7 @@ def render_chief(dr_lvlh, q_chief, sun_lvlh, image_size_px=(640, 480), f_px=800.
         z_interp = w0*p0[2] + w1*p1[2] + w2*p2[2]
         mat      = _MATERIALS[tri_idx]
 
-        # Lambertian diffuse
         diffuse  = max(0.0, float(np.dot(normal, sun_cam)))
-        # Phong specular
         view_dir = -centroid / (np.linalg.norm(centroid) + 1e-12)
         reflect  = 2.0 * np.dot(sun_cam, normal) * normal - sun_cam
         specular = max(0.0, float(np.dot(reflect, view_dir))) ** _SHININESS

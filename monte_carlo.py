@@ -1,22 +1,30 @@
 """
 Monte Carlo — GEO Jetpack RPOD
 ==============================
-Runs N trials of the full mission simulation (main.py logic) with
-randomised initial conditions to characterise DV and docking performance.
+Scenario: Non-cooperative GEO terminal RPOD with point-cloud engine-bell
+acquisition and strict capture gating.
+
+The deputy (50 kg hydrazine jetpack) rendezvous with a tumbling GEO comsat
+(IS-1002 class, 3000 kg) whose docking port is inaccessible. The deputy
+instead grapples the LAE engine bell on the chief's −Z face using flash-lidar
+point cloud detection (NozzleEstimator) with no geometry prior.  Capture is
+certified by a bell-geometry gate (axial/lateral/vrel limits) rather than the
+cooperative port-alignment gate.
+
+Stress cases cover the ADR hardening matrix:
+  Sensor degradation : range_dropout, camera_dropout, lidar_occlusion
+  Navigation errors  : gyro_bias, high_pose_noise
+  Actuator limits    : weak_thruster
+  Dynamics           : slow_detumble
+  Unknown target     : nozzle_oversize (+15 %), nozzle_undersize (−15 %)
 
 Varied per trial
 ----------------
-  chief_omega0_deg_s  : tumble rate magnitude (uniform 0.05-0.20 deg/s)
+  chief_omega0_deg_s  : tumble rate magnitude (uniform 0.05-0.25 deg/s)
                         and direction (random unit vector on sphere)
   chief_M0_deg        : mean anomaly at epoch (uniform 0-360 deg)
-                        -> changes initial relative geometry + tumble phase
   sc_omega0_rad_s     : deputy initial tumble (uniform magnitude 0.1-0.3 rad/s)
-  gyro_bias_seed      : numpy seed for gyro bias draw
   sensor_noise_seed   : numpy seed for rng/camera noise
-
-Fixed per trial (same as main.py)
------------------------------------
-  All hardware parameters, gains, thresholds, DV accounting fixes
 
 Outputs
 -------
@@ -78,6 +86,7 @@ from sensors.dock_port_sensor             import DockPortSensor
 from sensors.lidar_pointcloud_sensor      import LidarPointCloudSensor
 from estimation.nozzle_estimator          import NozzleEstimator
 from utils.quaternion                     import quat_error, rot_matrix
+from render.chief_renderer                import build_mesh as _build_chief_mesh
 
 UNCOOPERATIVE_MODE    = True
 SURVEY_START_M        = 35.0
@@ -100,9 +109,12 @@ MC_STRESS_CASES = (
     "high_pose_noise",
     "slow_detumble",
     "weak_thruster",
+    "lidar_occlusion",   # flash-lidar dropout 30-120 s into SURVEY (Item 4)
+    "nozzle_oversize",   # LAE bell 15 % larger than estimator expects (Item 7)
+    "nozzle_undersize",  # LAE bell 15 % smaller than estimator expects (Item 7)
 )
 
-MC_STRESS_WEIGHTS = np.array([0.52, 0.10, 0.10, 0.10, 0.08, 0.05, 0.05])
+MC_STRESS_WEIGHTS = np.array([0.38, 0.08, 0.08, 0.08, 0.06, 0.04, 0.04, 0.08, 0.08, 0.08])
 MC_STRESS_WEIGHTS = MC_STRESS_WEIGHTS / np.sum(MC_STRESS_WEIGHTS)
 
 STRESS_PROFILES = {
@@ -113,6 +125,9 @@ STRESS_PROFILES = {
         "gyro_bias_rad_s": np.zeros(3),
         "range_dropout_s": None,
         "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
     },
     "range_dropout": {
         "thrust_scale": 1.00,
@@ -121,6 +136,9 @@ STRESS_PROFILES = {
         "gyro_bias_rad_s": np.zeros(3),
         "range_dropout_s": (120.0, 420.0),
         "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
     },
     "camera_dropout": {
         "thrust_scale": 1.00,
@@ -129,6 +147,9 @@ STRESS_PROFILES = {
         "gyro_bias_rad_s": np.zeros(3),
         "range_dropout_s": None,
         "camera_dropout_s": (15.0, 135.0),
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
     },
     "gyro_bias": {
         "thrust_scale": 1.00,
@@ -137,6 +158,9 @@ STRESS_PROFILES = {
         "gyro_bias_rad_s": np.radians(np.array([0.035, -0.020, 0.015])),
         "range_dropout_s": None,
         "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
     },
     "high_pose_noise": {
         "thrust_scale": 1.00,
@@ -145,6 +169,9 @@ STRESS_PROFILES = {
         "gyro_bias_rad_s": np.zeros(3),
         "range_dropout_s": None,
         "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
     },
     "slow_detumble": {
         "thrust_scale": 1.00,
@@ -153,6 +180,9 @@ STRESS_PROFILES = {
         "gyro_bias_rad_s": np.zeros(3),
         "range_dropout_s": None,
         "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
     },
     "weak_thruster": {
         "thrust_scale": 0.65,
@@ -161,6 +191,44 @@ STRESS_PROFILES = {
         "gyro_bias_rad_s": np.zeros(3),
         "range_dropout_s": None,
         "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
+    },
+    # ── Item 4: partial lidar visibility ─────────────────────────────────
+    "lidar_occlusion": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+        "lidar_dropout_s": (30.0, 120.0),  # 90 s dropout starting 30 s into SURVEY
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.0,
+    },
+    # ── Item 7: unknown target geometry variation ─────────────────────────
+    "nozzle_oversize": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 1.15,   # bell 15 % larger than nominal
+    },
+    "nozzle_undersize": {
+        "thrust_scale": 1.00,
+        "sc_omega_scale": 1.00,
+        "port_noise_scale": 1.00,
+        "gyro_bias_rad_s": np.zeros(3),
+        "range_dropout_s": None,
+        "camera_dropout_s": None,
+        "lidar_dropout_s": None,
+        "lidar_noise_scale": 1.0,
+        "nozzle_scale": 0.85,   # bell 15 % smaller than nominal
     },
 }
 
@@ -556,8 +624,21 @@ def run_trial(trial_id,
     terminal_entry_align_deg = np.nan
     dock_port_sensor    = DockPortSensor(alpha=PORT_TRACK_ALPHA,
                                          innovation_gate_m=PORT_TRACK_GATE_M)
-    pc_sensor           = LidarPointCloudSensor(n_rays=60, noise_sigma_m=0.02)
+    pc_sensor           = LidarPointCloudSensor(
+        n_rays=60, noise_sigma_m=0.02 * profile.get("lidar_noise_scale", 1.0))
     nozzle_est          = NozzleEstimator(min_pts=40, conf_decay=0.01)
+
+    # Item 7: build variant chief mesh if nozzle geometry is varied per trial.
+    # The lidar sensor raycasts against this mesh instead of the default one.
+    _nozzle_scale = profile.get("nozzle_scale", 1.0)
+    if _nozzle_scale != 1.0:
+        _var_verts, _var_tris, _ = _build_chief_mesh(
+            nozzle_r_base=LAE_NOZZLE_BASE_RADIUS_M * _nozzle_scale,
+            nozzle_r_exit=LAE_NOZZLE_EXIT_RADIUS_M * _nozzle_scale,
+            nozzle_length=LAE_NOZZLE_LENGTH_M       * _nozzle_scale,
+        )
+    else:
+        _var_verts, _var_tris = None, None
     _pc_rng             = np.random.default_rng(rng_seed + 9999)
     _R_b2l_sync         = None   # flip-filtered R for spin sync
     _pose_bias_samples  = []    # (truth_align, est_align) pairs during soft capture
@@ -882,14 +963,24 @@ def run_trial(trial_id,
             _nav_range_for_port = float(np.linalg.norm(th_ekf.x[0:3]))
 
             if UNCOOPERATIVE_MODE:
+                # Item 4: lidar dropout window is relative to SURVEY start.
+                _lidar_blocked = _in_relative_window(
+                    t, t_survey_start, profile.get("lidar_dropout_s"))
                 # Point cloud update
                 if (_nav_range_for_port < SURVEY_START_M * 1.5
                         and rpod_ctrl.mode in (RPODMode.PROX_OPS, RPODMode.SURVEY,
                                                RPODMode.TERMINAL, RPODMode.SOFT_CAPTURE)):
-                    _pc_pts = pc_sensor.measure(
-                        R_e2l @ (chi_pos_m_prev - dep_pos_eci),
-                        chief_att.quaternion, rng=_pc_rng)
-                    nozzle_est.update(_pc_pts, th_ekf.x[0:3].copy(), dt=DT_OUTER)
+                    if _lidar_blocked:
+                        # Confidence decay while occluded — no new hits ingested.
+                        nozzle_est.update(np.zeros((0, 3)),
+                                          th_ekf.x[0:3].copy(), dt=DT_OUTER)
+                    else:
+                        # Item 7: pass variant mesh to lidar if nozzle geometry varies.
+                        _pc_pts = pc_sensor.measure(
+                            R_e2l @ (chi_pos_m_prev - dep_pos_eci),
+                            chief_att.quaternion, rng=_pc_rng,
+                            verts=_var_verts, tris=_var_tris)
+                        nozzle_est.update(_pc_pts, th_ekf.x[0:3].copy(), dt=DT_OUTER)
 
                 # SURVEY transitions
                 if (rdv_started

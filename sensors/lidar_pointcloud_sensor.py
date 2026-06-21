@@ -69,7 +69,7 @@ class LidarPointCloudSensor:
         self._noise_sigma  = noise_sigma_m
 
     def measure(self, dr_lvlh: np.ndarray, q_chief: np.ndarray,
-                 rng=None) -> np.ndarray:
+                 rng=None, verts=None, tris=None) -> np.ndarray:
         """
         Shoot rays at the chief and return hit points in LVLH.
 
@@ -78,40 +78,39 @@ class LidarPointCloudSensor:
         dr_lvlh  : (3,) chief CoM position relative to deputy [m], LVLH
         q_chief  : (4,) chief body→LVLH quaternion [w,x,y,z]
         rng      : numpy Generator
+        verts    : (N,3) override vertex array (default: module-level _VERTS_BODY)
+        tris     : (M,3) override triangle index array (default: module-level _TRIS)
 
         Returns
         -------
         pts : (K, 3) hit points in LVLH frame, K ≤ n_rays
               Returns empty array if no hits.
         """
-        rng = rng if rng is not None else np.random.default_rng()
+        rng   = rng   if rng   is not None else np.random.default_rng()
+        _v    = verts if verts is not None else _VERTS_BODY
+        _t    = tris  if tris  is not None else _TRIS
+        bsr   = float(np.max(np.linalg.norm(_v, axis=1))) + 0.05
+
         R_b2l = _rot_matrix(q_chief)
+        verts_lvlh = (R_b2l @ _v.T).T + dr_lvlh
 
-        # Transform chief vertices to LVLH
-        verts_lvlh = (R_b2l @ _VERTS_BODY.T).T + dr_lvlh
-
-        # Deputy is at origin; chief CoM at dr_lvlh
-        # Build random rays that pass through chief bounding sphere
         r_hat = dr_lvlh / np.linalg.norm(dr_lvlh)
-
-        # Orthonormal basis perpendicular to boresight
         up  = np.array([0., 0., 1.]) if abs(r_hat[2]) < 0.9 else np.array([1., 0., 0.])
         u   = np.cross(r_hat, up);  u /= np.linalg.norm(u)
         v   = np.cross(r_hat, u)
 
         hits = []
         for _ in range(self._n_rays):
-            # Random offset within bounding sphere disk
             while True:
-                dx, dy = rng.uniform(-_BSPHERE_R, _BSPHERE_R, 2)
-                if dx*dx + dy*dy < _BSPHERE_R**2:
+                dx, dy = rng.uniform(-bsr, bsr, 2)
+                if dx*dx + dy*dy < bsr**2:
                     break
             ray_o = np.zeros(3)
             ray_d = dr_lvlh + dx*u + dy*v
             ray_d = ray_d / np.linalg.norm(ray_d)
 
             t_min = np.inf
-            for tri in _TRIS:
+            for tri in _t:
                 v0, v1, v2 = verts_lvlh[tri[0]], verts_lvlh[tri[1]], verts_lvlh[tri[2]]
                 t = _moller_trumbore(ray_o, ray_d, v0, v1, v2)
                 if t is not None and t < t_min:
