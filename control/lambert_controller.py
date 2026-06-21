@@ -49,6 +49,7 @@ class RPODMode(Enum):
     FORMATION_HOLD = auto()
     LAMBERT        = auto()
     PROX_OPS       = auto()
+    SURVEY         = auto()   # uncooperative: hold at standoff, build point cloud
     TERMINAL       = auto()
     SOFT_CAPTURE   = auto()
     DOCKING        = auto()
@@ -244,6 +245,13 @@ class GEORPODController:
             return self._terminal(nav_state, t, port_lvlh=_port,
                                   port_axis_lvlh=port_axis_lvlh,
                                   attitude_align_deg=attitude_align_deg), None
+
+        elif self.mode == RPODMode.SURVEY:
+            # Hold at standoff using PROX_OPS guidance while nozzle estimator stabilizes.
+            # SURVEY→TERMINAL transition is gated externally (main.py / monte_carlo.py).
+            return self._prox_ops(ekf_lvlh, truth_range, t,
+                                  port_lvlh=port_lvlh,
+                                  port_axis_lvlh=port_axis_lvlh), None
 
         elif self.mode == RPODMode.SOFT_CAPTURE:
             _port = port_lvlh if port_lvlh is not None else np.zeros(3)

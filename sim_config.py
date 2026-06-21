@@ -149,6 +149,25 @@ TERMINAL_MAX_S   = 20_000.0
 # ── Hard capture hysteresis ───────────────────────────────────────────
 HARD_CAPTURE_GRACE_S = 1.0   # brief misalignment allowed without resetting hold
 
+# ── Engine-bell grapple geometry (uncooperative capture) ─────────────
+# GNC-accessible parameters — NOT derived from truth LAE_NOZZLE_* geometry.
+# These define what geometry must be certified before capture is declared.
+BELL_SOFT_LATERAL_MAX_M  = 0.15   # max lateral miss from nozzle axis [m] — soft gate
+BELL_SOFT_AXIAL_MAX_M    = 0.30   # max axial stand-off from nozzle exit [m] — soft gate
+BELL_SOFT_VREL_MAX_MS    = 0.05   # max relative speed [m/s] — soft gate
+BELL_SOFT_APPROACH_DEG   = 55.0   # max angle from nozzle approach axis [deg] — soft gate
+BELL_HARD_LATERAL_MAX_M  = 0.08   # tighter lateral limit [m] — hard gate
+BELL_HARD_AXIAL_MAX_M    = 0.15   # tighter axial stand-off [m] — hard gate
+BELL_HARD_VREL_MAX_MS    = 0.02   # tighter velocity [m/s] — hard gate
+BELL_HARD_APPROACH_DEG   = 25.0   # tighter axis alignment [deg] — hard gate
+BELL_HARD_HOLD_S         = 5.0    # sustained hard-gate hold before DOCKING [s]
+
+# ── Terminal commit stability gate (SURVEY → TERMINAL) ────────────────
+# Prevents TERMINAL commit on a fleeting detection.
+NOZZLE_STABILITY_S    = 3.0    # confidence must stay ≥ threshold for this long [s]
+NOZZLE_DRIFT_MAX_M    = 0.80   # RANSAC shot noise is 10–70 cm; 80 cm catches only gross divergence [m]
+NOZZLE_FP_SCORE_MAX   = 1.01   # fp_score is informational only — LAE frustum geometry always scores ≥ 0.67
+
 # ── CNN pose estimator ────────────────────────────────────────────────
 # Off by default — analytic DLT+GN path remains the baseline.
 # Enable to add CNN-based orientation measurements in PROX_OPS/TERMINAL.

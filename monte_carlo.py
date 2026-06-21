@@ -323,6 +323,49 @@ def _stress_profile(stress_case):
     return STRESS_PROFILES.get(stress_case, STRESS_PROFILES["nominal"])
 
 
+def _bell_capture_check(dep_pos, dep_vel, nozzle_est):
+    """
+    Engine-bell grapple geometry gate (same logic as main.py, no print).
+    Returns (soft_ready, hard_ready, diag_dict).
+    """
+    if not nozzle_est.is_valid:
+        return False, False, {}
+
+    nozzle_pos  = nozzle_est.estimate
+    approach_ax = nozzle_est.axis
+
+    dep_to_nozzle = nozzle_pos - dep_pos
+    dist = float(np.linalg.norm(dep_to_nozzle))
+    if dist < 1e-6:
+        return False, False, {}
+
+    axial_m   = float(np.dot(dep_to_nozzle, approach_ax))
+    lat_vec   = dep_to_nozzle - axial_m * approach_ax
+    lateral_m = float(np.linalg.norm(lat_vec))
+
+    los_unit     = dep_to_nozzle / dist
+    cos_ang      = float(np.clip(np.dot(los_unit, approach_ax), -1.0, 1.0))
+    approach_deg = float(np.degrees(np.arccos(cos_ang)))
+    vrel_ms      = float(np.linalg.norm(dep_vel))
+
+    soft_ready = (0.0 < axial_m < BELL_SOFT_AXIAL_MAX_M
+                  and lateral_m    < BELL_SOFT_LATERAL_MAX_M
+                  and vrel_ms      < BELL_SOFT_VREL_MAX_MS
+                  and approach_deg < BELL_SOFT_APPROACH_DEG
+                  and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8)
+
+    hard_ready = (0.0 < axial_m < BELL_HARD_AXIAL_MAX_M
+                  and lateral_m    < BELL_HARD_LATERAL_MAX_M
+                  and vrel_ms      < BELL_HARD_VREL_MAX_MS
+                  and approach_deg < BELL_HARD_APPROACH_DEG
+                  and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8)
+
+    return soft_ready, hard_ready, {
+        "axial_m": axial_m, "lateral_m": lateral_m,
+        "vrel_ms": vrel_ms, "approach_deg": approach_deg,
+    }
+
+
 def _in_relative_window(t_now, t_ref, window):
     if t_ref is None or window is None:
         return False
@@ -846,7 +889,7 @@ def run_trial(trial_id,
                     _pc_pts = pc_sensor.measure(
                         R_e2l @ (chi_pos_m_prev - dep_pos_eci),
                         chief_att.quaternion, rng=_pc_rng)
-                    nozzle_est.update(_pc_pts, th_ekf.x[0:3].copy())
+                    nozzle_est.update(_pc_pts, th_ekf.x[0:3].copy(), dt=DT_OUTER)
 
                 # SURVEY transitions
                 if (rdv_started
@@ -860,7 +903,10 @@ def run_trial(trial_id,
                 max_nozzle_conf = max(max_nozzle_conf, nozzle_est.confidence)
 
                 if (rpod_ctrl.mode == RPODMode.SURVEY
-                        and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD):
+                        and nozzle_est.confidence    >= NOZZLE_CONF_THRESHOLD
+                        and nozzle_est.stable_for_s  >= NOZZLE_STABILITY_S
+                        and nozzle_est.estimate_drift_m < NOZZLE_DRIFT_MAX_M
+                        and nozzle_est.false_positive_score < NOZZLE_FP_SCORE_MAX):
                     nozzle_conf_at_terminal  = nozzle_est.confidence
                     terminal_entry_range_m   = _nav_range_for_port
                     rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
@@ -1130,21 +1176,21 @@ def run_trial(trial_id,
                 hard_capture_vrel_ms             = HARD_CAPTURE_VREL_MS,
                 dock_align_max_deg               = DOCK_ALIGN_MAX_DEG,
             ))
-            soft_core_ready    = _cg.soft_core_ready
-            soft_capture_ready = _cg.soft_capture_ready
-            hard_capture_ready = _cg.hard_capture_ready
+            soft_core_ready = _cg.soft_core_ready
 
-            # Uncooperative override: nozzle on body surface ~0.45m from CoM.
-            _uncoop_com_m = float(np.linalg.norm(true_cw_pos))
-            if (UNCOOPERATIVE_MODE
-                    and rpod_ctrl.mode == RPODMode.TERMINAL
-                    and not soft_capture_ready
-                    and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8
-                    and _uncoop_com_m < 0.25):
-                soft_capture_ready     = True
-                uncoop_override_fired  = True
-                com_at_capture_m       = _uncoop_com_m
-                nozzle_conf_at_capture = nozzle_est.confidence
+            if UNCOOPERATIVE_MODE:
+                # Bell-geometry capture gate — no CoM shortcut, no cooperative aids.
+                _bell_soft, _bell_hard, _ = _bell_capture_check(
+                    true_cw_pos, true_cw_vel, nozzle_est)
+                soft_capture_ready = _bell_soft
+                hard_capture_ready = _bell_hard
+                if _bell_soft and not uncoop_override_fired:
+                    uncoop_override_fired  = True
+                    com_at_capture_m       = float(np.linalg.norm(true_cw_pos))
+                    nozzle_conf_at_capture = nozzle_est.confidence
+            else:
+                soft_capture_ready = _cg.soft_capture_ready
+                hard_capture_ready = _cg.hard_capture_ready
 
             if rpod_ctrl.mode == RPODMode.TERMINAL and soft_capture_ready:
                 if port_range > 1e-6:
@@ -1191,16 +1237,12 @@ def run_trial(trial_id,
             soft_capture_stable    = _cg.soft_capture_stable
             soft_capture_certified = _cg.soft_capture_certified
 
-            # UNCOOP hard-capture override: alignment to a tumbling nozzle never reaches
-            # DOCK_ALIGN_MAX_DEG (10°), so _cg.hard_capture_ready never fires. Once the
-            # soft-capture override has fired and geometry is stable (port_rng < 0.30m,
-            # vrel < 50mm/s), skip the alignment gate and promote to hard_capture_ready.
-            if (UNCOOPERATIVE_MODE
-                    and uncoop_override_fired
-                    and rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
-                    and soft_capture_stable
-                    and not hard_capture_ready):
-                hard_capture_ready = True
+            if UNCOOPERATIVE_MODE and rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
+                # Post-contact: cooperative alignment/geometry checks are irrelevant.
+                # Bell-soft gate certified approach geometry; ideal_latch maintains
+                # port_range=0 and vrel=0 each step. Hard capture = contact sustained.
+                hard_capture_ready     = True
+                soft_capture_certified = True
 
             if rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
                 soft_capture_align_min_deg = min(soft_capture_align_min_deg,

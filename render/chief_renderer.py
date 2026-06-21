@@ -18,7 +18,9 @@ multiprocessing (Monte Carlo runs many worker processes in parallel).
 
 import numpy as np
 
-from sim_config import CHIEF_BODY_HALF_EXTENTS_M, CHIEF_SOLAR_ARRAY_HALF_SPAN_M
+from sim_config import (CHIEF_BODY_HALF_EXTENTS_M, CHIEF_SOLAR_ARRAY_HALF_SPAN_M,
+                        LAE_NOZZLE_BASE_RADIUS_M, LAE_NOZZLE_EXIT_RADIUS_M,
+                        LAE_NOZZLE_LENGTH_M, LAE_NOZZLE_N_SEG)
 
 _HX, _HY, _HZ = CHIEF_BODY_HALF_EXTENTS_M
 _ARRAY_ROOT_X  = 1.50
@@ -36,20 +38,24 @@ _ALBEDO = {
     "bus_my":       0.42,   # -Y face (darkest side face)
     "panel_front":  0.20,   # dark solar cell side
     "panel_back":   0.65,   # bright white substrate
-    "marker":       0.95,   # dock-face retroreflector (existing)
-    "retro":        0.98,   # asymmetric retroreflectors (new)
+    "marker":        0.95,   # dock-face retroreflector (existing)
+    "retro":         0.98,   # asymmetric retroreflectors (new)
+    "nozzle_side":   0.08,   # LAE nozzle bell — dark graphite/carbon
+    "nozzle_throat": 0.03,   # nozzle throat interior — near-black cavity
 }
 _SPECULAR = {
-    "bus_pz":       0.10,
-    "bus_mz":       0.10,
-    "bus_px":       0.10,
-    "bus_mx":       0.10,
-    "bus_py":       0.10,
-    "bus_my":       0.10,
-    "panel_front":  0.05,
-    "panel_back":   0.15,
-    "marker":       0.80,
-    "retro":        0.95,
+    "bus_pz":        0.10,
+    "bus_mz":        0.10,
+    "bus_px":        0.10,
+    "bus_mx":        0.10,
+    "bus_py":        0.10,
+    "bus_my":        0.10,
+    "panel_front":   0.05,
+    "panel_back":    0.15,
+    "marker":        0.80,
+    "retro":         0.95,
+    "nozzle_side":   0.30,   # slight metallic sheen on nozzle bell
+    "nozzle_throat": 0.00,   # cavity absorbs everything
 }
 _SHININESS = 32.0
 
@@ -155,6 +161,43 @@ def _build_mesh():
         all_v_list.append(rv)
         all_t_list.append(np.array([[0,1,2],[1,3,2]]) + base_r)
         all_m.extend([mat, mat])
+
+    # ── LAE nozzle — truncated cone on −Z face ────────────────────────
+    # Dark graphite bell protrudes below the bus; detectable as a concave
+    # circular feature in the point cloud without any geometry prior.
+    n      = LAE_NOZZLE_N_SEG
+    r_base = LAE_NOZZLE_BASE_RADIUS_M
+    r_exit = LAE_NOZZLE_EXIT_RADIUS_M
+    z_base = -_HZ                          # flush with -Z bus face
+    z_exit = -_HZ - LAE_NOZZLE_LENGTH_M   # tip protruding below
+
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    base_ring = np.column_stack([r_base * np.cos(angles),
+                                  r_base * np.sin(angles),
+                                  np.full(n, z_base)])
+    exit_ring = np.column_stack([r_exit * np.cos(angles),
+                                  r_exit * np.sin(angles),
+                                  np.full(n, z_exit)])
+    exit_cap  = np.array([[0.0, 0.0, z_exit]])   # throat centre
+
+    nozzle_verts = np.vstack([base_ring, exit_ring, exit_cap])
+    base_n = sum(len(v) for v in all_v_list)
+    all_v_list.append(nozzle_verts)
+
+    nozzle_tris, nozzle_mats = [], []
+    for i in range(n):
+        j = (i + 1) % n
+        # Side quads (2 triangles each)
+        nozzle_tris.append([base_n+i,     base_n+j,     base_n+n+i])
+        nozzle_mats.append("nozzle_side")
+        nozzle_tris.append([base_n+j,     base_n+n+j,   base_n+n+i])
+        nozzle_mats.append("nozzle_side")
+        # Throat cap fan
+        nozzle_tris.append([base_n+2*n,   base_n+n+i,   base_n+n+j])
+        nozzle_mats.append("nozzle_throat")
+
+    all_t_list.append(np.array(nozzle_tris))
+    all_m.extend(nozzle_mats)
 
     all_verts = np.vstack(all_v_list)
     all_tris  = np.vstack(all_t_list)

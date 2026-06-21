@@ -10,29 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-import torch.nn as nn
-import torchvision.models as models
-
 from pose_cnn.dataset import SpeedPlusDataset
-
-
-class _QuatNet(nn.Module):
-    """Old 4-output quaternion model — matches the saved checkpoint."""
-    def __init__(self):
-        super().__init__()
-        bb = models.resnet18(weights=None)
-        bb.fc = nn.Identity()
-        self.backbone = bb
-        self.bearing_mlp = nn.Sequential(nn.Linear(3,32), nn.ReLU(True), nn.Linear(32,64), nn.ReLU(True))
-        self.head = nn.Sequential(nn.Linear(512+64, 256), nn.ReLU(True), nn.Linear(256, 4))
-
-    def forward(self, x, bearing):
-        f = torch.cat([self.backbone(x), self.bearing_mlp(bearing)], dim=1)
-        q = self.head(f)
-        return q / q.norm(dim=1, keepdim=True).clamp_min(1e-8)
-
-
-PoseRegressionNet = _QuatNet
+from pose_cnn.model import PoseRegressionNet
 
 
 def quat_angle_error_deg(q_pred, q_true):
@@ -64,7 +43,7 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, pin_memory=True)
 
-    model = PoseRegressionNet().to(device)
+    model = PoseRegressionNet(pretrained=False).to(device)
     model.load_state_dict(torch.load(args.checkpoint, map_location=device, weights_only=True))
     model.eval()
 

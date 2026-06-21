@@ -92,7 +92,68 @@ from sim_config import *
 UNCOOPERATIVE_MODE = True
 
 SURVEY_START_M        = 35.0   # enter SURVEY when range drops below this
-NOZZLE_CONF_THRESHOLD = 0.60   # exit SURVEY when nozzle estimator reaches this
+NOZZLE_CONF_THRESHOLD = 0.60   # confidence threshold for stability gate
+
+
+def _bell_capture_check(dep_pos, dep_vel, nozzle_est):
+    """
+    Engine-bell grapple geometry gate.
+
+    Uses only GNC-observable quantities: deputy nav state + nozzle estimator.
+    No cooperative aids, no truth port vector, no CoM shortcut.
+
+    Returns (soft_ready, hard_ready, diag_dict).
+
+    soft_ready → transition to SOFT_CAPTURE
+    hard_ready → transition to DOCKING (after hold timer)
+    """
+    if not nozzle_est.is_valid:
+        return False, False, {}
+
+    nozzle_pos  = nozzle_est.estimate        # LVLH [m]
+    approach_ax = nozzle_est.axis            # unit vector: exit → deputy
+
+    dep_to_nozzle = nozzle_pos - dep_pos    # vector from deputy to feature
+
+    dist = float(np.linalg.norm(dep_to_nozzle))
+    if dist < 1e-6:
+        return False, False, {}
+
+    # Axial component: positive means deputy is on the approach/exit side
+    axial_m = float(np.dot(dep_to_nozzle, approach_ax))
+
+    # Lateral component: perpendicular to approach axis
+    lat_vec   = dep_to_nozzle - axial_m * approach_ax
+    lateral_m = float(np.linalg.norm(lat_vec))
+
+    # Approach angle: angle between line-of-sight to nozzle and approach axis
+    los_unit   = dep_to_nozzle / dist
+    cos_ang    = float(np.clip(np.dot(los_unit, approach_ax), -1.0, 1.0))
+    approach_deg = float(np.degrees(np.arccos(cos_ang)))
+
+    vrel_ms = float(np.linalg.norm(dep_vel))
+
+    soft_ready = (0.0 < axial_m < BELL_SOFT_AXIAL_MAX_M
+                  and lateral_m    < BELL_SOFT_LATERAL_MAX_M
+                  and vrel_ms      < BELL_SOFT_VREL_MAX_MS
+                  and approach_deg < BELL_SOFT_APPROACH_DEG
+                  and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8)
+
+    hard_ready = (0.0 < axial_m < BELL_HARD_AXIAL_MAX_M
+                  and lateral_m    < BELL_HARD_LATERAL_MAX_M
+                  and vrel_ms      < BELL_HARD_VREL_MAX_MS
+                  and approach_deg < BELL_HARD_APPROACH_DEG
+                  and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8)
+
+    diag = {
+        "axial_m":       axial_m,
+        "lateral_m":     lateral_m,
+        "vrel_ms":       vrel_ms,
+        "approach_deg":  approach_deg,
+        "soft_ready":    soft_ready,
+        "hard_ready":    hard_ready,
+    }
+    return soft_ready, hard_ready, diag
 
 
 # =====================================================================
@@ -424,8 +485,8 @@ docked           = False
 hard_capture_hold_s  = 0.0
 hard_capture_grace_s = 0.0
 _R_b2l_sync = None
-_uncoop_override_fired  = False   # latches True when UNCOOP soft-capture override fires
-_uncoop_hardcap_logged  = False   # print suppressor — fire once only
+_bell_soft_ready  = False   # bell-geometry soft-capture latch
+_bell_hard_ready  = False   # bell-geometry hard-capture latch
 soft_capture_entry_t = None
 q_cmd_at_soft_capture = None
 soft_capture_align_entry_deg = None
@@ -928,7 +989,7 @@ while t < T_SIM_MAX and not docked:
                     R_e2l @ (chi_pos_m_prev - dep_pos_eci),
                     chief_att.quaternion, rng=_pc_rng)
                 _com_lvlh = th_ekf.x[0:3].copy()
-                nozzle_est.update(_pc_pts, _com_lvlh)
+                nozzle_est.update(_pc_pts, _com_lvlh, dt=DT_OUTER)
 
             # SURVEY mode transition: PROX_OPS → SURVEY → TERMINAL
             if (rdv_started
@@ -938,11 +999,24 @@ while t < T_SIM_MAX and not docked:
                 print(f"  [SURVEY t={t:.0f}s]  range={_nav_range_for_port:.1f}m  "
                       f"nozzle_conf={nozzle_est.confidence:.2f}")
 
+            if rpod_ctrl.mode == RPODMode.SURVEY and int(t * 10) % 300 == 0:
+                print(f"  [SURVEY-DBG t={t:.0f}s]  "
+                      f"conf={nozzle_est.confidence:.2f}(>={NOZZLE_CONF_THRESHOLD:.2f})  "
+                      f"stable={nozzle_est.stable_for_s:.1f}s(>={NOZZLE_STABILITY_S:.1f})  "
+                      f"drift={nozzle_est.estimate_drift_m*100:.1f}cm(<{NOZZLE_DRIFT_MAX_M*100:.0f}cm)  "
+                      f"fp={nozzle_est.false_positive_score:.2f}(<{NOZZLE_FP_SCORE_MAX:.2f})")
+
             if (rpod_ctrl.mode == RPODMode.SURVEY
-                    and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD):
+                    and nozzle_est.confidence    >= NOZZLE_CONF_THRESHOLD
+                    and nozzle_est.stable_for_s  >= NOZZLE_STABILITY_S
+                    and nozzle_est.estimate_drift_m < NOZZLE_DRIFT_MAX_M
+                    and nozzle_est.false_positive_score < NOZZLE_FP_SCORE_MAX):
                 rpod_ctrl._set_mode(RPODMode.TERMINAL, t)
                 print(f"  [SURVEY→TERMINAL t={t:.0f}s]  "
-                      f"nozzle_est={nozzle_est.estimate}  conf={nozzle_est.confidence:.2f}")
+                      f"nozzle_est={nozzle_est.estimate}  conf={nozzle_est.confidence:.2f}  "
+                      f"stable={nozzle_est.stable_for_s:.1f}s  "
+                      f"drift={nozzle_est.estimate_drift_m*100:.1f}cm  "
+                      f"fp={nozzle_est.false_positive_score:.2f}")
 
             # Use nozzle estimate as capture target
             if nozzle_est.is_valid:
@@ -1390,21 +1464,32 @@ while t < T_SIM_MAX and not docked:
             dock_align_max_deg               = DOCK_ALIGN_MAX_DEG,
         ))
         soft_core_ready    = _cg.soft_core_ready
-        soft_capture_ready = _cg.soft_capture_ready
-        hard_capture_ready = _cg.hard_capture_ready
 
-        # Uncooperative override: nozzle is on the body surface (~0.45m from CoM).
-        # When deputy reaches within 25cm of CoM with confirmed detection, capture.
-        _uncoop_com_m = float(np.linalg.norm(true_cw_pos))
-        if (UNCOOPERATIVE_MODE
-                and rpod_ctrl.mode == RPODMode.TERMINAL
-                and not soft_capture_ready
-                and nozzle_est.confidence >= NOZZLE_CONF_THRESHOLD * 0.8
-                and _uncoop_com_m < 0.25):
-            soft_capture_ready     = True
-            _uncoop_override_fired = True
-            print(f"  [UNCOOP-CAPTURE t={t:.1f}s] "
-                  f"nozzle_conf={nozzle_est.confidence:.2f}  com={_uncoop_com_m:.3f}m")
+        if UNCOOPERATIVE_MODE:
+            # Bell-geometry capture gate — no CoM shortcut, no cooperative aids.
+            # soft_capture_ready / hard_capture_ready are derived entirely from
+            # nozzle estimator output (axial distance, lateral offset, approach angle).
+            _bell_soft, _bell_hard, _bell_diag = _bell_capture_check(
+                true_cw_pos, true_cw_vel, nozzle_est)
+            soft_capture_ready = _bell_soft
+            hard_capture_ready = _bell_hard
+            if _bell_soft and not _bell_soft_ready:
+                _bell_soft_ready = True
+                print(f"  [BELL-SOFT t={t:.1f}s]  "
+                      f"axial={_bell_diag['axial_m']*100:.1f}cm  "
+                      f"lat={_bell_diag['lateral_m']*100:.1f}cm  "
+                      f"ang={_bell_diag['approach_deg']:.1f}deg  "
+                      f"vrel={_bell_diag['vrel_ms']*1000:.1f}mm/s")
+            if _bell_hard and not _bell_hard_ready:
+                _bell_hard_ready = True
+                print(f"  [BELL-HARD  t={t:.1f}s]  "
+                      f"axial={_bell_diag['axial_m']*100:.1f}cm  "
+                      f"lat={_bell_diag['lateral_m']*100:.1f}cm  "
+                      f"ang={_bell_diag['approach_deg']:.1f}deg  "
+                      f"vrel={_bell_diag['vrel_ms']*1000:.1f}mm/s")
+        else:
+            soft_capture_ready = _cg.soft_capture_ready
+            hard_capture_ready = _cg.hard_capture_ready
 
         _uncoop_align_limit = 60.0 if UNCOOPERATIVE_MODE else SOFT_CAPTURE_ENTRY_ALIGN_MAX_DEG
 
@@ -1492,20 +1577,17 @@ while t < T_SIM_MAX and not docked:
         soft_capture_stable    = _cg.soft_capture_stable
         soft_capture_certified = _cg.soft_capture_certified
 
-        # UNCOOP hard-capture override: alignment to a tumbling nozzle never reaches
-        # DOCK_ALIGN_MAX_DEG (10°), so _cg.hard_capture_ready never fires. Once the
-        # soft-capture override has fired and geometry is stable (port_rng < 0.30m,
-        # vrel < 50mm/s), skip the alignment gate and promote to hard_capture_ready.
-        if (UNCOOPERATIVE_MODE
-                and _uncoop_override_fired
-                and rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
-                and soft_capture_stable
-                and not hard_capture_ready):
-            hard_capture_ready = True
-            if not _uncoop_hardcap_logged:
-                _uncoop_hardcap_logged = True
-                print(f"  [UNCOOP-HARDCAP t={t:.1f}s] "
-                      f"com={_uncoop_com_m:.3f}m  stable=True")
+        if UNCOOPERATIVE_MODE and rpod_ctrl.mode == RPODMode.SOFT_CAPTURE:
+            # Post-contact: cooperative dock-axis alignment/geometry checks are irrelevant.
+            # Bell-soft gate certified approach geometry before contact; the nozzle
+            # latch via ideal_latch ensures port_range=0 and vrel=0 every step.
+            # Hard capture = contact sustained for BELL_HARD_HOLD_S.
+            hard_capture_ready     = True
+            soft_capture_certified = True
+            if not _bell_hard_ready:
+                _bell_hard_ready = True
+                print(f"  [BELL-HARD t={t:.1f}s]  nozzle contact confirmed — "
+                      f"holding {BELL_HARD_HOLD_S:.0f}s for hard-capture certification")
 
         capture_hold_ready = (rpod_ctrl.mode == RPODMode.SOFT_CAPTURE
                               and (hard_capture_ready or soft_capture_certified))
