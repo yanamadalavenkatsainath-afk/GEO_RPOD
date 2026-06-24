@@ -1939,7 +1939,8 @@ if tel['rn_t']:
         _err_interp = np.full(len(_t_arr), np.nan)
     _err2 = np.column_stack([_err_interp, np.full_like(_err_interp, np.nan)])
 
-    np.savez("rpod_telemetry.npz",
+    _out_npz = os.path.join(_ARGS.out_dir, "rpod_telemetry.npz")
+    np.savez(_out_npz,
         # ADCS channels (unit-converted to match analyze_rpod_telemetry.py expectations)
         t          = _t_arr,
         mode       = np.array(tel['mode']),
@@ -1996,7 +1997,7 @@ if tel['rn_t']:
         chief_body_half_extents_m= CHIEF_BODY_HALF_EXTENTS_M,
         uncooperative_mode       = np.bool_(UNCOOPERATIVE_MODE),
     )
-    print("  rpod_telemetry.npz written")
+    print(f"  rpod_telemetry.npz written → {_out_npz}")
 
 if not _ARGS.no_plot:
     plt.show()

@@ -38,6 +38,9 @@ _mc*/
 # Experimental scratch guidance module
 control/nmc_guidance.py
 
+# One-off utility scripts
+extract_check.py
+
 # Jupyter notebooks (if used)
 .ipynb_checkpoints/
 *.ipynb

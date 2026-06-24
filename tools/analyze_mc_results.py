@@ -292,9 +292,12 @@ def main():
     reasons = arr(d, "failure_reason", dtype=str)
     signatures = np.array([classify_signature(d, i, docked[i]) for i in range(n)])
     scores = np.array([criticality_score(d, i, docked[i]) for i in range(n)])
+    uncooperative = bool(d["uncooperative_mode"]) if "uncooperative_mode" in d.files else False
 
     print_header("MC CRITICAL DIAGNOSTIC REPORT")
     print(f"  Source       : {path}")
+    _mode_label = "NON-COOPERATIVE (engine-bell grapple)" if uncooperative else "COOPERATIVE (dock-port)"
+    print(f"  Scenario     : {_mode_label}")
     print(f"  Trials       : {n}")
     print(f"  Docked       : {int(docked.sum())}/{n} ({pct(int(docked.sum()), n):.1f}%)")
     print(f"  Failed       : {int(failed.sum())}/{n} ({pct(int(failed.sum()), n):.1f}%)")
@@ -342,15 +345,24 @@ def main():
     print_stats("PROX DV", arr(d, "prox_dv_ms"), " m/s", 3)
     print_stats("TERMINAL DV", arr(d, "term_dv_ms"), " m/s", 3)
     print_stats("Time to dock", arr(d, "t_dock_hr"), " hr", 3)
-    print_stats("Min port range", arr(d, "min_port_range_m"), " m", 4)
-    print_stats("Final port range", arr(d, "final_port_range_m"), " m", 4)
     print_stats("Final port vrel", arr(d, "final_port_vrel_ms"), " m/s", 4)
-    print_stats("Final align", arr(d, "final_align_deg"), " deg", 2)
-    print_stats("Final cone err", arr(d, "final_cone_err_deg"), " deg", 2)
-    print_stats("Final lateral", arr(d, "final_lateral_m"), " m", 4)
     print_stats("Max nav err", arr(d, "max_nav_err_m"), " m", 3)
     print_stats("Camera dropout", arr(d, "camera_drop_s"), " s", 1)
     print_stats("Range dropout", arr(d, "range_drop_s"), " s", 1)
+    if uncooperative:
+        print()
+        print("  --- Non-cooperative nozzle estimator ---")
+        print_stats("Nozzle conf@terminal", arr(d, "nozzle_conf_at_terminal"), "", 3)
+        print_stats("Nozzle conf@capture", arr(d, "nozzle_conf_at_capture"), "", 3)
+        uncoop_fired = arr(d, "uncoop_override_fired", dtype=bool)
+        if uncoop_fired is not None:
+            print(f"  {'uncoop_override_fired':<24} {int(uncoop_fired.sum())}/{n}")
+    else:
+        print_stats("Min port range", arr(d, "min_port_range_m"), " m", 4)
+        print_stats("Final port range", arr(d, "final_port_range_m"), " m", 4)
+        print_stats("Final align", arr(d, "final_align_deg"), " deg", 2)
+        print_stats("Final cone err", arr(d, "final_cone_err_deg"), " deg", 2)
+        print_stats("Final lateral", arr(d, "final_lateral_m"), " m", 4)
 
     # ── Soft capture phase stats ──────────────────────────────────────
     print_header("SOFT CAPTURE PHASE STATS")
@@ -449,16 +461,25 @@ def main():
 
     # ── Gate margin audit ─────────────────────────────────────────────
     print_header("GATE MARGIN AUDIT")
-    gate_specs = [
-        ("soft range",  "final_port_range_m",  0.30,  "<=", "m"),
-        ("hard range",  "final_port_range_m",  0.08,  "<=", "m"),
-        ("hard vrel",   "final_port_vrel_ms",  0.010, "<=", "m/s"),
-        ("dock align",  "final_align_deg",     10.0,  "<=", "deg"),
-        ("cone err",    "final_cone_err_deg",  15.0,  "<=", "deg"),
-        ("lateral",     "final_lateral_m",     0.30,  "<=", "m"),
-        ("SC entry align", "soft_capture_align_entry_deg", 30.0, "<=", "deg"),
-        ("SC best align",  "soft_capture_align_min_deg",   10.0, "<=", "deg"),
-    ]
+    if uncooperative:
+        print("  [NON-COOPERATIVE mode: cooperative port/alignment gates N/A]")
+        print("  [Success criterion: bell contact (uncoop_override_fired) + hold time]")
+        gate_specs = [
+            ("nozzle conf@capture", "nozzle_conf_at_capture", 0.70, ">=", ""),
+            ("nozzle conf@terminal","nozzle_conf_at_terminal",0.70, ">=", ""),
+            ("hard vrel",           "final_port_vrel_ms",     0.010,"<=", "m/s"),
+        ]
+    else:
+        gate_specs = [
+            ("soft range",  "final_port_range_m",  0.30,  "<=", "m"),
+            ("hard range",  "final_port_range_m",  0.08,  "<=", "m"),
+            ("hard vrel",   "final_port_vrel_ms",  0.010, "<=", "m/s"),
+            ("dock align",  "final_align_deg",     10.0,  "<=", "deg"),
+            ("cone err",    "final_cone_err_deg",  15.0,  "<=", "deg"),
+            ("lateral",     "final_lateral_m",     0.30,  "<=", "m"),
+            ("SC entry align", "soft_capture_align_entry_deg", 30.0, "<=", "deg"),
+            ("SC best align",  "soft_capture_align_min_deg",   10.0, "<=", "deg"),
+        ]
     for label, key, threshold, op, unit in gate_specs:
         values = arr(d, key)
         if values is None:
@@ -549,22 +570,31 @@ def main():
 
     # ── Near misses / suspicious passes ──────────────────────────────
     print_header("NEAR MISSES / SUSPICIOUS PASSES")
+    if uncooperative:
+        print("  [NON-COOPERATIVE: 'loose_align' suppressed — final_align_deg is cooperative-port metric]")
     suspicious = []
     for i in range(n):
         if not docked[i]:
             continue
         flags = []
-        if scalar(d, "final_port_range_m", i) > 0.08:
-            flags.append("loose_final_range")
         if scalar(d, "final_port_vrel_ms", i) > 0.010:
             flags.append("loose_final_vrel")
-        if scalar(d, "final_align_deg", i) > 10.0:
-            flags.append("loose_align")
+        if uncooperative:
+            if not flag(d, "uncoop_override_fired", i):
+                flags.append("uncoop_not_fired")
+            nc = scalar(d, "nozzle_conf_at_capture", i)
+            if np.isfinite(nc) and nc < 0.70:
+                flags.append("low_nozzle_conf")
+        else:
+            if scalar(d, "final_port_range_m", i) > 0.08:
+                flags.append("loose_final_range")
+            if scalar(d, "final_align_deg", i) > 10.0:
+                flags.append("loose_align")
+            if not flag(d, "final_hard_strict", i):
+                flags.append("not_hard_strict")
         term_dv_arr = arr(d, "term_dv_ms")
         if term_dv_arr is not None and scalar(d, "term_dv_ms", i) > np.nanpercentile(term_dv_arr, 90):
             flags.append("high_terminal_dv")
-        if not flag(d, "final_hard_strict", i):
-            flags.append("not_hard_strict")
         if flags:
             suspicious.append((scores[i], i, flags))
     for _, i, flags in sorted(suspicious, reverse=True)[: args.top]:

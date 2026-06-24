@@ -82,13 +82,13 @@ control/                   RPOD, Lambert, spin-sync, guidance controllers
 estimation/                MEKF, TH-EKF, terminal nav
 sensors/
   lidar_pointcloud_sensor.py  flash lidar (Möller–Trumbore ray cast, geometry override)
-  camera.py                   monocular camera model
+  camera_sensor.py            monocular camera model
   dock_port_sensor.py         cooperative dock-port sensor (inactive in uncoop mode)
 plant/                     deputy rigid body, finite body, contact dynamics
 environment/               GEO orbit, CW dynamics, gravity gradient, SRP, sun, B-field
 tools/
   analyze_rpod_telemetry.py   single-run NPZ analyser (mode-aware: coop vs uncoop)
-  analyze_mc_results.py       Monte Carlo PKL analyser
+  analyze_mc_results.py       Monte Carlo NPZ analyser (reads monte_carlo_results.npz)
   update_report_current_state.py  auto-update Word report
 tests/                     Python unit/regression tests
 ```

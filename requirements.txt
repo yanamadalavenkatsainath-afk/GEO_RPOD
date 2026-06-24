@@ -1,0 +1,12 @@
+# GEO Jetpack RPOD Simulation — Python 3.11+
+numpy>=1.24.0
+scipy>=1.10.0
+sgp4>=2.22
+nrlmsise00>=0.1.0
+astropy>=5.0.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+Pillow>=9.0.0
+python-docx>=0.8.11

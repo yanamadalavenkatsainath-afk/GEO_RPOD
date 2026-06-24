@@ -20,19 +20,29 @@ Usage
 """
 
 import sys
+import argparse
 import pathlib
 import numpy as np
+
+_NPZ_DEFAULT = pathlib.Path(__file__).parent.parent / "rpod_telemetry.npz"
+_parser = argparse.ArgumentParser(
+    description="RPOD Telemetry Analyser — loads rpod_telemetry.npz and prints summary + plot")
+_parser.add_argument("path", nargs="?", default=None,
+                     help=f"Path to rpod_telemetry.npz (default: {_NPZ_DEFAULT})")
+_parser.add_argument("--show", action="store_true",
+                     help="Open interactive plot window (default: save PNG only)")
+_parser.add_argument("--out", type=str, default=None,
+                     help="Save plot PNG to this path (default: rpod_telemetry_analysis.png next to NPZ)")
+_args = _parser.parse_args()
+
 import matplotlib
-if "--show" not in sys.argv:
+if not _args.show:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
-# ── Path handling ──────────────────────────────────────────────────────────────
-NPZ_DEFAULT = pathlib.Path(__file__).parent.parent / "rpod_telemetry.npz"
-npz_path    = pathlib.Path(sys.argv[1]) if (len(sys.argv) > 1
-                and not sys.argv[1].startswith("--")) else NPZ_DEFAULT
+npz_path = pathlib.Path(_args.path) if _args.path else _NPZ_DEFAULT
 
 if not npz_path.exists():
     print(f"[ERROR] File not found: {npz_path}")
@@ -527,7 +537,7 @@ ax9.set(xlabel="Along-track y [m]", ylabel="Cross-track x [m]",
 ax9.legend(fontsize=7); ax9.grid(True, alpha=0.3)
 plt.colorbar(sc9, ax=ax9, label='Time [hr]', fraction=0.046, pad=0.04)
 
-out_path = npz_path.parent / "rpod_telemetry_plots.png"
+out_path = pathlib.Path(_args.out) if _args.out else npz_path.parent / "rpod_telemetry_plots.png"
 plt.savefig(out_path, dpi=150, bbox_inches="tight")
 print(f"\n  Plot saved: {out_path}")
 if "--show" in sys.argv:

@@ -1845,7 +1845,8 @@ def summarise(results, out_dir="."):
              terminal_entry_range_m  = np.array([r.get('terminal_entry_range_m', np.nan) for r in results], dtype=float),
              uncoop_override_fired   = np.array([r.get('uncoop_override_fired', False) for r in results]),
              com_at_capture_m        = np.array([r.get('com_at_capture_m', np.nan) for r in results], dtype=float),
-             nozzle_conf_at_capture  = np.array([r.get('nozzle_conf_at_capture', np.nan) for r in results], dtype=float))
+             nozzle_conf_at_capture  = np.array([r.get('nozzle_conf_at_capture', np.nan) for r in results], dtype=float),
+             uncooperative_mode      = np.bool_(UNCOOPERATIVE_MODE))
     # Also pickle the full results list for post-processing scripts
     import pickle
     out_pkl = os.path.join(out_dir, "mc_results.pkl")
