@@ -1,295 +1,201 @@
-# GEO RPOD Python Reference Simulation
+# Unified LEO/GEO Rendezvous, Proximity Operations and Capture
 
-Python reference plant, sensor simulation, Monte Carlo environment, and debug
-sandbox for GEO rendezvous, proximity operations, and docking of a 50 kg
-servicing deputy grappling the engine bell of a tumbling GEO chief (IS-1002
-class comsat, ~50 kg jetpack servicer).
+A Python research simulation of a servicing spacecraft approaching and capturing a non-cooperative target, using one shared engine with LEO and GEO orbital presets.
 
-The paired embedded C/SIL repository is:
+**Purpose of this repository:** provide a compact, inspectable implementation and saved evidence for independent technical review. This is an engineering prototype developed with AI-assisted coding. It is not flight software, a flight-qualified system, a reproduction of a named servicing mission, or evidence of general mission reliability.
 
-```text
-C:\Users\Venkat\OneDrive\Desktop\appex\Satellite_GNC
+## Start here: technical review
+
+1. Read the [single-run results](#saved-single-run-results) and [limitations](#assumptions-and-limitations).
+2. Inspect [the shared mission wrapper](mission_specifics/rpod/wrapper.py), [terminal engine](fsw/rpod.py), and [far-leg navigation](estimation/rpod_relative_navigation.py).
+3. Run the focused checks below, then inspect the saved [LEO](evidence/leo_seed1/trial_1.json) and [GEO](evidence/geo_seed1/trial_1.json) records.
+4. See [validation scope and evidence interpretation](docs/VALIDATION.md).
+
+The most useful feedback would concern physical consistency, estimator assumptions, achieved-versus-commanded actuation, handoff continuity, capture acceptance and missing evidence. No endorsement by Stanford, SLAB, ISRO or any researcher is implied.
+
+## What the simulation does
+
+The default full profile combines:
+
+- Independent nonlinear Cartesian chief/deputy propagation with central gravity and J2; an illustrative plate/effective-area disturbance environment adds drag, solar radiation pressure and gravity-gradient effects.
+- A finite-duration Cartesian Lambert transfer, numerical shooting and navigation-driven midcourse replanning, followed by bounded proximity acquisition.
+- Relative navigation using range/bearing measurements and ROE/CW filters. The ROE estimate drives far-leg guidance.
+- Physical RCS allocation with 16 jets, pulsing, valve behaviour, fuel accounting and geometric plume exclusions; inherited wheel and attitude-chain states continue across handoff.
+- A performance-gyro and star-tracker chain feeding an attitude MEKF.
+- Pixel-level projection and pose estimation with known target landmarks, plus an illustrative segmented bell-rim ranging/survey abstraction.
+- Estimated-state terminal guidance, rate synchronization and approach to a rotating capture fixture.
+- Two-body compliant capture dynamics and a five-second qualified capture hold.
+
+These features are implemented models; inclusion alone does not establish their fidelity to flight hardware.
+
+```mermaid
+flowchart TD
+    A[Orbit preset and vehicle configuration] --> B[Initial coast and declared navigation prior]
+    B --> C[Range/bearing relative navigation]
+    C --> D[Finite Lambert transfer and cleanup]
+    D --> E[Fresh-navigation and actuator-health handoff gate]
+    E --> F[Survey and target-rate estimation]
+    F --> G[Spin synchronization and terminal approach]
+    G --> H[Compliant capture and qualified hold]
+    I[Physical plant and sensor simulation] --> C
+    I --> F
+    C --> J[Bounded actuator execution]
+    G --> J
+    J --> I
+    H --> K[Saved metrics and acceptance criteria]
 ```
 
-> Status: engineering prototype / reference plant. Not flight-certified.
+The supervisor qualifies a handoff below 20 m estimated range and 0.15 m/s estimated speed, with fresh navigation, ready actuation, no active burn, and five seconds of qualification. It is not a complete operational abort supervisor.
 
-## Current Baseline
+## Orbit presets and illustrative vehicle
 
-**Scenario: non-cooperative uncontrolled tumbler, engine-bell grapple.**
+| Setting | LEO | GEO |
+|---|---:|---:|
+| Chief orbital radius | 6,781 km | 42,164 km |
+| Chief inclination | 51.6 degrees | 0 degrees |
+| Initial along-track separation | 100 m | 100 m |
+| Nominal transfer time | 2,700 s | approximately 41,863.53 s |
+| Maximum far-leg window | 4,500 s | 69,773 s after time-grid rounding |
+| Terminal time bound | 2,400 s | 2,400 s |
 
-The deputy approaches from the -Z (nozzle) side of the chief, aligns with the
-nozzle axis, and captures the LAE engine bell using a flash-lidar / RANSAC
-nozzle estimator. There is no cooperative docking port. The chief is tumbling
-at 0.5–2 deg/s and does not respond to commands.
+Both presets use the same illustrative vehicle, target and sensor settings. Orbit timing scales with radius to the power 1.5. GEO is an orbital configuration of the shared engine, not a port of every feature in the older GEO implementation.
 
-Pipeline:
+Selected defaults: chaser dry mass 50 kg, initial propellant 1 kg, diagonal inertia (10, 10, 6) kg m^2, individual jet force 0.25 N, specific impulse 220 s, and target mass 500 kg. Terminal outer step is 0.25 s; far-leg outer step is 0.5 s. The attitude chain substeps at approximately 0.01 s. These are demonstration assumptions, not validated spacecraft specifications.
 
-- SURVEY phase: lidar point cloud + RANSAC circle fitter estimates nozzle centre
-  and radius, builds confidence/stability score
-- TERMINAL gate: opens when nozzle estimator confidence and stability thresholds
-  are met
-- bell capture: proximity trigger replaces geometric dock-port gates; a 5-second
-  BELL_HARD_HOLD timer runs before DOCKING is declared
-- false-positive rejection: 6-axis probe checks the fitted circle against the
-  full body mesh before propagating to the estimator
+## Saved single-run results
 
-Latest Monte Carlo baseline (20 trials, seed 42):
+The following are **two historical full runs, one seed per orbit**, recovered from their original frozen snapshots. Both saved results have no execution error, `far_handoff=true`, `terminal_capture=true`, and all eight terminal criteria true. They are not a Monte Carlo success-rate estimate.
 
-```text
-Trials total        : 20
-Docking success     : 20 / 20  (100.0%)
-Soft capture seen   : 20 / 20
-Capture timeouts    :  0 / 20
-Mean total DV       : 3.028 m/s
-95th-pct DV         : 3.654 m/s
-Mean time to dock   : 1.603 hr
-95th-pct time       : 1.866 hr
-Nozzle conf (mean)  : 1.000  (estimator always converges before TERMINAL)
-```
+| Saved measurement | LEO, seed 1 | GEO, seed 1 |
+|---|---:|---:|
+| Declared mission result | PASS | PASS |
+| Reported elapsed simulation time | 3,398.50 s | 39,047.25 s |
+| Terminal phase duration | 1,076.00 s | 1,161.25 s |
+| Recorded total delta-v diagnostic | 1.276012 m/s | 1.393635 m/s |
+| Terminal propellant consumption | 0.042831 kg | 0.048990 kg |
+| Final relative-position estimation error | 1.428 mm | 2.122 mm |
+| Final fixture axial error | 0.558 mm | 1.130 mm |
+| Final fixture lateral error | 2.443 mm | 0.488 mm |
+| Final fixture-relative speed | 0.01435 mm/s | 0.01806 mm/s |
+| Final alignment error | 0.04075 degrees | 0.01061 degrees |
+| Qualified capture hold | 5.0 s | 5.0 s |
+| Peak modelled contact load | 0.01767 N | 0.01729 N |
+| Minimum recorded bus-sphere clearance diagnostic | 0.20709 m | 0.20773 m |
+| Bus collision / attachment overload | Neither reported | Neither reported |
 
-Stress-case breakdown:
+Final contact errors are evaluated after compliant attachment and the hold; they are not all pre-contact approach errors. The report's elapsed time excludes the initial 30 s coast: the final truth clocks are 3,428.50 s and 39,077.25 s. Delta-v is the implementation's cumulative translational diagnostic, not a propulsion-optimality claim or a complete six-axis impulse budget.
 
-```text
-nominal              5 / 5
-gyro_bias            1 / 1
-high_pose_noise      1 / 1
-camera_dropout       1 / 1
-slow_detumble        1 / 1
-weak_thruster        2 / 2
-lidar_occlusion      5 / 5   (90-s lidar dropout during SURVEY)
-nozzle_oversize      2 / 2   (nozzle radius +15%)
-nozzle_undersize     2 / 2   (nozzle radius -15%)
-```
+Read the original records, including pre-capture metrics and mode transitions:
 
-Note: `range_dropout` was not sampled in this 20-trial run (low weight, draws
-randomly). Re-run with `--trials 50` to populate sparse cases.
+- [LEO seed-1 record](evidence/leo_seed1/trial_1.json) and [provenance/source comparison](evidence/leo_seed1/provenance.json).
+- [GEO seed-1 record](evidence/geo_seed1/trial_1.json) and [provenance/source comparison](evidence/geo_seed1/provenance.json).
+- [Machine-readable comparison](evidence/single_run_summary.json).
 
-## Architecture
+**Important source distinction:** these runs predate extraction of this smaller package. The core engine, dynamics, navigation and control files match the original run snapshots byte-for-byte; seven shared export/factory/report files were narrowed during packaging. This extracted tree has focused checks and bounded initialization/stepping evidence; it has not received a fresh full end-to-end replay. The exact matched/changed/added files are recorded in each provenance file.
 
-Core layout:
+A separate 300-trial campaign was launched locally (150 seeds per orbit). It is not presented here as completed evidence, and its large source archives and live logs are not included.
 
-```text
-main.py                    single-run closed-loop simulation (argparse CLI)
-monte_carlo.py             Monte Carlo campaign runner
-sim_config.py              mission, sensor, guidance, and capture constants
-render/
-  chief_renderer.py        software rasteriser + IS-1002 mesh (138 triangles)
-                           including Ka-band antenna bracket and array hinges
-chief_pose_estimator.py    chief attitude/omega estimator
-estimation/
-  nozzle_estimator.py      flash-lidar RANSAC circle → nozzle centre + radius
-control/                   RPOD, Lambert, spin-sync, guidance controllers
-estimation/                MEKF, TH-EKF, terminal nav
-sensors/
-  lidar_pointcloud_sensor.py  flash lidar (Möller–Trumbore ray cast, geometry override)
-  camera_sensor.py            monocular camera model
-  dock_port_sensor.py         cooperative dock-port sensor (inactive in uncoop mode)
-plant/                     deputy rigid body, finite body, contact dynamics
-environment/               GEO orbit, CW dynamics, gravity gradient, SRP, sun, B-field
-tools/
-  analyze_rpod_telemetry.py   single-run NPZ analyser (mode-aware: coop vs uncoop)
-  analyze_mc_results.py       Monte Carlo NPZ analyser (reads monte_carlo_results.npz)
-  update_report_current_state.py  auto-update Word report
-tests/                     Python unit/regression tests
-```
+## Acceptance criteria
 
-Mission flow (non-cooperative):
+The outer report requires both a qualified far-to-terminal handoff and terminal success. Terminal success requires all of:
 
-```text
-DETUMBLE
-  -> SUN_ACQUISITION
-  -> FINE_POINTING
-  -> FORMATION_HOLD
-  -> LAMBERT / PROX_OPS
-  -> SURVEY          (lidar active, nozzle estimator building confidence)
-  -> TERMINAL        (gated on estimator confidence + stability thresholds)
-  -> SOFT_CAPTURE    (proximity contact, bell geometry check)
-  -> DOCKING         (5 s BELL_HARD_HOLD, then declared)
-```
+1. Completed capture with at least five seconds of qualified hold.
+2. Recorded capture-entry evidence.
+3. No sampled bus collision.
+4. No modelled attachment overload/breakage.
+5. Actuator-health readiness.
+6. Healthy measured-attitude chain.
+7. At least one accepted mapped-pixel pose.
+8. Engaged physical attachment.
 
-The Python sim is the truth plant and campaign environment. The C repo ports
-flight-software kernels and runs against this plant for SIL/HIL.
+The local geometric contact gate uses axial error in [0, 0.04) m, lateral error below 0.04 m, relative speed below 0.01 m/s, alignment below 2 degrees, and spin-rate error below 0.1 degrees/s. See `eligible()` and `RPODMission.summary()` in [fsw/rpod.py](fsw/rpod.py). A zero process exit is not mission acceptance.
 
-## Current Scenario
+The saved `far.rdv_success=false` flag is retained in both historical records. It belongs to a separate legacy far-leg truth-based endpoint/hold evaluator; it is not the shared supervisor's handoff criterion. The top-level handoff and terminal results are reported explicitly rather than hiding this distinction. Also, the far summary is generated after terminal execution on a shared plant, so its final range must not be interpreted as the far-leg handoff range.
 
-```text
-Chief orbit                 GEO, a = 42164 km, e = 0.0003
-Chief attitude              uncontrolled tumble 0.5–2 deg/s (random axis)
-Deputy mass                 50 kg
-Deputy thrust               1 N
-Max acceleration            20 mm/s^2
-Initial standoff            ~1000 m trailing
-Inner ADCS step             0.01 s
-RPOD outer-loop step        0.1 s
-Approach axis               chief -Z (nozzle face)
+## Install and run
 
-LAE nozzle geometry
-  Base radius               0.185 m
-  Exit radius               0.240 m
-  Nozzle length             0.420 m
+Python 3.11 is the locally checked interpreter. The pinned packages reproduce the recorded local environment; availability on other Python versions/platforms has not been established. No model weights or LLM are required.
 
-Soft-capture trigger        proximity to bell + geometry check
-Hard-capture gate           bell contact + 5 s hold (BELL_HARD_HOLD_S)
-SURVEY entry range          ≤ 50 m
-TERMINAL entry              nozzle_conf ≥ 0.70, stability ≥ 0.60,
-                            drift ≤ 0.10 m/s, FP score ≥ 0.80
-```
-
-Lidar sensor:
-
-```text
-Rays per shot               60
-Range noise (1-sigma)       0.02 m  (nominal); scaled per stress profile
-RANSAC search band          R ∈ [0.10, 0.45] m
-```
-
-## Quick Start
-
-Install dependencies:
-
-```powershell
+```bash
+python -m venv .venv
+# Activate .venv for your shell, then:
 python -m pip install -r requirements.txt
+python main.py --describe
 ```
 
-Run one simulation (headless, non-cooperative default):
+On Windows, `py -3.11` can replace `python` when selecting the interpreter.
 
-```powershell
-python main.py --no-plot
+Single full runs (use a fresh output directory each time):
+
+```bash
+python main.py --profile full --parameters configs/rpod_leo.json --seed 1 --duration 2400 --output results/leo_seed1
+python main.py --profile full --parameters configs/rpod_geo.json --seed 1 --duration 2400 --output results/geo_seed1
 ```
 
-Run cooperative mode (dock-port target, legacy):
+`--duration` bounds the terminal phase, not total mission time. Full GEO runs can be slow. The far leg ends on qualified handoff or its separate time bound. The `terminal-window` profile is a fresh terminal-only diagnostic and does not reproduce a complete far-leg handoff.
 
-```powershell
-python main.py --no-plot --cooperative
+Monte Carlo, one worker, one orbit at a time:
+
+```bash
+python mc.py --profile full --parameters configs/rpod_leo.json --runs 150 --workers 1 --seed 0 --duration 2400 --output results/leo_mc
+python mc.py --profile full --parameters configs/rpod_geo.json --runs 150 --workers 1 --seed 0 --duration 2400 --output results/geo_mc
 ```
 
-Reproducible single run:
+Seeds vary the existing stochastic models and declared initial variations; they do not imply a comprehensive hardware/environment dispersion campaign. For interrupted campaigns, use the identical source/configuration and append `--resume`; completed trial records are retained and interrupted trials restart in separate attempt folders. Do not run duplicate workers against the same output folder. There is no automatic retry policy.
 
-```powershell
-python main.py --no-plot --seed 7
+## Focused verification
+
+```bash
+python -m unittest -v tests.test_unified_rpod tests.test_rpod_rim_covariance
 ```
 
-Analyze the latest single-run telemetry:
+These 11 component checks cover orbit initialization/configuration, handoff inhibition and dwell, the legacy alias, rim covariance/bias-floor handling, inconsistent geometry, freshness and invalid covariance. They do not cover the entire closed loop.
 
-```powershell
-python tools\analyze_rpod_telemetry.py          # saves PNG
-python tools\analyze_rpod_telemetry.py --show   # opens window
-```
+`python verify_package.py` additionally runs short far-leg and terminal stepping in both orbits and checks local import isolation. These intentionally short cases do not meet mission acceptance; a normal execution with `success=false` is expected. It creates a local `BOUNDED_VERIFICATION.json`.
 
-Run Monte Carlo:
+## Code map
 
-```powershell
-python monte_carlo.py --trials 20 --workers 8 --seed 42
-python tools\analyze_mc_results.py
-```
+| Path | Responsibility |
+|---|---|
+| `main.py`, `mc.py`, `wrapper.py` | Public entry points for the same shared simulation |
+| `mission_specifics/master_rpod/wrapper.py` | Select full mission or terminal diagnostic |
+| `mission_specifics/rpod/wrapper.py` | Orbit configuration, far-to-terminal orchestration and report |
+| `fsw/rpod.py`, `fsw/rpod_supervisor.py` | Terminal state machine, capture and handoff qualification |
+| `fsw/leo_attitude.py` | Shared attitude sensing/MEKF chain; historical filename also used for GEO |
+| `estimation/` | Relative navigation, attitude filtering and camera-pose solution |
+| `control/` | Lambert planning, finite burns, rendezvous and attitude control |
+| `sensors/` | Range/bearing, gyro, star tracker and landmark camera |
+| `actuators/` | RCS allocation/execution, valve and wheel support |
+| `plant/`, `environment/` | Coupled rigid bodies, contact, orbit and disturbances |
+| `spec/`, `utils/` | Typed records, time, frames, numerical helpers |
+| `telemetry/` | Trial records, provenance, optional diagnostics |
+| `tests/`, `evidence/`, `docs/` | Focused checks, saved results and review notes |
 
-Run tests:
+Shared files may retain helper functions unused by this scenario. Other mission implementations, AI-training assets and the previous broad library are not included.
 
-```powershell
-python -m pytest tests\ -v
-```
+## Frames and interfaces
 
-## CLI Flags (main.py)
+The terminal engine expresses relative position and coordinate-derivative velocity in chief RTN/LVLH axes, with rotation matrices mapping body vectors into that frame. Cartesian truth is propagated in inertial coordinates. Transformations include rotating-frame terms; see [utils/orbital_frames.py](utils/orbital_frames.py). SI units are used unless a field explicitly names another unit. Quaternion conventions and time/measurement records are defined by the code in `utils/` and `spec/`; review them before connecting another simulator.
 
-```text
---no-plot        run headless (Agg backend, no plt.show)
---cooperative    switch to cooperative dock-port mode (default: non-cooperative)
---seed N         RNG seed for repeatable runs (default: 42)
---out-dir PATH   directory for output files (default: cwd)
-```
+## Assumptions and limitations
 
-## Telemetry To Watch
+- Chief ephemeris is assumed known. Far navigation starts with a one-time noisy truth-derived prior, not autonomous target discovery or absolute navigation.
+- Landmark geometry/correspondences are supplied to the camera model. There is no demonstrated raw-image detection pipeline, unknown-target reconstruction or CNN pose estimator in this package.
+- The bell-rim sensor and uncertainty treatment are illustrative. No hardware-derived sensor calibration or full joint pose/geometry uncertainty validation is established.
+- Target geometry, actuator settings and contact properties are illustrative, not identified from a flight vehicle. There is no demonstrated telemetry-based digital twin or learned physics surrogate here.
+- The environment is simplified. Neither comprehensive GEO force modelling nor long-duration high-precision orbit truth has been independently validated.
+- Collision checks sample example bus geometry at plant steps and exclude appendages. Geometric plume exclusion is not a plume-fluid or contamination model.
+- Physics truth is used for measurement generation, independent scoring/contact mechanics and some simulation safety stops; the entire Python program is not an onboard-information-only implementation.
+- The handoff supervisor does not establish complete safe abort/retreat trajectories under combined failures.
+- Finite-step contact behaviour, estimator consistency, filter noise calibration and closed-loop robustness need further independent assessment.
+- No embedded execution timing, hardware-in-the-loop qualification, mission certification, global stability proof or comprehensive reliability percentage is claimed.
 
-For terminal/debug work in non-cooperative mode:
+## Questions for an independent reviewer
 
-- **nozzle estimator**: confidence, stability, drift, FP score at TERMINAL entry
-- **SURVEY duration**: time from SURVEY entry to TERMINAL gate open
-- flash lidar health: point cloud density, dropout windows
-- truth nozzle-axis alignment and estimated alignment
-- truth-est alignment bias
-- pose-estimator status counts: `ACCEPTED`, `REJECTED`, `COAST`, `NO_VISIBLE`
-- pose age, reprojection RMS, PCA condition number
-- bell capture trigger: proximity check + `uncoop_override_fired`
+1. Are the frame conventions, propagation and far-to-terminal state/hardware continuity physically consistent?
+2. Are the navigation priors, sensing abstractions and covariance assumptions sufficient for the claimed scenario?
+3. Does achieved actuation accurately represent the bounds and nonidealities relevant to this demonstration?
+4. Are capture entry/hold, collision and load criteria appropriate, and what important checks are missing?
+5. Which independent benchmarks and failure cases should be completed before treating this as a useful engineering tool?
 
-Note on port metrics: `rn_port_range` and related cooperative-port metrics are
-logged throughout but are **not** the capture criterion in non-cooperative mode.
-`analyze_rpod_telemetry.py` labels them accordingly when `uncooperative_mode`
-is set in the NPZ.
-
-Healthy non-cooperative terminal behavior:
-
-- nozzle_conf ≥ 0.70 before TERMINAL entry,
-- nozzle estimator still stable at contact (conf = 1.0 in all 20 baseline trials),
-- deputy +Z vs nozzle axis alignment below 30 deg through approach,
-- bell proximity trigger fires within a few seconds of contact.
-
-## Relationship To The C Port
-
-Do not port `main.py` directly. It is the simulation harness, not flight code.
-
-The C repo should port or mirror:
-
-- nozzle estimator (RANSAC circle fitter + confidence logic),
-- SURVEY/TERMINAL mode manager and gate thresholds,
-- bell-capture proximity check,
-- MEKF, TH-EKF, terminal nav,
-- guidance kernels and spin-sync,
-- packet ABI, fault handling, actuator limits.
-
-The Python repo remains responsible for:
-
-- truth plant,
-- mesh renderer and lidar ray caster,
-- sensors and stress cases,
-- Monte Carlo campaigns,
-- plots and diagnostics,
-- reference behavior for C parity checks.
-
-## Outputs
-
-Generated outputs are local artifacts (gitignored):
-
-```text
-rpod_telemetry.npz
-rpod_telemetry_plots.png
-mc_results.pkl
-ca_results.png
-monte_carlo_results/
-Figure_*.png
-```
-
-Preserve important campaign results in this README or a report. Do not commit
-raw generated artifacts.
-
-## Near-Term Work
-
-Python side:
-
-- run larger MC sets (50–100 trials) to populate sparse stress cases,
-- add named baseline reports for each major architecture change,
-- keep deterministic replay for failed or suspicious seeds (`--seed N`),
-- pose CNN integration (ENABLE_CNN_POSE_ESTIMATOR flag, currently False).
-
-C/HIL side lives in `Satellite_GNC`:
-
-- port nozzle estimator and SURVEY/TERMINAL mode manager,
-- target compiler build and WCET measurement,
-- real comms-link HIL with this Python plant.
-
-## Git Hygiene
-
-Commit source, tests, configuration, and documentation. Avoid committing:
-
-```text
-__pycache__/
-.pytest_cache/
-rpod_telemetry*.npz
-mc_results.pkl
-monte_carlo_results/
-*_plots.png
-Figure_*.png
-```
-
-## Author
-
-Venkat Sainath — MSc Space Engineering
+The repository name is retained for continuity. The earlier GEO-only implementation and its historical claims remain available in Git history; they are not evidence for the replacement tree.

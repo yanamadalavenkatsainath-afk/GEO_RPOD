@@ -1,0 +1,56 @@
+COMMAND: python -m unittest -v tests.test_unified_rpod tests.test_rpod_rim_covariance
+test_chief_inclination_and_far_model_are_configured (tests.test_unified_rpod.UnifiedRPODTests.test_chief_inclination_and_far_model_are_configured) ... ok
+test_handoff_rejects_active_burn_or_unhealthy_actuation (tests.test_unified_rpod.UnifiedRPODTests.test_handoff_rejects_active_burn_or_unhealthy_actuation) ... ok
+test_legacy_alias_and_orbit_validation (tests.test_unified_rpod.UnifiedRPODTests.test_legacy_alias_and_orbit_validation) ... ok
+test_one_engine_initializes_both_orbits (tests.test_unified_rpod.UnifiedRPODTests.test_one_engine_initializes_both_orbits) ... ok
+test_stand_off_hold_resets_when_navigation_is_stale (tests.test_unified_rpod.UnifiedRPODTests.test_stand_off_hold_resets_when_navigation_is_stale) ... ok
+test_bad_angular_covariance_rejected (tests.test_rpod_rim_covariance.RimCovarianceTests.test_bad_angular_covariance_rejected) ... ok
+test_freshness_still_required (tests.test_rpod_rim_covariance.RimCovarianceTests.test_freshness_still_required) ... ok
+test_high_uncertainty_does_not_qualify_from_count_alone (tests.test_rpod_rim_covariance.RimCovarianceTests.test_high_uncertainty_does_not_qualify_from_count_alone) ... ok
+test_inconsistent_geometry_rejected_without_overwriting_fit (tests.test_rpod_rim_covariance.RimCovarianceTests.test_inconsistent_geometry_rejected_without_overwriting_fit) ... ok
+test_noisy_pose_accumulates_geometry_within_original_accuracy (tests.test_rpod_rim_covariance.RimCovarianceTests.test_noisy_pose_accumulates_geometry_within_original_accuracy) ... ok
+test_shared_bias_floor_enters_gate_after_many_samples (tests.test_rpod_rim_covariance.RimCovarianceTests.test_shared_bias_floor_enters_gate_after_many_samples) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 1.392s
+
+OK
+
+COMMAND: python main.py --describe
+{
+  "mission": "master_rpod",
+  "status": "experimental",
+  "engine": "mission_specifics.rpod.wrapper.run_shared",
+  "implemented": "Fresh-navigation/actuation handoff qualification and 5-second stand-off hold",
+  "pending": "Integrated hold/retreat/abort fault trajectories and complete operational verification"
+}
+
+COMMAND: python mc.py --help
+usage: mc.py [-h] [--describe] [--seed SEED] [--duration DURATION]
+             [--output OUTPUT] [--parameters PARAMETERS] [--resume]
+             [--retry-failed] [--component-events] [--original-plots]
+             [--runs RUNS] [--workers WORKERS]
+             [--profile {full,terminal-window}]
+
+Mission-inspired qualification around the same shared RPOD mission engine.
+
+options:
+  -h, --help            show this help message and exit
+  --describe
+  --seed SEED
+  --duration DURATION
+  --output OUTPUT
+  --parameters PARAMETERS
+                        JSON object of explicit selected-wrapper parameters;
+                        saved in the manifest
+  --resume              Resume completed trials; interrupted trials restart
+                        from initial state
+  --retry-failed        Preserve failed attempt evidence and run a new attempt
+                        with --resume
+  --component-events    Save chunked raw measurements, covariance, pixel data
+                        and actuator records
+  --original-plots      Save retained original plots where supported
+  --runs RUNS
+  --workers WORKERS
+  --profile {full,terminal-window}
+

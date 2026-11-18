@@ -239,38 +239,20 @@ class LambertSolver:
                   tol:  float = 0.01,
                   max_iter: int = 500) -> float:
         """Bisect on f(z) = tgt."""
-        f_lo = f(z_lo) - tgt
-        f_hi = f(z_hi) - tgt
-
-        # Expand upper bracket if needed
-        for _ in range(20):
-            if f_lo * f_hi < 0:
-                break
-            z_hi *= 2.0
-            f_hi = f(z_hi) - tgt
-        else:
-            # Try expanding lower bracket
-            for _ in range(20):
-                z_lo *= 2.0
-                f_lo = f(z_lo) - tgt
-                if f_lo * f_hi < 0:
-                    break
-
-        for _ in range(max_iter):
-            z_mid = (z_lo + z_hi) / 2.0
-            f_mid = f(z_mid) - tgt
-            if abs(f_mid) < tol:
-                return z_mid
-            if f_lo * f_mid < 0:
-                z_hi, f_hi = z_mid, f_mid
-            else:
-                z_lo, f_lo = z_mid, f_mid
-
-        return (z_lo + z_hi) / 2.0
-
-    # ─────────────────────────────────────────────────────────────────
-    # Stumpff functions (universal variable)
-    # ─────────────────────────────────────────────────────────────────
+        # Invalid-y TOF sentinels are outside the real domain, not brackets.
+        # Scan only the single-revolution interval, avoiding multi-rev poles.
+        from scipy.optimize import brentq
+        previous=None
+        for candidate in np.linspace(z_lo+1e-8,z_hi-1e-8,513):
+            value=f(candidate)
+            if not np.isfinite(value) or value>=1e29:continue
+            residual=value-tgt
+            if abs(residual)<1e-8:return float(candidate)
+            if previous is not None and previous[1]*residual<0:
+                return float(brentq(lambda z:f(z)-tgt,previous[0],candidate,
+                    xtol=1e-12,rtol=1e-14,maxiter=max_iter))
+            previous=(candidate,residual)
+        raise ValueError('No finite single-revolution Lambert TOF bracket')
 
     @staticmethod
     def _C2(z: float) -> float:

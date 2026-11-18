@@ -24,6 +24,9 @@ Reference:
 """
 
 import numpy as np
+from utils.random_streams import random_generator
+from utils.quaternion import normalize
+from utils.validation import finite_scalar, vector
 
 
 class RangingBearingSensor:
@@ -51,15 +54,19 @@ class RangingBearingSensor:
                  sigma_doppler_ms: float = 0.005,
                  fov_half_deg:     float = 45.0,
                  min_range_m:      float = 1.0,
-                 max_range_m:      float = 10_000.0):
+                 max_range_m:      float = 10_000.0,
+                 rng=None):
 
-        self.sigma_range_abs  = sigma_range_m
-        self.sigma_range_frac = sigma_range_frac
-        self.sigma_angle      = sigma_angle_rad
-        self.sigma_doppler    = sigma_doppler_ms
-        self.fov_half         = np.radians(fov_half_deg)
-        self.min_range        = min_range_m
-        self.max_range        = max_range_m
+        self.rng = random_generator(rng=rng)
+        self.sigma_range_abs  = finite_scalar(sigma_range_m, "sigma_range_m", minimum=0)
+        self.sigma_range_frac = finite_scalar(sigma_range_frac, "sigma_range_frac", minimum=0)
+        self.sigma_angle      = finite_scalar(sigma_angle_rad, "sigma_angle_rad", minimum=0)
+        self.sigma_doppler    = finite_scalar(sigma_doppler_ms, "sigma_doppler_ms", minimum=0)
+        self.fov_half         = np.radians(finite_scalar(fov_half_deg, "fov_half_deg", minimum=0))
+        self.min_range        = finite_scalar(min_range_m, "min_range_m", minimum=0)
+        self.max_range        = finite_scalar(max_range_m, "max_range_m", strictly_positive=True)
+        if self.fov_half > np.pi or self.max_range <= self.min_range:
+            raise ValueError("Require FOV half angle <= 180 deg and max_range > min_range")
         self._prev_pos_est    = None   # for lateral velocity diff
 
     def measure(self, dr_lvlh, sensor_pointing_lvlh=None):
@@ -70,9 +77,11 @@ class RangingBearingSensor:
         """
         if sensor_pointing_lvlh is None:
             sensor_pointing_lvlh = np.array([0., 1., 0.])
+        dr_lvlh = vector(dr_lvlh, "dr_lvlh", size=3)
+        sensor_pointing_lvlh = normalize(vector(sensor_pointing_lvlh, "sensor_pointing_lvlh", size=3))
 
         true_range = float(np.linalg.norm(dr_lvlh))
-        if true_range < self.min_range or true_range > self.max_range:
+        if true_range == 0 or true_range < self.min_range or true_range > self.max_range:
             return None, self._noise_cov(true_range)
 
         dr_hat  = dr_lvlh / true_range
@@ -83,10 +92,24 @@ class RangingBearingSensor:
         el_true = np.arctan2(dr_lvlh[2], np.sqrt(dr_lvlh[0]**2 + dr_lvlh[1]**2))
 
         sigma_r = max(self.sigma_range_abs, self.sigma_range_frac * true_range)
-        z = np.array([true_range + np.random.normal(0, sigma_r),
-                      az_true    + np.random.normal(0, self.sigma_angle),
-                      el_true    + np.random.normal(0, self.sigma_angle)])
+        z = np.array([true_range + self.rng.normal(0, sigma_r),
+                      az_true    + self.rng.normal(0, self.sigma_angle),
+                      el_true    + self.rng.normal(0, self.sigma_angle)])
         return z, self._noise_cov(true_range)
+
+    def measure_range_rate(self, dr_lvlh, dv_lvlh, sensor_pointing_lvlh=None):
+        """Scalar radial Doppler with the SAME geometry gate as range/bearing."""
+        position = vector(dr_lvlh, "dr_lvlh", size=3)
+        velocity = vector(dv_lvlh, "dv_lvlh", size=3)
+        distance = float(np.linalg.norm(position))
+        pointing = normalize(vector([0, 1, 0] if sensor_pointing_lvlh is None
+                                    else sensor_pointing_lvlh, "pointing", size=3))
+        noise = np.array([[self.sigma_doppler**2]])
+        if (distance == 0 or distance < self.min_range or distance > self.max_range
+                or np.dot(pointing, position / distance) < np.cos(self.fov_half)):
+            return None, noise
+        value = np.dot(velocity, position / distance) + self.rng.normal(0, self.sigma_doppler)
+        return np.array([value]), noise
 
     def measure_doppler(self, dr_lvlh, dv_lvlh, pos_est_ekf, dt):
         """
@@ -129,7 +152,7 @@ class RangingBearingSensor:
         # dot(dv_lvlh, r_hat) is a scalar — no truth vector in guidance path
         r_hat_true      = dr_lvlh / true_range
         true_range_rate = float(np.dot(dv_lvlh, r_hat_true))
-        doppler_meas    = true_range_rate + np.random.normal(0, self.sigma_doppler)
+        doppler_meas    = true_range_rate + self.rng.normal(0, self.sigma_doppler)
 
         # Project onto EKF range direction (not truth direction)
         r_hat_est = pos_est_ekf / max(np.linalg.norm(pos_est_ekf), 1e-3)

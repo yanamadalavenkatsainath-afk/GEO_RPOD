@@ -1,0 +1,2 @@
+# Preserve original source/evidence bytes so published SHA-256 provenance remains valid.
+* -text

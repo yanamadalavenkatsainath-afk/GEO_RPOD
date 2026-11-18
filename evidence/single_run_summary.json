@@ -1,0 +1,116 @@
+[
+  {
+    "orbit": "leo",
+    "seed": 1,
+    "success": true,
+    "elapsed_s": 3398.5,
+    "terminal_elapsed_s": 1076.0,
+    "far_elapsed_s": 2322.5,
+    "initial_coast_s": 30,
+    "truth_elapsed_s": 3428.5,
+    "delta_v_m_s": 1.2760121346103817,
+    "terminal_propellant_kg": 0.04283059881702855,
+    "final_navigation_error_m": 0.0014282874395129353,
+    "final_axial_m": 0.0005579435154789319,
+    "final_lateral_m": 0.002442763147024567,
+    "final_relative_speed_m_s": 1.4353961148965511e-05,
+    "final_alignment_deg": 0.040745758682450534,
+    "capture_hold_s": 5.0,
+    "peak_contact_load_n": 0.017668886273409387,
+    "minimum_bus_sphere_clearance_m": 0.20708657937239738,
+    "criteria": {
+      "far_handoff": true,
+      "terminal_capture": true
+    },
+    "terminal_criteria": {
+      "capture_hold": true,
+      "entry_verified": true,
+      "no_bus_collision": true,
+      "no_attachment_overload": true,
+      "actuator_health": true,
+      "measured_attitude": true,
+      "pixel_acquisition": true,
+      "physical_attachment": true
+    },
+    "legacy_far_rdv_success": false,
+    "source_comparison": {
+      "matching": 64,
+      "changed": [
+        "actuators\\__init__.py",
+        "control\\__init__.py",
+        "environment\\__init__.py",
+        "estimation\\__init__.py",
+        "mission_specifics\\benchmarks.py",
+        "plant\\__init__.py",
+        "sensors\\catalog.py"
+      ],
+      "added": [
+        "main.py",
+        "mc.py",
+        "verify_package.py",
+        "wrapper.py",
+        "mission_specifics\\master_rpod\\mc.py",
+        "tests\\test_rpod_rim_covariance.py",
+        "tests\\test_unified_rpod.py",
+        "tests\\__init__.py"
+      ]
+    }
+  },
+  {
+    "orbit": "geo",
+    "seed": 1,
+    "success": true,
+    "elapsed_s": 39047.25,
+    "terminal_elapsed_s": 1161.25,
+    "far_elapsed_s": 37886.0,
+    "initial_coast_s": 30,
+    "truth_elapsed_s": 39077.25,
+    "delta_v_m_s": 1.3936351039019295,
+    "terminal_propellant_kg": 0.04898963458469685,
+    "final_navigation_error_m": 0.00212216905599368,
+    "final_axial_m": 0.0011300119116654287,
+    "final_lateral_m": 0.00048796011371285224,
+    "final_relative_speed_m_s": 1.806000080773093e-05,
+    "final_alignment_deg": 0.010610498841509247,
+    "capture_hold_s": 5.0,
+    "peak_contact_load_n": 0.017294276563510118,
+    "minimum_bus_sphere_clearance_m": 0.20773310417306845,
+    "criteria": {
+      "far_handoff": true,
+      "terminal_capture": true
+    },
+    "terminal_criteria": {
+      "capture_hold": true,
+      "entry_verified": true,
+      "no_bus_collision": true,
+      "no_attachment_overload": true,
+      "actuator_health": true,
+      "measured_attitude": true,
+      "pixel_acquisition": true,
+      "physical_attachment": true
+    },
+    "legacy_far_rdv_success": false,
+    "source_comparison": {
+      "matching": 64,
+      "changed": [
+        "actuators\\__init__.py",
+        "control\\__init__.py",
+        "environment\\__init__.py",
+        "estimation\\__init__.py",
+        "mission_specifics\\benchmarks.py",
+        "plant\\__init__.py",
+        "sensors\\catalog.py"
+      ],
+      "added": [
+        "main.py",
+        "mc.py",
+        "verify_package.py",
+        "wrapper.py",
+        "mission_specifics\\master_rpod\\mc.py",
+        "tests\\test_rpod_rim_covariance.py",
+        "tests\\test_unified_rpod.py",
+        "tests\\__init__.py"
+      ]
+    }
+  }
+]

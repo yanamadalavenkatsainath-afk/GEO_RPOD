@@ -43,10 +43,11 @@ class BoxBody:
 
 class FiniteBodyPair:
     """
-    Coarse pairwise finite-body geometry between chief and deputy.
+    Exact oriented-box overlap for the declared bus geometries.
 
-    This is intentionally conservative: it checks deputy box corners against
-    the chief box and uses a bounding-radius precheck to keep MC inexpensive.
+    The sphere precheck avoids work at range. Near the buses, all 15
+    separating axes are tested; corner containment alone misses crossed
+    edges and complete containment. Appendages are not represented here.
     """
 
     def __init__(self, chief_body, deputy_body):
@@ -73,8 +74,27 @@ class FiniteBodyPair:
             self.chief.contains_world_point(p, chief_com_world, R_chief_to_world)
             for p in dep_corners
         ]
+        chief_axes = np.asarray(R_chief_to_world, dtype=float)
+        deputy_axes = np.asarray(R_deputy_to_world, dtype=float)
+        delta = deputy_com_world-chief_com_world
+        axes = [*chief_axes.T, *deputy_axes.T]
+        axes.extend(np.cross(a, b) for a in chief_axes.T for b in deputy_axes.T)
+        collision = True
+        for axis in axes:
+            norm = float(np.linalg.norm(axis))
+            if norm < 1e-10:
+                continue  # Parallel edges do not define a separating axis.
+            axis = axis/norm
+            chief_radius = float(np.dot(self.chief.half_extents_m,
+                                         np.abs(chief_axes.T@axis)))
+            deputy_radius = float(np.dot(self.deputy.half_extents_m,
+                                          np.abs(deputy_axes.T@axis)))
+            # Mere surface contact is not positive-volume bus penetration.
+            if abs(float(np.dot(delta, axis))) >= chief_radius+deputy_radius-1e-9:
+                collision = False
+                break
         return {
-            "collision": bool(any(inside)),
+            "collision": collision,
             "sphere_clearance_m": sphere_clearance,
             "corner_inside_count": int(np.sum(inside)),
         }

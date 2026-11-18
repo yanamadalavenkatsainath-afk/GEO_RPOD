@@ -1,0 +1,424 @@
+{
+  "seed": 1,
+  "result": {
+    "mission": "master_rpod",
+    "seed": 1,
+    "elapsed_s": 3398.5,
+    "metrics": {
+      "orbit": "leo",
+      "orbital_period_s": 5557.143314574155,
+      "far": {
+        "rdv_triggered": true,
+        "rdv_success": false,
+        "final_range": 2.5222491141664616,
+        "final_speed": 0.0010131413960288791,
+        "hold_s": 0.0,
+        "total_dv_mms": 1276.0121346103817,
+        "truth_model": "cartesian_j2",
+        "transfer_guidance": "finite_cartesian_lambert",
+        "lambert_plans": [
+          {
+            "planner": "flight_sim_Lambert_seed_full_force_finite_shooting",
+            "start_s": 150.0,
+            "end_s": 2850.0,
+            "departure_delta_v_m_s": [
+              0.030622232958413157,
+              0.00534456636436379,
+              0.006448731362656094
+            ],
+            "arrival_delta_v_m_s": [
+              -0.033278474402984884,
+              -0.0006630738172793831,
+              -0.0013065083013617644
+            ],
+            "arrival_burn_start_s": 2516.8928866837564,
+            "departure_duration_s": 317.46994773838327,
+            "arrival_duration_s": 333.1071133162438,
+            "target_rtn_m": [
+              0.0,
+              12.0,
+              0.0
+            ],
+            "predicted_position_error_m": 1.6529028497494344e-08,
+            "predicted_speed_error_m_s": 1.4214037590216125e-11,
+            "maximum_acceleration_m_s2": 0.0001,
+            "optimizer_evaluations": 8,
+            "departure_issued": true,
+            "arrival_issued": false
+          },
+          {
+            "planner": "flight_sim_Lambert_seed_full_force_finite_shooting",
+            "start_s": 1500.0,
+            "end_s": 2850.0,
+            "departure_delta_v_m_s": [
+              0.00012910454184066736,
+              -0.001863296477747159,
+              -0.002236599052912135
+            ],
+            "arrival_delta_v_m_s": [
+              -0.032462426602062736,
+              -6.667988679794651e-05,
+              -0.0005798998393932675
+            ],
+            "arrival_burn_start_s": 2525.3232575429306,
+            "departure_duration_s": 29.1391782145556,
+            "arrival_duration_s": 324.6767424570694,
+            "target_rtn_m": [
+              0.0,
+              12.0,
+              0.0
+            ],
+            "predicted_position_error_m": 1.5247518719410785e-08,
+            "predicted_speed_error_m_s": 2.3241104534791953e-11,
+            "maximum_acceleration_m_s2": 0.0001,
+            "optimizer_evaluations": 6,
+            "departure_issued": true,
+            "arrival_issued": true
+          }
+        ],
+        "finite_burn_execution": [
+          {
+            "start_s": 150.0,
+            "phase": "FAR_LAMBERT_DEPARTURE",
+            "commanded_delta_v_m_s": [
+              0.030622232958413157,
+              0.00534456636436379,
+              0.006448731362656094
+            ],
+            "issued_delta_v_m_s": [
+              0.030622232958413095,
+              0.005344566364363668,
+              0.006448731362655949
+            ],
+            "achieved_delta_v_m_s": [
+              0.030615212606107927,
+              0.0053478941151191,
+              0.006455802149790122
+            ],
+            "command_sequence_complete": true,
+            "aborted": false,
+            "end_s": 467.5,
+            "vector_error_m_s": 1.0505013197219537e-05
+          },
+          {
+            "start_s": 1500.0,
+            "phase": "FAR_LAMBERT_DEPARTURE",
+            "commanded_delta_v_m_s": [
+              0.00012910454184066736,
+              -0.001863296477747159,
+              -0.002236599052912135
+            ],
+            "issued_delta_v_m_s": [
+              0.00012910454184066717,
+              -0.0018632964777471595,
+              -0.0022365990529121327
+            ],
+            "achieved_delta_v_m_s": [
+              0.0001309516427211311,
+              -0.0018592674481755559,
+              -0.002234464270587761
+            ],
+            "command_sequence_complete": true,
+            "aborted": false,
+            "end_s": 1529.5,
+            "vector_error_m_s": 4.919568733529524e-06
+          }
+        ],
+        "remaining_propellant_kg": 0.9560563903065917,
+        "burn_count": 2,
+        "measurements": 4645,
+        "roe_updates": 4645,
+        "cw_updates": 4645
+      },
+      "terminal": {
+        "seed": 1,
+        "success": true,
+        "criteria": {
+          "capture_hold": true,
+          "entry_verified": true,
+          "no_bus_collision": true,
+          "no_attachment_overload": true,
+          "actuator_health": true,
+          "measured_attitude": true,
+          "pixel_acquisition": true,
+          "physical_attachment": true
+        },
+        "accepted_range_updates": 2152,
+        "rejected_range_updates": 0,
+        "recovery_waypoint_m": null,
+        "reason": "qualified_capture",
+        "elapsed_s": 1076.0,
+        "transitions": [
+          {
+            "t": 0.0,
+            "mode": "SURVEY"
+          },
+          {
+            "t": 30.0,
+            "mode": "SPIN_SYNC"
+          },
+          {
+            "t": 349.0,
+            "mode": "APPROACH"
+          },
+          {
+            "t": 1071.0,
+            "mode": "CAPTURE"
+          },
+          {
+            "t": 1076.0,
+            "mode": "COMPLETE"
+          }
+        ],
+        "handoff": {
+          "truth_time_s": 2352.5,
+          "estimated_range_m": 19.827577923937188,
+          "estimate": [
+            9.691565865181332,
+            17.297458204360606,
+            -0.06585650348561098,
+            -0.028080720394007046,
+            -0.02522146817274912,
+            0.00017562652499933577
+          ],
+          "phase": 2.661930809807548,
+          "truth_model": "cartesian_j2",
+          "truth_state": [
+            9.556958820148989,
+            17.11317185636722,
+            -0.05820658404978137,
+            -0.028554249092983035,
+            -0.025536549432030452,
+            0.00020654475288907074
+          ],
+          "chief_position_m": [
+            -6009521.169748064,
+            1946504.4474541373,
+            2434297.782435769
+          ],
+          "chief_velocity_m_s": [
+            -3534.0812426304324,
+            -4228.9619010481965,
+            -5346.243282478612
+          ],
+          "deputy_position_m": [
+            -6009537.532376206,
+            1946497.8163400926,
+            2434289.268199003
+          ],
+          "deputy_velocity_m_s": [
+            -3534.0318983402644,
+            -4228.967750336526,
+            -5346.2501767911035
+          ],
+          "continuity": "Same Cartesian plant object and clock retained; no position/velocity reset",
+          "attitude_continuity": "Same body, gyro/star filter, wheels, jets/valves and tank retained"
+        },
+        "final": {
+          "t": 1076.0,
+          "mode": "COMPLETE",
+          "range_m": 2.5222491141664616,
+          "truth_elapsed_s": 3428.5,
+          "chief_position_m": [
+            -4989957.157892475,
+            -2833859.896909668,
+            -3592131.6323906705
+          ],
+          "deputy_position_m": [
+            -4989955.695431511,
+            -2833861.7105096714,
+            -3592130.6660555573
+          ],
+          "standoff_m": 0.012,
+          "nav_error_m": 0.0014282874395129353,
+          "pose_healthy": true,
+          "guidance_sensing_healthy": true,
+          "bell_identified": true,
+          "bell_fit_residual_m": 0.0009233458617366578,
+          "bell_fit_count": 2129,
+          "bell_fit_rejections": 0,
+          "bell_fit_reason": "COVARIANCE_FIT",
+          "bell_fit_nis": 0.0694132059970291,
+          "estimated_target_rate_rad_s": [
+            -0.0010305398975180703,
+            0.0009199427585824243,
+            0.0014640654911138274
+          ],
+          "truth_target_rate_rad_s": [
+            -0.001038323507459558,
+            0.0009251890336165361,
+            0.0014653835147400921
+          ],
+          "estimated_sync_attitude_error_deg": 0.03917933760539261,
+          "estimated_sync_rate_error_deg_s": 0.0027580475828432394,
+          "estimated_sync_position_error_m": 9.978405252326093,
+          "sync_hold_s": 0.0,
+          "latched": true,
+          "capture_hold_s": 5.0,
+          "axial_m": 0.0005579435154789319,
+          "lateral_m": 0.002442763147024567,
+          "speed_ms": 1.4353961148965511e-05,
+          "angle_deg": 0.040745758682450534,
+          "spin_error_deg_s": 0.0024493037975832615,
+          "contact_force_n": 0.003927017279662926,
+          "contact_couple_nm": 0.0018252516370724468,
+          "attachment_broken": false,
+          "bus_collision": false,
+          "bus_sphere_clearance_m": 0.2071031171130543,
+          "attitude_estimation_error_deg": 0.0019676561719955085,
+          "attitude_healthy": true,
+          "attitude_uncertainty_bound_deg": 0.002037872731561552,
+          "gyro_bias_estimate_rad_s": [
+            2.8877150595005922e-06,
+            -4.796360239222844e-06,
+            -4.798983132658509e-06
+          ],
+          "star_age_s": 0.25,
+          "accepted_star_samples": 13584,
+          "rejected_star_samples": 0,
+          "unavailable_star_samples": 13844,
+          "measured_relative_rate_rad_s": [
+            -0.0010048311852054815,
+            0.0009596115879659932,
+            0.0014731549321520398
+          ],
+          "truth_relative_rate_rad_s": [
+            -0.0010200167949353095,
+            0.0009039949499591921,
+            0.001497680606482482
+          ],
+          "angular_accel_command_rad_s2": [
+            -2.3931001747687887e-06,
+            -1.1983513971857484e-06,
+            -1.9299144200971243e-06
+          ],
+          "requested_torque_body_nm": [
+            -2.174712606671366e-05,
+            -5.950702196724499e-06,
+            -9.619727221425572e-06
+          ],
+          "propellant_used_kg": 0.04283059881702855,
+          "achieved_force_body_n": [
+            -0.0058137705806258,
+            -0.0015285643998525409,
+            0.0006465622375378295
+          ],
+          "achieved_torque_body_nm": [
+            -2.1747126066713472e-05,
+            -5.950702196723778e-06,
+            0.00017851127583696586
+          ],
+          "force_residual_n": 0.0005007436370370852,
+          "torque_residual_nm": 0.00018813100305839142,
+          "actuator_flags": [
+            "PULSED",
+            "VALVE_DYNAMICS"
+          ]
+        },
+        "pre_capture_evidence": {
+          "t": 1071.25,
+          "axial_m": 0.0005496334955261535,
+          "lateral_m": 0.00243803718458781,
+          "speed_ms": 9.185948179600358e-05,
+          "angle_deg": 0.03624963345884846,
+          "spin_error_deg_s": 0.0005146221364872665
+        },
+        "rejected_contacts": 0,
+        "total_dv_ms": 1.2760121346103817,
+        "vision_model": "mapped_pixels",
+        "accepted_pixel_poses": 3752,
+        "rejected_pixel_poses": 3,
+        "actuation_model": "allocated_rcs",
+        "attitude_model": "sensor_mekf",
+        "environment_model": "earth_plates",
+        "environment_scope": "Deputy plate drag/SRP/GG and chief effective-area drag/SRP; tabulated atmosphere; selected physical far path shares these providers",
+        "terminal_propellant_used_kg": 0.04283059881702855,
+        "peak_force_residual_n": 0.006404148915706732,
+        "peak_torque_residual_nm": 0.00039447197810234117,
+        "actuator_flag_counts": {
+          "DISABLED_CHANNELS": 675,
+          "PULSED": 4304,
+          "VALVE_DYNAMICS": 4304
+        },
+        "actuator_health_events": [],
+        "bus_collision": false,
+        "min_bus_sphere_clearance_m": 0.20708657937239738,
+        "collision_scope": "Oriented example bus boxes sampled each plant step; appendages excluded",
+        "model": "Independent nonlinear Cartesian two-body plus J2 chief/deputy truth; secular ROE navigation prediction, mapped pixels/PnP with known bus features; independent segmented bell-rim ranging, achieved bounded pulsed 16-jet RCS, fuel depletion, inertial rigid-body Euler dynamics; estimate-driven chief plume cone; finite far leg when inherited physical state is supplied",
+        "peak_contact_load_n": 0.017668886273409387,
+        "attachment_broken": false,
+        "capture": "Two dynamic bodies and finite compliant fixture forces/torques; no pose/velocity reset; declared mechanism parameters"
+      },
+      "supervisor_hold_s": 5.0
+    },
+    "criteria": {
+      "far_handoff": true,
+      "terminal_capture": true
+    },
+    "success": true,
+    "assumptions": [
+      "One shared Earth-orbit RPOD engine; LEO/GEO change declared orbit and scaled transfer timing",
+      "Same illustrative vehicle, target and sensors for both presets; not heritage GEO pipeline parity",
+      "Master mode initially adds fresh-navigation/actuation qualification and a 5 s estimated stand-off hold",
+      "Complete mission-inspired retreat/abort trajectory enforcement remains to be integrated; component checks are separate"
+    ],
+    "plot_metrics": {},
+    "config": {
+      "orbit": "leo",
+      "far_duration_s": 4500.0,
+      "transfer_time_s": 2700.0,
+      "mission_inspired": true,
+      "vehicle": {
+        "dt": 0.25,
+        "duration": 2400.0,
+        "seed": 1,
+        "dropout_start": null,
+        "dropout_end": null,
+        "contact_enabled": true,
+        "tumble_scale": 1.0,
+        "truth_model": "cartesian_j2",
+        "actuation_model": "allocated_rcs",
+        "dry_mass_kg": 50.0,
+        "propellant_kg": 1.0,
+        "inertia_diagonal_kg_m2": [
+          10.0,
+          10.0,
+          6.0
+        ],
+        "jet_force_n": 0.25,
+        "isp_s": 220.0,
+        "minimum_impulse_ns": 0.0001,
+        "plume_exclusion_half_angle_deg": 45.0,
+        "attitude_model": "sensor_mekf",
+        "attitude_coast_limit_s": 300.0,
+        "attitude_uncertainty_limit_deg": 0.1,
+        "environment_model": "earth_plates",
+        "environment_epoch_tai": "2025-01-01T00:00:00",
+        "bus_half_extents_m": [
+          0.3,
+          0.3,
+          0.4
+        ],
+        "pressure_offset_m": [
+          0.001,
+          0.001,
+          0.005
+        ],
+        "drag_coefficient": 2.2,
+        "radiation_coefficient": 1.3,
+        "target_mass_kg": 500.0,
+        "target_effective_area_m2": 4.0,
+        "vision_model": "mapped_pixels",
+        "contact_model": "compliant",
+        "maximum_contact_load_n": 100.0,
+        "navigation_acceleration_noise_density": 0.003,
+        "chief_radius_m": 6781000.0,
+        "chief_inclination_deg": 51.6
+      }
+    },
+    "scope": "Declared simulation benchmark only; not mission or flight qualification",
+    "telemetry_file": "trial_1_attempt_000\\trial_1.npz"
+  },
+  "error": null,
+  "log_file": "trial_1_attempt_000\\trial_1.log"
+}

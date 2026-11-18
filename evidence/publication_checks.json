@@ -1,0 +1,39 @@
+{
+  "time_utc": "2026-11-18T23:29:39.455324+00:00",
+  "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+  "commands": [
+    {
+      "command": [
+        "python",
+        "-m",
+        "unittest",
+        "-v",
+        "tests.test_unified_rpod",
+        "tests.test_rpod_rim_covariance"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "python",
+        "main.py",
+        "--describe"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "python",
+        "mc.py",
+        "--help"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "unit_checks_run": 11,
+  "unit_checks_passed": 11,
+  "historical_trial_hashes_verified": true,
+  "historical_acceptance_flags_verified": true,
+  "source_manifest": "SOURCE_MANIFEST.json",
+  "scope": "Focused tests and CLI checks on publication tree; no fresh full mission or MC launch"
+}

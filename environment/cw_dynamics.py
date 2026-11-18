@@ -191,7 +191,7 @@ class CWDynamics:
         s, c = np.sin(nt), np.cos(nt)
 
         x  = (4 - 3*c)*x0 + s*vx0/n + 2*(1 - c)*vy0/n
-        y  = (6*(s - nt) + 1)*y0 - 2*(1 - c)*vx0/n + (4*s - 3*nt)*vy0/n
+        y  = 6*(s - nt)*x0 + y0 - 2*(1 - c)*vx0/n + (4*s - 3*nt)*vy0/n
         z  =  c*z0 + s*vz0/n
 
         vx =  3*n*s*x0 + c*vx0 + 2*s*vy0

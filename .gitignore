@@ -1,74 +1,17 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.pyc
-.Python
-
-# Virtual environments
-venv/
-env/
-.env/
 .venv/
-
-# Output / generated files — large, reproducible, not tracked
-*.csv
+venv/
+.env
+.env.*
+results/
+campaigns/
 *.log
-*.gif
-rpod_telemetry.npz
-rpod_telemetry_plots.png
-rpod_telemetry_analysis.png
-Figure_*.png
-monte_carlo_results.npz
-monte_carlo_summary.txt
-monte_carlo_plots.png
-monte_carlo_results/
-mc_results/
-mc_results.pkl
-ca_results.png
-visualiser_dashboard.png
-visualiser_replay.gif
-visualiser_*.png
+*.npz
+*.pkl
+BOUNDED_VERIFICATION.json
 .pytest_cache/
-
-# Local Monte Carlo debug runs
-_mc*/
-
-# Experimental scratch guidance module
-control/nmc_guidance.py
-
-# One-off utility scripts
-extract_check.py
-
-# Jupyter notebooks (if used)
-.ipynb_checkpoints/
-*.ipynb
-
-# IDE
-.claude/
 .vscode/
 .idea/
-*.sublime-project
-*.sublime-workspace
-
-# macOS
 .DS_Store
-
-# Windows
 Thumbs.db
-desktop.ini
-
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-
-# SPEED+ dataset (14GB+, downloaded separately) and trained pose model artifacts
-speedplusv2/
-pose_cnn/checkpoints/
-pose_cnn/*.pt
-pose_cnn/*.pth
-pose_cnn/runs/
-# 50k rendered images — too large for git
-pose_cnn/data/
